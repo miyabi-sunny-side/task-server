@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy, rustfmt
+
+      - name: Install frontend dependencies
+        run: npm --prefix client ci
+
+      - name: Check frontend formatting
+        run: npm --prefix client run format:check
+
+      - name: Check Svelte
+        run: npm --prefix client run check
+
+      - name: Test frontend
+        run: npm --prefix client test
+
+      - name: Build frontend
+        run: npm --prefix client run build
+
+      - name: Lint design contract
+        run: npm --prefix client run lint:design
+
+      - name: Check Rust formatting
+        run: cargo fmt --check
+
+      - name: Lint Rust
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test Rust
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: Smoke-test production server
+        shell: bash
+        run: |
+          set -euo pipefail
+          target/release/task-server &
+          server_pid=$!
+          trap 'kill -TERM "$server_pid" 2>/dev/null || true' EXIT
+
+          for attempt in {1..20}; do
+            if curl --fail --silent --show-error http://127.0.0.1:3000/healthz >/dev/null; then
+              break
+            fi
+            if [[ "$attempt" == 20 ]]; then
+              exit 1
+            fi
+            sleep 0.25
+          done
+
+          test "$(curl --fail --silent http://127.0.0.1:3000/healthz)" = "ok"
+          test "$(curl --fail --silent http://127.0.0.1:3000/api/health)" = '{"status":"ok"}'
+          curl --fail --silent http://127.0.0.1:3000/ | grep --ignore-case '<!doctype html'
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:3000/api/missing)" = "404"
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:3000/projects/example)" = "200"
+
+          kill -TERM "$server_pid"
+          wait "$server_pid"
+          trap - EXIT
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Build container image
+        run: docker build --tag task-server:test .
