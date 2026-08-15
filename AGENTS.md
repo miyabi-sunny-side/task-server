@@ -13,6 +13,21 @@ the JSON API and the compiled client.
 - There is no physical delete. Discarding a task is a transition to
   `cancelled` or `dropped`, so the row stays auditable.
 - Product ids are `org/repo`, never a path. Task ids are one path segment.
+- The `products` table is the register of product identity. A task may be
+  created with a `product_id` that is not in it, but it may not be promoted:
+  `ready` is refused with 409 and code `product_not_catalogued` when the product
+  is uncatalogued, or `product_required` when the task has no `product_id`. The
+  gate fires on the transition only, so a row that is already `ready` or beyond
+  is never demoted, and `available_transitions` still offers `ready`.
+- `APP_PRODUCTS_SEED` upserts a JSON product roster at startup, in one
+  transaction. Unreadable, unparseable, or invalid seeds fail the startup with
+  nothing written. The roster itself is operational data and is not in the
+  repository.
+- Every refusal the domain owns — and every unknown `/api/*` path — answers
+  `{"error": "<message>", "code": "<slug>"}`. The slug is stable and is what an
+  automated client branches on; the message is not. A request body that is not
+  JSON never reaches the domain: the axum extractor rejects it first, with 400
+  and a plain-text explanation that carries no `code`.
 - `merged` and `released` belong to the control plane. `POST /api/tasks/{id}/status`
   refuses both, and `available_transitions` never offers them; the transition
   table still allows them because the control plane goes through it.
@@ -49,8 +64,9 @@ the JSON API and the compiled client.
   `Origin`, and `X-CSRF-Token`. Worker capability is not sufficient.
 - `TASK_SERVER_ENV=production` is fail-closed without `WORKER_CAPABILITY`,
   `APP_AUTH_ALLOWLIST`, `APP_CSRF_TOKEN`, and `APP_ALLOWED_ORIGINS`.
-- Unknown `/api/*` paths return 404. Every other unknown path falls back to
-  `client/dist/index.html` so the client router can restore a deep link.
+- Unknown `/api/*` paths return the 404 JSON refusal, code `not_found`. Every
+  other unknown path falls back to `client/dist/index.html` so the client router
+  can restore a deep link.
 
 ## Status vocabulary
 

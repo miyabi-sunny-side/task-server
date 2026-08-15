@@ -75,6 +75,31 @@ async fn send(state: &AppState, request: Request<Body>) -> (StatusCode, Value) {
     (status, value)
 }
 
+/// The response without the JSON assumption: status, `content-type`, and the
+/// raw bytes as text. `send` turns anything unparseable into `Value::Null`,
+/// which is exactly what a test about non-JSON refusals must not do.
+async fn send_raw(state: &AppState, request: Request<Body>) -> (StatusCode, String, String) {
+    let response = task_server::app(state.clone())
+        .oneshot(request)
+        .await
+        .expect("router response");
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    (
+        status,
+        content_type,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    )
+}
+
 fn request(method: &str, uri: &str) -> axum::http::request::Builder {
     Request::builder()
         .method(method)
@@ -474,6 +499,7 @@ async fn merge_candidates_are_done_tasks_and_are_issued_once() {
         StatusCode::CONFLICT,
         "a second merge for the same target conflicts: {again}"
     );
+    assert_eq!(again["code"], "conflict", "{again}");
 
     let (status, listing) = send(&state, read("/api/tasks")).await;
     assert_eq!(status, StatusCode::OK);
@@ -567,6 +593,10 @@ async fn a_merge_only_lands_when_every_check_passed() {
                 .as_str()
                 .is_some_and(|message| message.contains("control plane")),
             "the refusal must name the control plane: {refused}"
+        );
+        assert_eq!(
+            refused["code"], "invalid",
+            "every error body carries a machine readable code: {refused}"
         );
     }
 
@@ -861,6 +891,7 @@ async fn claim_prefers_instant_merge_and_listing_hides_released() {
         StatusCode::CONFLICT,
         "a stale claim_id must conflict: {rejected}"
     );
+    assert_eq!(rejected["code"], "claim_mismatch", "{rejected}");
 
     // A merge task nobody issued has nothing to land, so it is dropped by hand.
     let (status, orphan) = post_report(
@@ -954,8 +985,9 @@ async fn mutation_requires_identity_origin_and_csrf_while_worker_requires_capabi
         .header("x-csrf-token", CSRF)
         .body(Body::from(denied.to_string()))
         .unwrap();
-    let (status, _) = send(&state, no_identity).await;
+    let (status, denied_body) = send(&state, no_identity).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "identity is required");
+    assert_eq!(denied_body["code"], "unauthorized", "{denied_body}");
 
     let wrong_origin = request("POST", "/api/tasks")
         .header("x-auth-user", USER)
@@ -963,8 +995,9 @@ async fn mutation_requires_identity_origin_and_csrf_while_worker_requires_capabi
         .header("x-csrf-token", CSRF)
         .body(Body::from(denied.to_string()))
         .unwrap();
-    let (status, _) = send(&state, wrong_origin).await;
+    let (status, foreign) = send(&state, wrong_origin).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "a foreign Origin is refused");
+    assert_eq!(foreign["code"], "forbidden", "{foreign}");
 
     let no_csrf = request("POST", "/api/tasks")
         .header("x-auth-user", USER)
@@ -991,6 +1024,7 @@ async fn mutation_requires_identity_origin_and_csrf_while_worker_requires_capabi
         StatusCode::NOT_FOUND,
         "no refused request may have written: {missing}"
     );
+    assert_eq!(missing["code"], "not_found", "{missing}");
 
     let no_capability = request("POST", "/worker/claim")
         .body(Body::from(json!({"worker": "grok"}).to_string()))
@@ -1052,6 +1086,82 @@ async fn patch_edits_attributes_without_touching_the_workflow() {
         status,
         StatusCode::BAD_REQUEST,
         "draft cannot jump straight to wip"
+    );
+}
+
+/// Registering a task is not the moment to know the catalogue: an agent may
+/// file work for a product nobody has entered yet. Promoting it to `ready` is,
+/// and the refusal has to say which product is missing and carry a code an
+/// automated client can branch on.
+#[tokio::test]
+async fn an_uncatalogued_product_blocks_ready_but_not_registration() {
+    const UNLISTED: &str = "sunny-side/unlisted";
+
+    let (_dir, state) = file_backed_state();
+
+    let created = create_task(
+        &state,
+        &json!({
+            "id": "t-unlisted",
+            "title": "work for a product nobody entered",
+            "product_id": UNLISTED,
+        }),
+    )
+    .await;
+    assert_eq!(created["status"], "draft");
+    assert_eq!(created["product_id"], UNLISTED);
+    assert!(
+        transitions(&created).contains(&"ready".to_owned()),
+        "the table still allows ready; the gate refuses at the transition: {created}"
+    );
+
+    let (status, refused) = post_status(&state, "t-unlisted", "ready").await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "an uncatalogued product must not be promoted: {refused}"
+    );
+    assert_eq!(
+        refused["code"], "product_not_catalogued",
+        "the refusal must be machine readable: {refused}"
+    );
+    assert!(
+        refused["error"]
+            .as_str()
+            .is_some_and(|message| message.contains(UNLISTED)),
+        "the refusal must name the product: {refused}"
+    );
+
+    let (status, still) = get_task(&state, "t-unlisted").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        still["status"], "draft",
+        "a refused promotion changes nothing: {still}"
+    );
+
+    // A task with no product at all is refused under its own code.
+    create_task(
+        &state,
+        &json!({"id": "t-orphan", "title": "work for no product"}),
+    )
+    .await;
+    let (status, orphan) = post_status(&state, "t-orphan", "ready").await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a task without a product must not be promoted: {orphan}"
+    );
+    assert_eq!(orphan["code"], "product_required", "{orphan}");
+
+    // Entering the product in the catalogue is the whole remedy.
+    put_product(&state, UNLISTED, true).await;
+    set_status(&state, "t-unlisted", "ready").await;
+
+    let (status, lease) = send(&state, worker("/worker/claim", &json!({"worker": "grok"}))).await;
+    assert_eq!(status, StatusCode::OK, "claim: {lease}");
+    assert_eq!(
+        lease["id"], "t-unlisted",
+        "a catalogued task is handed to a worker: {lease}"
     );
 }
 
@@ -1336,4 +1446,93 @@ fn production_startup_is_fail_closed_without_secrets() {
     assert!(ok.dev_identity.is_none());
     assert_eq!(ok.worker_capability, "secret-cap");
     assert!(db_path.is_file(), "APP_DB_PATH must be opened at startup");
+}
+
+/// A path no API route claims is our own refusal, so it answers in the shape
+/// every other refusal of ours uses: 404 JSON with the stable `not_found` slug.
+/// It must not leak the SPA fallback and must not answer in prose.
+#[tokio::test]
+async fn an_unknown_api_path_is_refused_as_json_with_a_stable_code() {
+    let (_dir, state) = file_backed_state();
+
+    let (status, content_type, text) = send_raw(
+        &state,
+        request("GET", "/api/nowhere")
+            .header("x-auth-user", USER)
+            .body(Body::empty())
+            .expect("unknown api request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+    assert!(
+        content_type.starts_with("application/json"),
+        "an unknown API path answers JSON, got {content_type}: {text}"
+    );
+    let body: Value = serde_json::from_str(&text).expect("json body");
+    assert_eq!(body["code"], "not_found", "{body}");
+    assert!(
+        body["error"].as_str().is_some_and(|it| !it.is_empty()),
+        "the message is prose next to the slug, never instead of it: {body}"
+    );
+
+    // A POST to an unknown API path is the same refusal, not a 405 and not the
+    // client's index.html.
+    let (status, content_type, text) = send_raw(
+        &state,
+        human("POST", "/api/nowhere", &json!({"anything": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+    assert!(
+        content_type.starts_with("application/json"),
+        "got {content_type}: {text}"
+    );
+    let body: Value = serde_json::from_str(&text).expect("json body");
+    assert_eq!(body["code"], "not_found", "{body}");
+}
+
+/// A request body that is not JSON never reaches our code: axum's own extractor
+/// rejects it before the handler runs, in plain text and without a `code`. That
+/// is the framework's contract, not ours, and this test pins what it actually
+/// does so the documented promise stays true to it.
+#[tokio::test]
+async fn a_malformed_request_body_is_rejected_by_the_framework_in_plain_text() {
+    let (_dir, state) = file_backed_state();
+
+    let (status, content_type, text) = send_raw(
+        &state,
+        request("POST", "/api/tasks")
+            .header("x-auth-user", USER)
+            .header("origin", ORIGIN)
+            .header("x-csrf-token", CSRF)
+            .body(Body::from("{\"id\": \"t-broken\", "))
+            .expect("malformed request"),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a syntactically broken body is a 400: {text}"
+    );
+    assert!(
+        content_type.starts_with("text/plain"),
+        "the framework answers in plain text, got {content_type}: {text}"
+    );
+    assert!(
+        serde_json::from_str::<Value>(&text).is_err(),
+        "the rejection body is not JSON: {text}"
+    );
+    assert!(
+        text.contains("Failed to parse the request body as JSON"),
+        "the rejection names the parse failure: {text}"
+    );
+
+    // Nothing was written, because nothing of ours ever ran.
+    let (status, missing) = send(&state, read("/api/tasks/t-broken")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a rejected body must not have written: {missing}"
+    );
 }

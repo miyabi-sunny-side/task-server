@@ -53,6 +53,60 @@ Reads need an allowlisted `X-Auth-User`. Mutations additionally need a matching
 and nothing else grants them. Tasks are never physically deleted; discard one by
 moving it to `cancelled` or `dropped`.
 
+## The product catalogue
+
+The `products` table is the register of product identity. Anything that names a
+product — a task, a merge, a release — means a row in it.
+
+Filing work and curating the catalogue are two different moments, so
+`POST /api/tasks` accepts a `product_id` the catalogue has never heard of and
+the task starts in `draft` as usual. Promoting it is where identity is required:
+`POST /api/tasks/{id}/status` with `ready` answers 409 when the product is not
+catalogued, or when the task has no `product_id` at all, and the task stays
+where it was. Add the product with `PUT /api/products/{id}` and the same
+promotion goes through.
+
+Refusals that come from the server's own domain carry a stable `code` next to
+their human `error` message, so an automated client branches on the reason
+rather than on the prose:
+
+```json
+{
+  "error": "product 'org/repo' is not in the product catalogue, so task t-1 cannot become ready; add it first with PUT /api/products/org/repo",
+  "code": "product_not_catalogued"
+}
+```
+
+The codes are `unauthorized`, `forbidden`, `not_found`, `claim_mismatch`,
+`invalid`, `conflict`, `product_required`, `product_not_catalogued`,
+`frontmatter`, `io`, and `db`. An unknown `/api/*` path answers in the same
+shape, as a 404 with code `not_found`.
+
+One kind of failure is outside that contract: a request body that is not valid
+JSON is rejected by the web framework before any handler runs, so it comes back
+as `400` with a plain-text explanation and no `code` to branch on.
+
+Set `APP_PRODUCTS_SEED` to fill the catalogue at startup from a JSON roster:
+
+```json
+[
+  {
+    "id": "org/repo",
+    "repository": "https://github.com/org/repo",
+    "description": "one line",
+    "releases": true
+  },
+  { "id": "org/other", "repository": "https://github.com/org/other" }
+]
+```
+
+`description` defaults to empty and `releases` to `true`. Each entry is an
+upsert keyed on `id`, so restarting with the same file adds no duplicates and
+editing the file corrects the row in place. `created_at` survives either way;
+`updated_at` is stamped on every seed, including a re-run of an unchanged file.
+Nothing is ever removed by a seed. A missing file, JSON that does not parse, or
+an id that is not `org/repo` stops the startup with nothing written.
+
 ## Merging and releasing
 
 The last two steps of a task are not buttons a human presses on the status API;
@@ -140,6 +194,7 @@ cargo build --locked --release
 | `APP_CSRF_TOKEN` | `dev-csrf` | Required on human mutation as `X-CSRF-Token`. |
 | `APP_ALLOWED_ORIGINS` | (unset) | Comma-separated origins accepted on mutation. Outside production, loopback origins are accepted when this is unset. |
 | `APP_STATIC_DIR` | `client/dist` | Directory of the production frontend. |
+| `APP_PRODUCTS_SEED` | (unset) | Path to a JSON product roster upserted into the catalogue at startup. Unset means the catalogue is curated over the API alone. |
 | `TASK_SERVER_ENV` | (unset) | Set to `production` to require the four secrets above and drop the development identity. |
 | `RUST_LOG` | `info` | `tracing-subscriber` filter, for example `task_server=debug,tower_http=debug`. |
 
@@ -159,8 +214,8 @@ With `TASK_SERVER_ENV=production` the process refuses to start unless
 └── rust-toolchain.toml
 ```
 
-Unknown `/api/*` paths return 404. Other unknown paths fall back to
-`client/dist/index.html` so the client router can restore a deep link.
+Unknown `/api/*` paths return the 404 JSON refusal. Other unknown paths fall
+back to `client/dist/index.html` so the client router can restore a deep link.
 
 ## License
 

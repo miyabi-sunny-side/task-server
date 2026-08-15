@@ -16,16 +16,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let bind_addr = bind_addr_from_env()?;
+    // Fail before the socket exists: a listener that logs "listening" and then
+    // exits over a bad seed file is worse than never binding at all.
+    let state = AppState::from_env()?;
+    seed_products(&state)?;
+
     let listener = TcpListener::bind(bind_addr).await?;
     info!(%bind_addr, "server listening");
-
-    let state = AppState::from_env()?;
 
     axum::serve(listener, task_server::app(state))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
     info!("server stopped");
+    Ok(())
+}
+
+/// Upsert the roster at `APP_PRODUCTS_SEED`, if one is configured. Unset means
+/// the catalogue is curated over the API alone; set and unusable is fatal, so a
+/// typo in the path never boots a server with an empty catalogue.
+fn seed_products(state: &AppState) -> Result<(), Box<dyn Error>> {
+    let Some(path) = env::var("APP_PRODUCTS_SEED").ok().filter(|p| !p.is_empty()) else {
+        return Ok(());
+    };
+    let seeded = task_server::product::seed_from_path(&state.db, &path, state.clock.now())?;
+    info!(seeded, path, "products seeded");
     Ok(())
 }
 

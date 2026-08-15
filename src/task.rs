@@ -285,8 +285,43 @@ fn product_releases(conn: &Connection, product_id: Option<&str>) -> Result<bool,
     }
 }
 
-/// Move a task to `to`, refusing transitions the table forbids and releases the
-/// owning product does not want.
+/// The catalogue is the register of product identity, and `ready` is where it
+/// is checked. Registering a task for an unknown product is allowed on purpose:
+/// whoever files the work does not have to curate the catalogue first. What is
+/// not allowed is handing that task to a worker, because nobody could say which
+/// repository it belongs to.
+///
+/// The check fires on the transition only. A row that reached `ready` or beyond
+/// before its product left the catalogue keeps its status; nothing is demoted.
+fn check_catalogued(conn: &Connection, task: &Task) -> Result<(), Error> {
+    let Some(product_id) = task.product_id.as_deref() else {
+        return Err(Error::Precondition {
+            code: "product_required",
+            message: format!(
+                "task {} has no product_id, so it cannot become ready; \
+                 set one that is in the product catalogue",
+                task.id
+            ),
+        });
+    };
+    match product::read(conn, product_id) {
+        Ok(_) => Ok(()),
+        Err(Error::NotFound) => Err(Error::Precondition {
+            code: "product_not_catalogued",
+            message: format!(
+                "product '{product_id}' is not in the product catalogue, \
+                 so task {} cannot become ready; \
+                 add it first with PUT /api/products/{product_id}",
+                task.id
+            ),
+        }),
+        Err(other) => Err(other),
+    }
+}
+
+/// Move a task to `to`, refusing transitions the table forbids, promotions of
+/// work whose product is not catalogued, and releases the owning product does
+/// not want.
 pub fn set_status(db: &Db, id: &str, to: TaskStatus, now: OffsetDateTime) -> Result<Task, Error> {
     let stamp = format_z(now);
     db.with_tx(|tx| {
@@ -297,6 +332,9 @@ pub fn set_status(db: &Db, id: &str, to: TaskStatus, now: OffsetDateTime) -> Res
                 task.status.as_str(),
                 to.as_str()
             )));
+        }
+        if to == TaskStatus::Ready {
+            check_catalogued(tx, &task)?;
         }
         if to == TaskStatus::Released && !product_releases(tx, task.product_id.as_deref())? {
             let product_id = task.product_id.as_deref().unwrap_or("<none>");
@@ -935,20 +973,119 @@ mod tests {
             ..new_task("t-1", TaskKind::Normal, 0)
         };
         create(&db, &orphan, now()).unwrap();
-        for to in [
-            TaskStatus::Ready,
-            TaskStatus::Wip,
-            TaskStatus::Done,
-            TaskStatus::Merged,
-        ] {
-            set_status(&db, "t-1", to, now()).unwrap();
-        }
 
+        // A task with no product never gets promoted in the first place.
+        assert!(matches!(
+            set_status(&db, "t-1", TaskStatus::Ready, now()),
+            Err(Error::Precondition {
+                code: "product_required",
+                ..
+            })
+        ));
+
+        // A row that got to `merged` before the gate existed keeps its status,
+        // and is still refused a release: shipping needs a releasing product.
+        force_status(&db, "t-1", "merged");
         assert!(matches!(
             set_status(&db, "t-1", TaskStatus::Released, now()),
             Err(Error::Invalid(_))
         ));
         assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Merged);
+    }
+
+    /// Write a status straight to the row, standing in for a database written
+    /// before the `ready` gate existed. Nothing in production does this.
+    fn force_status(db: &Db, id: &str, status: &str) {
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE tasks SET status = ?2 WHERE id = ?1",
+                rusqlite::params![id, status],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Registration is open; promotion is gated. The refusal has to name the
+    /// product and carry a code a client can branch on, and it must leave the
+    /// task exactly where it was.
+    #[test]
+    fn ready_is_refused_while_the_product_is_not_catalogued() {
+        let db = db_with_product();
+        let unlisted = NewTask {
+            product_id: Some("nobody/knows".into()),
+            ..new_task("t-1", TaskKind::Normal, 0)
+        };
+        let created = create(&db, &unlisted, now()).expect("registration is not gated");
+        assert_eq!(created.status, TaskStatus::Draft);
+        assert!(
+            available_transitions(&created).contains(&TaskStatus::Ready),
+            "the table still offers ready; the gate refuses at the transition"
+        );
+
+        let err = set_status(&db, "t-1", TaskStatus::Ready, now()).unwrap_err();
+        assert!(
+            matches!(&err, Error::Precondition { code, message }
+                if *code == "product_not_catalogued" && message.contains("nobody/knows")),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Draft);
+
+        product::upsert(
+            &db,
+            &Product {
+                id: "nobody/knows".into(),
+                repository: "https://example.test/nobody/knows.git".into(),
+                description: String::new(),
+                releases: false,
+            },
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            set_status(&db, "t-1", TaskStatus::Ready, now())
+                .unwrap()
+                .status,
+            TaskStatus::Ready,
+            "cataloguing the product is the whole remedy"
+        );
+    }
+
+    /// The gate guards the promotion, not the row. Work that is already past
+    /// `ready` is never demoted, and no other transition consults the catalogue.
+    #[test]
+    fn the_ready_gate_never_demotes_or_blocks_other_transitions() {
+        let db = db_with_product();
+        create(
+            &db,
+            &NewTask {
+                product_id: Some("nobody/knows".into()),
+                ..new_task("t-1", TaskKind::Normal, 0)
+            },
+            now(),
+        )
+        .unwrap();
+        force_status(&db, "t-1", "wip");
+
+        for to in [TaskStatus::Done, TaskStatus::Blocked] {
+            let moved = set_status(&db, "t-1", to, now()).unwrap();
+            assert_eq!(moved.status, to, "the gate must not touch {to:?}");
+            force_status(&db, "t-1", "wip");
+        }
+
+        // Only the way back into `ready` is refused.
+        assert!(matches!(
+            set_status(&db, "t-1", TaskStatus::Ready, now()),
+            Err(Error::Precondition {
+                code: "product_not_catalogued",
+                ..
+            })
+        ));
+        assert_eq!(
+            get(&db, "t-1").unwrap().status,
+            TaskStatus::Wip,
+            "a refused promotion leaves the row where it was"
+        );
     }
 
     #[test]

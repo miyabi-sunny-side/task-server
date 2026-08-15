@@ -411,6 +411,9 @@ pub async fn worker_report(
     Ok(Json(card(reported)))
 }
 
-pub async fn api_not_found() -> impl IntoResponse {
-    (StatusCode::NOT_FOUND, "API route not found\n")
+/// A path no API route claims. It is our refusal, so it answers in the shape
+/// every refusal of ours uses — the same status and the same `not_found` slug as
+/// [`Error::NotFound`] — instead of falling through to the client's index.html.
+pub async fn api_not_found() -> Response {
+    Error::NotFound.into_response()
 }
