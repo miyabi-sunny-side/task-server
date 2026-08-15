@@ -230,6 +230,12 @@ pub async fn api_tasks(
     Ok(Json(summaries(tasks)))
 }
 
+/// Register a task.
+///
+/// `kind` is still read rather than ignored: a request that asks for
+/// `instant:merge` is answered with the domain's refusal naming the control
+/// plane, which is what a caller needs to hear, instead of quietly filing
+/// something other than what was asked for.
 pub async fn api_create_task(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -284,17 +290,9 @@ pub async fn api_set_status(
 ) -> Result<Json<TaskCard>, Error> {
     require_human_mutation(&headers, &state)?;
     let to = TaskStatus::parse(&body.status)?;
-    // Landing and shipping are earned, not pressed: a task reaches `merged`
-    // only when a merge reported green checks, and `released` only through a
-    // product release.
-    if matches!(to, TaskStatus::Merged | TaskStatus::Released) {
-        return Err(Error::Invalid(format!(
-            "{} is granted by the control plane (POST /api/merges, POST /api/releases), \
-             not by a status change",
-            to.as_str()
-        )));
-    }
-    let moved = task::set_status(&state.db, &id, to, state.clock.now())?;
+    // Landing and shipping are earned, not pressed. The rule itself lives in
+    // the domain, so the MCP tool refuses exactly what this route refuses.
+    let moved = task::set_status_by_operator(&state.db, &id, to, state.clock.now())?;
     Ok(Json(card(moved)))
 }
 

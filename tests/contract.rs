@@ -169,6 +169,43 @@ async fn set_status(state: &AppState, id: &str, to: &str) -> Value {
     value
 }
 
+/// Register a task for `PRODUCT` at `priority` and promote it to `ready`.
+async fn ready_task(state: &AppState, id: &str, priority: i64) {
+    create_task(
+        state,
+        &json!({
+            "id": id,
+            "title": format!("task {id}"),
+            "product_id": PRODUCT,
+            "priority": priority,
+        }),
+    )
+    .await;
+    set_status(state, id, "ready").await;
+}
+
+/// A listing row carries the card's identity and none of its body.
+fn assert_summary_shape(summary: &Value) {
+    for field in [
+        "id",
+        "title",
+        "status",
+        "kind",
+        "product_id",
+        "priority",
+        "updated_at",
+    ] {
+        assert!(
+            summary.get(field).is_some(),
+            "summary must carry {field}: {summary}"
+        );
+    }
+    assert!(
+        summary.get("body").is_none(),
+        "the summary is not a full card: {summary}"
+    );
+}
+
 fn ids_of(listing: &Value) -> Vec<&str> {
     listing
         .as_array()
@@ -855,28 +892,28 @@ async fn claim_prefers_instant_merge_and_listing_hides_released() {
     let (_dir, state) = file_backed_state();
     put_product(&state, PRODUCT, true).await;
 
-    for (id, kind, priority) in [
-        ("t-normal", "normal", 100),
-        ("t-instant", "instant:merge", 0),
-    ] {
-        create_task(
-            &state,
-            &json!({
-                "id": id,
-                "title": format!("task {id}"),
-                "product_id": PRODUCT,
-                "kind": kind,
-                "priority": priority,
-            }),
-        )
-        .await;
-        set_status(&state, id, "ready").await;
-    }
+    // An instant:merge task exists only because the control plane issued one,
+    // so the queue this test schedules against is built the way production
+    // builds it: finished work, then POST /api/merges.
+    ready_task(&state, "t-merged", 0).await;
+    work_to_done(&state, "t-merged", "abc1234").await;
+
+    let (status, merge) = post_merge(&state, "t-merged").await;
+    assert_eq!(status, StatusCode::CREATED, "issue merge: {merge}");
+    let merge_id = merge["id"].as_str().expect("merge id").to_owned();
+    assert_eq!(merge["kind"], "instant:merge");
+    assert_eq!(
+        merge["priority"], 0,
+        "the merge inherits the target's priority, so it outranks on kind alone: {merge}"
+    );
+
+    ready_task(&state, "t-normal", 100).await;
 
     let (status, lease) = send(&state, worker("/worker/claim", &json!({"worker": "grok"}))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        lease["id"], "t-instant",
+        lease["id"],
+        merge_id.as_str(),
         "instant:merge outranks a higher priority normal task: {lease}"
     );
     let claim_id = lease["claim_id"].as_str().expect("claim_id").to_owned();
@@ -893,8 +930,10 @@ async fn claim_prefers_instant_merge_and_listing_hides_released() {
     );
     assert_eq!(rejected["code"], "claim_mismatch", "{rejected}");
 
-    // A merge task nobody issued has nothing to land, so it is dropped by hand.
-    let (status, orphan) = post_report(
+    // A merge attempt a human abandons is dropped by hand, and the lease dies
+    // with it: the report that was live a moment ago now lands nothing.
+    set_status(&state, &merge_id, "dropped").await;
+    let (status, abandoned) = post_report(
         &state,
         &report_with_checks(&claim_id, "abc1234", &green_checks()),
     )
@@ -902,16 +941,20 @@ async fn claim_prefers_instant_merge_and_listing_hides_released() {
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
-        "a merge without a target lands nothing: {orphan}"
+        "a dropped merge lands nothing: {abandoned}"
     );
-    set_status(&state, "t-instant", "dropped").await;
+    let (status, target) = get_task(&state, "t-merged").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        target["status"], "done",
+        "an abandoned merge leaves its target where it was: {target}"
+    );
 
-    // The remaining task takes the whole control-plane path to `released`.
-    work_to_done(&state, "t-normal", "def5678").await;
-    let (status, merge) = post_merge(&state, "t-normal").await;
-    assert_eq!(status, StatusCode::CREATED, "issue merge: {merge}");
-    let merge_id = merge["id"].as_str().expect("merge id").to_owned();
-    land_merge(&state, &merge_id, "def5678").await;
+    // The target then takes the whole control-plane path to `released`.
+    let (status, retry) = post_merge(&state, "t-merged").await;
+    assert_eq!(status, StatusCode::CREATED, "reissue merge: {retry}");
+    let retry_id = retry["id"].as_str().expect("merge id").to_owned();
+    land_merge(&state, &retry_id, "abc1234").await;
     let (status, released) = post_release(&state, PRODUCT, "v0.2.0").await;
     assert_eq!(status, StatusCode::OK, "release: {released}");
 
@@ -919,37 +962,20 @@ async fn claim_prefers_instant_merge_and_listing_hides_released() {
     assert_eq!(status, StatusCode::OK);
     let mut listed = ids_of(&listing);
     listed.sort_unstable();
-    let mut expected = vec!["t-instant", merge_id.as_str()];
+    let mut expected = vec!["t-normal", merge_id.as_str(), retry_id.as_str()];
     expected.sort_unstable();
     assert_eq!(listed, expected, "the default listing hides released");
     let summary = listing
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["id"] == "t-instant")
-        .expect("t-instant summary");
-    for field in [
-        "id",
-        "title",
-        "status",
-        "kind",
-        "product_id",
-        "priority",
-        "updated_at",
-    ] {
-        assert!(
-            summary.get(field).is_some(),
-            "summary must carry {field}: {summary}"
-        );
-    }
-    assert!(
-        summary.get("body").is_none(),
-        "the summary is not a full card: {summary}"
-    );
+        .find(|item| item["id"] == "t-normal")
+        .expect("t-normal summary");
+    assert_summary_shape(summary);
 
     let (status, released) = send(&state, read("/api/tasks?status=released")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(ids_of(&released), ["t-normal"]);
+    assert_eq!(ids_of(&released), ["t-merged"]);
 
     let (status, _) = send(&state, read("/api/tasks?status=not-a-status")).await;
     assert_eq!(
@@ -957,6 +983,66 @@ async fn claim_prefers_instant_merge_and_listing_hides_released() {
         StatusCode::BAD_REQUEST,
         "unknown status must be 400"
     );
+}
+
+/// Registration files ordinary work and nothing else. A hand-made
+/// `instant:merge` task would be a merge with no target: claimed ahead of every
+/// other task, impossible to report, and so a standing block on the queue. The
+/// refusal is explicit, never a silently ignored field.
+#[tokio::test]
+async fn creating_an_instant_merge_task_by_hand_is_refused() {
+    let (_dir, state) = file_backed_state();
+    put_product(&state, PRODUCT, true).await;
+
+    let (status, refused) = send(
+        &state,
+        human(
+            "POST",
+            "/api/tasks",
+            &json!({
+                "id": "t-forged",
+                "title": "forge a merge",
+                "product_id": PRODUCT,
+                "kind": "instant:merge",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "only the control plane issues a merge: {refused}"
+    );
+    assert_eq!(refused["code"], "invalid", "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("/api/merges")),
+        "the refusal must point at the control plane: {refused}"
+    );
+
+    let (status, missing) = get_task(&state, "t-forged").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a refused creation writes no row: {missing}"
+    );
+
+    // The kind that does exist is still accepted, spelled out or left out.
+    for (id, body) in [
+        (
+            "t-explicit",
+            json!({"id": "t-explicit", "title": "normal", "product_id": PRODUCT, "kind": "normal"}),
+        ),
+        (
+            "t-default",
+            json!({"id": "t-default", "title": "normal", "product_id": PRODUCT}),
+        ),
+    ] {
+        let created = create_task(&state, &body).await;
+        assert_eq!(created["id"], id);
+        assert_eq!(created["kind"], "normal", "{created}");
+    }
 }
 
 #[tokio::test]
@@ -1436,15 +1522,23 @@ fn production_startup_is_fail_closed_without_secrets() {
     let ok = AppState::from_vars(|key| match key {
         "TASK_SERVER_ENV" => Some("production".into()),
         "WORKER_CAPABILITY" => Some("secret-cap".into()),
+        // The MCP admin endpoint opens task CRUD to an agent, so production
+        // demands its own capability for it too.
+        "MCP_CAPABILITY" => Some("secret-mcp-cap".into()),
         "APP_AUTH_ALLOWLIST" => Some("miyabi".into()),
         "APP_CSRF_TOKEN" => Some("secret-csrf".into()),
         "APP_ALLOWED_ORIGINS" => Some("https://task-server.test".into()),
+        // A published deployment answers to its own name, and the `Host`
+        // allowlist that stops DNS rebinding cannot guess it.
+        "APP_MCP_ALLOWED_HOSTS" => Some("tasks.example.test".into()),
         "APP_DB_PATH" => Some(db_path.to_string_lossy().into_owned()),
         _ => None,
     })
     .expect("production with secrets");
     assert!(ok.dev_identity.is_none());
     assert_eq!(ok.worker_capability, "secret-cap");
+    assert_eq!(ok.mcp_capability, "secret-mcp-cap");
+    assert_eq!(ok.mcp_allowed_hosts, ["tasks.example.test"]);
     assert!(db_path.is_file(), "APP_DB_PATH must be opened at startup");
 }
 

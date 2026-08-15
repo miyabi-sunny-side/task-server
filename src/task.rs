@@ -160,7 +160,20 @@ pub struct TaskPatch {
 }
 
 /// Create a task in `draft`.
+///
+/// Registration files ordinary work only. An `instant:merge` task is issued by
+/// [`issue_merge`] against a target it can name, and a hand-made one would be a
+/// merge with no target: claimed ahead of every other task, impossible to
+/// report, and so a standing block on the queue. The refusal lives here rather
+/// than in a transport, so HTTP and MCP cannot drift apart on it.
 pub fn create(db: &Db, new: &NewTask, now: OffsetDateTime) -> Result<Task, Error> {
+    if new.kind == TaskKind::InstantMerge {
+        return Err(Error::Invalid(format!(
+            "an {} task is issued by the control plane (POST /api/merges) against the task it \
+             lands, and cannot be created directly",
+            TaskKind::InstantMerge.as_str()
+        )));
+    }
     if new.id.trim().is_empty() {
         return Err(Error::Invalid("id is required".into()));
     }
@@ -348,6 +361,30 @@ pub fn set_status(db: &Db, id: &str, to: TaskStatus, now: OffsetDateTime) -> Res
         )?;
         read(tx, id)
     })
+}
+
+/// Move a task the way a human or an administrative surface moves it.
+///
+/// `merged` and `released` are earned, not pressed: a task lands only when a
+/// merge reported green checks, and it ships only through a product release.
+/// Every operator surface — the HTTP status route and the MCP `task_set_status`
+/// tool — goes through here, so neither can become a way around the other. The
+/// control plane itself keeps calling [`set_status`] directly, because that is
+/// how it grants both.
+pub fn set_status_by_operator(
+    db: &Db,
+    id: &str,
+    to: TaskStatus,
+    now: OffsetDateTime,
+) -> Result<Task, Error> {
+    if matches!(to, TaskStatus::Merged | TaskStatus::Released) {
+        return Err(Error::Invalid(format!(
+            "{} is granted by the control plane (POST /api/merges, POST /api/releases), \
+             not by a status change",
+            to.as_str()
+        )));
+    }
+    set_status(db, id, to, now)
 }
 
 /// The rows a claim may take: anything still `ready`, plus a `wip` task whose
@@ -799,8 +836,9 @@ mod tests {
         Check, NewTask, Releasable, TaskKind, TaskPatch, TaskStatus, available_transitions,
         can_transition, claim, create, get, issue_merge, list, list_active, list_by_status,
         merge_task_id, mergeable, pending_merges, releasable, release_product, report, set_status,
-        update,
+        set_status_by_operator, update,
     };
+    use crate::clock::format_z;
     use crate::db::Db;
     use crate::error::Error;
     use crate::product::{self, Product};
@@ -1659,5 +1697,98 @@ mod tests {
             Some("v0.2.0"),
             "the refused release must not have restamped anything"
         );
+    }
+
+    /// Registration files ordinary work. A merge is issued by the control plane
+    /// against a task it can name, and a hand-made one would be a merge with no
+    /// target: claimed ahead of everything and impossible to report.
+    #[test]
+    fn create_refuses_an_instant_merge_while_the_control_plane_still_issues_one() {
+        let db = db_with_product();
+
+        let refused = create(&db, &new_task("t-forged", TaskKind::InstantMerge, 0), now())
+            .expect_err("a hand-made merge must be refused");
+        assert!(
+            matches!(&refused, Error::Invalid(message) if message.contains("/api/merges")),
+            "the refusal must point at the control plane: {refused:?}"
+        );
+        assert!(
+            matches!(get(&db, "t-forged"), Err(Error::NotFound)),
+            "a refused creation writes no row"
+        );
+
+        // The internal path is untouched: a merge still comes from a target.
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        work_to_done(&db, "t-1");
+        let merge = issue_merge(&db, "t-1", later()).unwrap();
+        assert_eq!(merge.kind, TaskKind::InstantMerge);
+        assert_eq!(merge.merge_target_task_id.as_deref(), Some("t-1"));
+    }
+
+    /// The last line of defence, kept because it is the reason `create` refuses:
+    /// a merge row with no target can never be reported, whatever put it there.
+    #[test]
+    fn a_merge_without_a_target_lands_nothing() {
+        let db = db_with_product();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, kind, product_id, priority,
+                                    created_at, updated_at)
+                 VALUES ('t-orphan', 'orphan merge', 'ready', 'instant:merge', 'a/b', 0, ?1, ?1)",
+                [format_z(now())],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let leased = claim(&db, "worker", now(), 60).unwrap().unwrap();
+        assert_eq!(leased.id, "t-orphan");
+        let claim_id = leased.claim_id.expect("claim_id");
+
+        let refused = report(&db, &claim_id, "abc1234", "cargo test", &green(), later())
+            .expect_err("a merge with no target lands nothing");
+        assert!(
+            matches!(&refused, Error::Invalid(message) if message.contains("no target")),
+            "unexpected error: {refused:?}"
+        );
+        assert_eq!(
+            get(&db, "t-orphan").unwrap().status,
+            TaskStatus::Wip,
+            "the refused report must roll the merge back"
+        );
+    }
+
+    /// One rule, one place: every human surface — HTTP and MCP alike — refuses
+    /// `merged` and `released`, while the control plane goes on using
+    /// `set_status`.
+    #[test]
+    fn an_operator_may_not_press_merged_or_released() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        work_to_done(&db, "t-1");
+
+        for to in [TaskStatus::Merged, TaskStatus::Released] {
+            let refused = set_status_by_operator(&db, "t-1", to, later())
+                .expect_err("an operator may not press it");
+            assert!(
+                matches!(&refused, Error::Invalid(message) if message.contains("control plane")),
+                "the refusal must name the control plane: {refused:?}"
+            );
+            assert_eq!(
+                get(&db, "t-1").unwrap().status,
+                TaskStatus::Done,
+                "a refusal moves no row"
+            );
+        }
+
+        // Everything else still goes through, and the control plane still lands
+        // the task through `set_status`.
+        let blocked = set_status_by_operator(&db, "t-1", TaskStatus::Blocked, later()).unwrap();
+        assert_eq!(blocked.status, TaskStatus::Blocked);
+        set_status(&db, "t-1", TaskStatus::Ready, later()).unwrap();
+        set_status(&db, "t-1", TaskStatus::Wip, later()).unwrap();
+        set_status(&db, "t-1", TaskStatus::Done, later()).unwrap();
+        let merged = set_status(&db, "t-1", TaskStatus::Merged, later()).unwrap();
+        assert_eq!(merged.status, TaskStatus::Merged);
     }
 }

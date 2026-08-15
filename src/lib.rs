@@ -14,6 +14,7 @@ pub mod db;
 pub mod error;
 pub mod frontmatter;
 pub mod http;
+pub mod mcp;
 pub mod product;
 pub mod state;
 pub mod task;
@@ -53,6 +54,10 @@ pub fn app(state: AppState) -> Router {
         .route("/healthz", get(http::healthz))
         .route("/worker/claim", post(http::worker_claim))
         .route("/worker/report", post(http::worker_report))
+        // Same domain layer, second transport: MCP clients speak here, and the
+        // capability that opens each endpoint is checked before rmcp sees the
+        // request.
+        .merge(mcp::endpoints(&state))
         .nest("/api", api)
         .fallback_service(
             ServeDir::new(&static_dir).fallback(ServeFile::new(static_dir.join("index.html"))),

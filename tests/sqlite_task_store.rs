@@ -85,16 +85,36 @@ fn instant_merge_task_is_claimed_before_higher_priority_normal_task() {
     let db = Db::open_in_memory().unwrap();
     product::upsert(&db, &product_at("household/tasks", true), now()).unwrap();
 
-    for new in [
-        new_task("t-normal", "household/tasks", TaskKind::Normal, 100),
-        new_task("t-instant", "household/tasks", TaskKind::InstantMerge, 0),
-    ] {
-        task::create(&db, &new, now()).unwrap();
-        task::set_status(&db, &new.id, TaskStatus::Ready, now()).unwrap();
-    }
+    // The instant task comes from the control plane, the only issuer of one:
+    // finished work first, then the merge that lands it. It inherits the
+    // target's priority of 0, so what puts it at the head of the queue is its
+    // kind and nothing else.
+    let target = new_task("t-target", "household/tasks", TaskKind::Normal, 0);
+    task::create(&db, &target, now()).unwrap();
+    task::set_status(&db, &target.id, TaskStatus::Ready, now()).unwrap();
+    let leased = task::claim(&db, "worker-0", now(), TTL).unwrap().unwrap();
+    assert_eq!(leased.id, "t-target");
+    task::report(
+        &db,
+        &leased.claim_id.expect("claim_id"),
+        "abc1234",
+        "cargo test",
+        &[],
+        now(),
+    )
+    .unwrap();
+
+    let normal = new_task("t-normal", "household/tasks", TaskKind::Normal, 100);
+    task::create(&db, &normal, now()).unwrap();
+    task::set_status(&db, &normal.id, TaskStatus::Ready, now()).unwrap();
+
+    let merge = task::issue_merge(&db, "t-target", now()).unwrap();
+    assert_eq!(merge.kind, TaskKind::InstantMerge);
+    assert_eq!(merge.priority, 0);
+    assert_eq!(merge.status, TaskStatus::Ready);
 
     let first = task::claim(&db, "worker-a", now(), TTL).unwrap().unwrap();
-    assert_eq!(first.id, "t-instant");
+    assert_eq!(first.id, merge.id);
     assert_eq!(first.status, TaskStatus::Wip);
     assert_eq!(first.claimed_by.as_deref(), Some("worker-a"));
     assert!(first.claim_id.is_some());
@@ -105,6 +125,26 @@ fn instant_merge_task_is_claimed_before_higher_priority_normal_task() {
     assert_ne!(second.claim_id, first.claim_id);
 
     assert!(task::claim(&db, "worker-c", now(), TTL).unwrap().is_none());
+}
+
+/// The kind a task is filed as is not the caller's to choose: a merge is issued
+/// against the task it lands, and one made by hand would have nothing to land.
+#[test]
+fn an_instant_merge_task_cannot_be_created_directly() {
+    let db = Db::open_in_memory().unwrap();
+    product::upsert(&db, &product_at("household/tasks", true), now()).unwrap();
+
+    let refused = task::create(
+        &db,
+        &new_task("t-forged", "household/tasks", TaskKind::InstantMerge, 0),
+        now(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&refused, Error::Invalid(message) if message.contains("/api/merges")),
+        "unexpected error: {refused:?}"
+    );
+    assert!(matches!(task::get(&db, "t-forged"), Err(Error::NotFound)));
 }
 
 #[test]

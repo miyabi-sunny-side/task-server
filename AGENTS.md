@@ -1,7 +1,7 @@
 # task-server
 
-Task control plane. One Axum process owns one sqlite database and serves both
-the JSON API and the compiled client.
+Task control plane. One Axum process owns one sqlite database and serves the
+JSON API, the MCP endpoints, and the compiled client.
 
 ## Invariants
 
@@ -9,7 +9,8 @@ the JSON API and the compiled client.
   `IMMEDIATE` so concurrent writers serialize at `BEGIN`.
 - The database lives at `APP_DB_PATH` (default `data/task-server.db`).
   Migrations run at open and are keyed on `PRAGMA user_version`.
-- HTTP is the only way in. There is no file store and no git side effect.
+- HTTP is the only way in, carrying both the JSON API and the MCP endpoints.
+  There is no file store and no git side effect.
 - There is no physical delete. Discarding a task is a transition to
   `cancelled` or `dropped`, so the row stays auditable.
 - Product ids are `org/repo`, never a path. Task ids are one path segment.
@@ -28,9 +29,19 @@ the JSON API and the compiled client.
   automated client branches on; the message is not. A request body that is not
   JSON never reaches the domain: the axum extractor rejects it first, with 400
   and a plain-text explanation that carries no `code`.
-- `merged` and `released` belong to the control plane. `POST /api/tasks/{id}/status`
-  refuses both, and `available_transitions` never offers them; the transition
-  table still allows them because the control plane goes through it.
+- `merged` and `released` belong to the control plane. Every operator surface
+  goes through `task::set_status_by_operator`, which refuses both before
+  delegating to `set_status`, so `POST /api/tasks/{id}/status` and the MCP
+  `task_set_status` tool answer the same refusal from one place. The control
+  plane keeps calling `set_status` directly, `available_transitions` never
+  offers either, and the transition table still allows them because the control
+  plane goes through it.
+- Only the control plane issues `instant:merge`. `task::create` refuses that
+  kind outright, so `POST /api/tasks` answers 400 with code `invalid` and the
+  MCP `task_create` tool has no `kind` argument to choose from. A merge task is
+  written by `task::issue_merge` alone, against a target it names; an orphan
+  merge would be claimed first, could never be reported, and would block the
+  queue.
 - A task is mergeable when it is `normal`, `done`, carries a `branch` and a
   `commit_sha`, and no live merge already targets it. `POST /api/merges` issues
   one `instant:merge` task per target, in `ready`, inheriting the target's
@@ -62,8 +73,35 @@ the JSON API and the compiled client.
   The browser does not mint identity.
 - Human mutation requires an allowlisted ingress identity, a matching
   `Origin`, and `X-CSRF-Token`. Worker capability is not sufficient.
+- MCP is a second transport, not a second domain. `/mcp` and `/worker/mcp` are
+  Streamable HTTP endpoints in the same process, and every tool decodes its
+  arguments and calls `src/task.rs` or `src/product.rs`. The transition table,
+  the catalogue gate, and the SQL are never duplicated there.
+- Each MCP endpoint has its own bearer: `MCP_CAPABILITY` for `/mcp`,
+  `WORKER_CAPABILITY` for `/worker/mcp`. A worker credential never opens task
+  CRUD. The check runs before rmcp sees the request, so a missing or mismatched
+  bearer is 401 and gets no JSON-RPC answer at all.
+- Ingress identity, `Origin`, and CSRF are not applied to MCP; the bearer is the
+  gate for authorization. The `Host` allowlist is a separate gate and stays on:
+  rmcp's loopback-only default is what stops DNS rebinding, and the bearer does
+  not replace it because a development capability is a published constant. An
+  undeclared `Host` is refused with 403 before JSON-RPC. `APP_MCP_ALLOWED_HOSTS`
+  declares the authorities a published deployment answers to and replaces the
+  default; it is never switched off.
+- `/mcp` carries `product_list`, `task_create`, `task_get`, `task_list`,
+  `task_update`, and `task_set_status`; `/worker/mcp` carries `task_claim` and
+  `task_report`. Catalogue writes, merges, and releases are human decisions and
+  have no tool; `task_create` files ordinary work and takes no `kind`, and
+  `task_set_status` refuses `merged` and `released` with code `invalid` through
+  the same domain function the HTTP status route calls.
+- A refusal the domain owns is not a protocol failure: it is a tool result with
+  `isError: true` whose `structuredContent` is the same `{"error", "code"}` pair
+  HTTP answers with, repeated in the text content. Arguments that fail to
+  deserialize are also `isError: true` but carry text alone and no `code`; an
+  unknown method or tool name is a JSON-RPC error.
 - `TASK_SERVER_ENV=production` is fail-closed without `WORKER_CAPABILITY`,
-  `APP_AUTH_ALLOWLIST`, `APP_CSRF_TOKEN`, and `APP_ALLOWED_ORIGINS`.
+  `MCP_CAPABILITY`, `APP_MCP_ALLOWED_HOSTS`, `APP_AUTH_ALLOWLIST`,
+  `APP_CSRF_TOKEN`, and `APP_ALLOWED_ORIGINS`.
 - Unknown `/api/*` paths return the 404 JSON refusal, code `not_found`. Every
   other unknown path falls back to `client/dist/index.html` so the client router
   can restore a deep link.
@@ -91,6 +129,8 @@ Sideways from any live status: `blocked`, `cancelled`, `dropped`.
 | GET | `/api/products`, `/api/products/{id}` | read |
 | PUT | `/api/products/{id}` | human mutation |
 | POST | `/worker/claim`, `/worker/report` | worker capability |
+| POST | `/mcp` | bearer `MCP_CAPABILITY` |
+| POST | `/worker/mcp` | bearer `WORKER_CAPABILITY` |
 
 `GET /api/tasks` returns summaries and hides `released` unless `?status=` asks
 for a status explicitly; an unknown status is a 400. Single-task responses are
