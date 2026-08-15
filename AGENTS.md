@@ -30,8 +30,8 @@ tree. Version 0.1.0.
   with a new `claim_id`. A report with a stale `claim_id` is rejected.
 - Clock is injectable. Default claim TTL is 3600 seconds (`CLAIM_TTL_SECS`).
 - `available_actions(status)` and action translation share one table.
-- If `target_space` is `tasks`, `ready → awaiting_user` is allowed without
-  `running` (self-service).
+- If `target_space` is `household/tasks`, `ready → awaiting_user` is allowed
+  without `running` (self-service).
 
 ## Status vocabulary
 

@@ -79,7 +79,7 @@ impl TransitionContext {
 
     #[must_use]
     pub fn is_self_service(&self) -> bool {
-        self.effective_product_id() == Some("tasks")
+        self.effective_product_id() == Some("household/tasks")
     }
 }
 
@@ -197,25 +197,27 @@ fn require_field(doc: &Document, name: &str) -> Result<String, Error> {
 }
 
 fn check_product_id(name: &str, value: &str) -> Result<(), Error> {
-    if value.contains("..") || value.contains('/') || value.contains('\\') {
-        return Err(Error::Invalid(format!(
-            "invalid {name} '{value}' (product id, not a path)"
-        )));
+    let invalid = || Error::Invalid(format!("invalid {name} '{value}' (org/repo, not a path)"));
+    if value.contains('\\') || value.contains("..") {
+        return Err(invalid());
     }
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return Err(Error::Invalid(format!(
-            "invalid {name} '{value}' (product id, not a path)"
-        )));
+    let mut parts = value.split('/');
+    let (Some(org), Some(repo), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(invalid());
     };
-    if !first.is_ascii_alphanumeric()
-        || !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
-    {
-        return Err(Error::Invalid(format!(
-            "invalid {name} '{value}' (product id, not a path)"
-        )));
+    if !segment_ok(org) || !segment_ok(repo) {
+        return Err(invalid());
     }
     Ok(())
+}
+
+fn segment_ok(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
 }
 
 fn due_ok(raw: &str) -> bool {

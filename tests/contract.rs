@@ -102,7 +102,7 @@ fn awaiting_user_fixture(title: &str, space: &str) -> Vec<u8> {
 
 #[test]
 fn frontmatter_rewrite_preserves_markdown_body_bytes() {
-    let fixture = ready_fixture("本文保存", "workers");
+    let fixture = ready_fixture("本文保存", "sunny-side/workers");
     assert!(
         !fixture.ends_with(b"\n"),
         "fixture must omit a trailing newline"
@@ -133,7 +133,7 @@ fn frontmatter_rewrite_preserves_markdown_body_bytes() {
 #[test]
 fn claim_then_report_flips_status_in_one_git_commit_and_preserves_body() {
     let (_tmp, root) = init_repo();
-    let fixture = ready_fixture("claim-report", "workers");
+    let fixture = ready_fixture("claim-report", "sunny-side/workers");
     let original_body = split_document(&fixture).unwrap().body;
     commit_file(&root, &task_rel("alpha"), &fixture, "add alpha");
     let before_log = git(&root, &["rev-list", "--count", "HEAD"]);
@@ -215,7 +215,7 @@ fn expired_lease_can_be_reclaimed_and_stale_claim_id_report_is_rejected() {
     commit_file(
         &root,
         &task_rel("beta"),
-        &ready_fixture("reclaim", "workers"),
+        &ready_fixture("reclaim", "sunny-side/workers"),
         "add beta",
     );
     let clock = SharedClock::at(datetime!(2026-08-15 00:00:00 UTC));
@@ -259,7 +259,7 @@ fn unexpired_claim_is_exclusive() {
     commit_file(
         &root,
         &task_rel("gamma"),
-        &ready_fixture("exclusive", "workers"),
+        &ready_fixture("exclusive", "sunny-side/workers"),
         "add gamma",
     );
     let state = AppState::for_test(&root);
@@ -282,13 +282,13 @@ fn claim_returns_at_most_one_ready_task() {
     commit_file(
         &root,
         &task_rel("one"),
-        &ready_fixture("one", "workers"),
+        &ready_fixture("one", "sunny-side/workers"),
         "add one",
     );
     commit_file(
         &root,
         &task_rel("two"),
-        &ready_fixture("two", "workers"),
+        &ready_fixture("two", "sunny-side/workers"),
         "add two",
     );
     let state = AppState::for_test(&root);
@@ -317,7 +317,7 @@ fn notify_failure_does_not_roll_back_status_commit_and_outbox_keeps_intent() {
     commit_file(
         &root,
         &task_rel("delta"),
-        &ready_fixture("notify", "workers"),
+        &ready_fixture("notify", "sunny-side/workers"),
         "add delta",
     );
     let state = AppState::for_test(&root).with_notifier(Arc::new(FailingNotifier));
@@ -354,7 +354,7 @@ async fn identity_header_alone_does_not_authenticate_worker_or_human_mutation() 
     commit_file(
         &root,
         &task_rel("eps"),
-        &awaiting_user_fixture("authz", "workers"),
+        &awaiting_user_fixture("authz", "sunny-side/workers"),
         "add eps",
     );
     let state = AppState::for_test(&root);
@@ -404,7 +404,7 @@ async fn worker_capability_cannot_post_human_action() {
     commit_file(
         &root,
         &task_rel("zeta"),
-        &awaiting_user_fixture("cap", "workers"),
+        &awaiting_user_fixture("cap", "sunny-side/workers"),
         "add zeta",
     );
     let state = AppState::for_test(&root);
@@ -476,25 +476,25 @@ fn awaiting_user_actions_translate_to_canonical_status() {
     commit_file(
         &root,
         &task_rel("act-done"),
-        &awaiting_user_fixture("done", "workers"),
+        &awaiting_user_fixture("done", "sunny-side/workers"),
         "add act-done",
     );
     commit_file(
         &root,
         &task_rel("act-push"),
-        &awaiting_user_fixture("push", "workers"),
+        &awaiting_user_fixture("push", "sunny-side/workers"),
         "add act-push",
     );
     commit_file(
         &root,
         &task_rel("act-ask"),
-        &awaiting_user_fixture("ask", "workers"),
+        &awaiting_user_fixture("ask", "sunny-side/workers"),
         "add act-ask",
     );
     commit_file(
         &root,
         &task_rel("act-bump"),
-        &awaiting_user_fixture("bump", "workers"),
+        &awaiting_user_fixture("bump", "sunny-side/workers"),
         "add act-bump",
     );
     let state = AppState::for_test(&root);
@@ -532,7 +532,7 @@ fn awaiting_user_actions_translate_to_canonical_status() {
     );
     assert_eq!(
         get_str(&doc.frontmatter, "release_repo").as_deref(),
-        Some("workers")
+        Some("sunny-side/workers")
     );
 
     assert!(apply_human_action(&state, "act-done", "explode", None).is_err());
@@ -541,7 +541,7 @@ fn awaiting_user_actions_translate_to_canonical_status() {
 #[test]
 fn self_service_ready_to_awaiting_user_is_allowed_when_target_space_is_tasks() {
     let tasks_ctx = TransitionContext {
-        target_space: Some("tasks".into()),
+        target_space: Some("household/tasks".into()),
         product_id: None,
     };
     assert!(can_transition(
@@ -550,7 +550,7 @@ fn self_service_ready_to_awaiting_user_is_allowed_when_target_space_is_tasks() {
         &tasks_ctx
     ));
     let workers_ctx = TransitionContext {
-        target_space: Some("workers".into()),
+        target_space: Some("sunny-side/workers".into()),
         product_id: None,
     };
     assert!(!can_transition(
@@ -563,13 +563,13 @@ fn self_service_ready_to_awaiting_user_is_allowed_when_target_space_is_tasks() {
     commit_file(
         &root,
         &task_rel("self"),
-        &ready_fixture("self-service", "tasks"),
+        &ready_fixture("self-service", "household/tasks"),
         "add self",
     );
     commit_file(
         &root,
         &task_rel("other"),
-        &ready_fixture("not-self", "workers"),
+        &ready_fixture("not-self", "sunny-side/workers"),
         "add other",
     );
     let state = AppState::for_test(&root);
@@ -593,7 +593,7 @@ async fn worker_claim_http_returns_a_real_task() {
     commit_file(
         &root,
         &task_rel("http1"),
-        &ready_fixture("via-http", "workers"),
+        &ready_fixture("via-http", "sunny-side/workers"),
         "add http1",
     );
     let state = AppState::for_test(&root);
@@ -634,7 +634,7 @@ async fn report_is_idempotent_for_the_same_claim_and_sha() {
     commit_file(
         &root,
         &task_rel("idem"),
-        &ready_fixture("idem", "workers"),
+        &ready_fixture("idem", "sunny-side/workers"),
         "add idem",
     );
     let state = AppState::for_test(&root);
@@ -667,7 +667,7 @@ async fn human_mutation_requires_origin_and_csrf() {
     commit_file(
         &root,
         &task_rel("origin"),
-        &awaiting_user_fixture("origin", "workers"),
+        &awaiting_user_fixture("origin", "sunny-side/workers"),
         "add origin",
     );
     let state = AppState::for_test(&root);
