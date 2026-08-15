@@ -42,6 +42,33 @@ export interface TaskCard {
   available_transitions: string[];
 }
 
+// A refusal the server explained. The message is the human wording the
+// operator reads; `code` is the stable slug a branch may test.
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code: string;
+
+  constructor(status: number, code: string, message: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+function refusal(status: number, body: string): ApiError {
+  try {
+    const parsed = JSON.parse(body) as { error?: unknown; code?: unknown };
+    if (typeof parsed.error === "string" && parsed.error !== "") {
+      const code = typeof parsed.code === "string" ? parsed.code : "";
+      return new ApiError(status, code, parsed.error);
+    }
+  } catch {
+    // not the documented error envelope; fall back to the status alone
+  }
+  return new ApiError(status, "", `HTTP ${status}`);
+}
+
 async function requestJson<T>(url: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   for (const [key, value] of Object.entries(authHeaders())) {
@@ -51,9 +78,17 @@ async function requestJson<T>(url: string, init: RequestInit = {}): Promise<T> {
   }
   const response = await fetch(url, { ...init, headers });
   if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
+    throw refusal(response.status, await response.text());
   }
   return (await response.json()) as T;
+}
+
+function postJson<T>(url: string, body: unknown): Promise<T> {
+  return requestJson(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
 }
 
 export function fetchTasks(
@@ -71,9 +106,40 @@ export function fetchTask(id: string, signal?: AbortSignal): Promise<TaskCard> {
 }
 
 export function postTaskStatus(id: string, status: string): Promise<TaskCard> {
-  return requestJson(`/api/tasks/${encodeURIComponent(id)}/status`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ status }),
-  });
+  return postJson(`/api/tasks/${encodeURIComponent(id)}/status`, { status });
+}
+
+export interface Releasable {
+  product_id: string;
+  task_count: number;
+}
+
+// What the top page needs to decide whether merge and release are live.
+export interface ControlPlane {
+  mergeable: TaskSummary[];
+  pending_merges: TaskSummary[];
+  releasable: Releasable[];
+}
+
+export interface ReleaseResult {
+  product_id: string;
+  tag: string;
+  released: TaskSummary[];
+}
+
+export function fetchControl(signal?: AbortSignal): Promise<ControlPlane> {
+  return requestJson("/api/control", { signal });
+}
+
+// Issue the merge task for one finished task. One target per request: the
+// server refuses a second merge for the same target with 409.
+export function postMerge(taskId: string): Promise<TaskCard> {
+  return postJson("/api/merges", { task_id: taskId });
+}
+
+export function postRelease(
+  productId: string,
+  tag: string,
+): Promise<ReleaseResult> {
+  return postJson("/api/releases", { product_id: productId, tag });
 }

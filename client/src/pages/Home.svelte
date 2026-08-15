@@ -1,125 +1,182 @@
 <script lang="ts">
-  import { fetchTasks, type TaskSummary } from "../lib/api";
+  import ControlPanel, { type ActionResult } from "../lib/ControlPanel.svelte";
+  import ReleaseModal from "../lib/ReleaseModal.svelte";
+  import StatusTaskList from "../lib/StatusTaskList.svelte";
+  import {
+    fetchControl,
+    fetchTasks,
+    postMerge,
+    postRelease,
+    type ControlPlane,
+    type TaskSummary,
+  } from "../lib/api";
 
-  type ListState = "loading" | "empty" | "error" | "success";
+  type FetchState = "loading" | "error" | "ready";
 
+  let plane = $state<ControlPlane | undefined>();
+  let controlState = $state<FetchState>("loading");
   let items = $state<TaskSummary[]>([]);
-  let listState = $state<ListState>("loading");
+  let listState = $state<FetchState>("loading");
 
-  let controller: AbortController | undefined;
-  let loadedOnce = false;
+  let busy = $state<"" | "merge" | "release">("");
+  let result = $state<ActionResult>({ kind: "none", message: "" });
+  let modalOpen = $state(false);
+  let releaseError = $state("");
 
-  async function load() {
-    controller?.abort();
-    controller = new AbortController();
-    if (!loadedOnce) {
+  let controlController: AbortController | undefined;
+  let listController: AbortController | undefined;
+  let controlLoaded = false;
+  let listLoaded = false;
+
+  function aborted(error: unknown): boolean {
+    return error instanceof DOMException && error.name === "AbortError";
+  }
+
+  function reason(error: unknown): string {
+    return error instanceof Error && error.message !== ""
+      ? error.message
+      : "原因不明のエラー";
+  }
+
+  async function loadControl() {
+    controlController?.abort();
+    controlController = new AbortController();
+    if (!controlLoaded) {
+      controlState = "loading";
+    }
+    try {
+      plane = await fetchControl(controlController.signal);
+      controlState = "ready";
+      controlLoaded = true;
+    } catch (error) {
+      if (!aborted(error)) {
+        controlState = "error";
+      }
+    }
+  }
+
+  async function loadList() {
+    listController?.abort();
+    listController = new AbortController();
+    if (!listLoaded) {
       listState = "loading";
     }
     try {
-      items = await fetchTasks(controller.signal);
-      listState = items.length === 0 ? "empty" : "success";
-      loadedOnce = true;
+      items = await fetchTasks(listController.signal);
+      listState = "ready";
+      listLoaded = true;
     } catch (error) {
-      if (error instanceof DOMException && error.name === "AbortError") {
-        return;
+      if (!aborted(error)) {
+        listState = "error";
       }
-      listState = "error";
+    }
+  }
+
+  // Two requests, two regions: one failing never hides the other.
+  function loadBoth(): Promise<unknown> {
+    return Promise.all([loadControl(), loadList()]);
+  }
+
+  // No confirmation step: nothing is chosen, so nothing is asked. One request
+  // per candidate, and a partial failure is reported as such.
+  async function onmerge() {
+    const targets = plane?.mergeable ?? [];
+    if (targets.length === 0 || busy !== "") {
+      return;
+    }
+    busy = "merge";
+    result = { kind: "none", message: "" };
+    const outcomes = await Promise.allSettled(
+      targets.map((target) => postMerge(target.id)),
+    );
+    const issued = outcomes.filter((one) => one.status === "fulfilled").length;
+    const failures = outcomes
+      .filter((one) => one.status === "rejected")
+      .map((one) => reason(one.reason));
+    busy = "";
+    result =
+      failures.length === 0
+        ? { kind: "success", message: `merge task を ${issued} 件発行しました` }
+        : {
+            kind: "error",
+            message: `merge task を ${issued} 件発行し、${failures.length} 件失敗しました: ${[...new Set(failures)].join(" / ")}`,
+          };
+    await loadBoth();
+  }
+
+  function onrelease() {
+    if ((plane?.releasable ?? []).length === 0) {
+      return;
+    }
+    releaseError = "";
+    modalOpen = true;
+  }
+
+  function closeModal() {
+    modalOpen = false;
+    // Focus returns to the control that opened the modal (DESIGN.md, Modals).
+    queueMicrotask(() => document.getElementById("control-release")?.focus());
+  }
+
+  async function onconfirmRelease(productId: string, tag: string) {
+    busy = "release";
+    releaseError = "";
+    try {
+      const released = await postRelease(productId, tag);
+      closeModal();
+      result = {
+        kind: "success",
+        message: `${released.product_id} を ${released.tag} で release しました (${released.released.length} 件)`,
+      };
+      busy = "";
+      await loadBoth();
+    } catch (error) {
+      // A refused release is corrected where the tag was typed.
+      releaseError = reason(error);
+      busy = "";
     }
   }
 
   function onVisibilityChange() {
     if (document.visibilityState === "visible") {
-      void load();
+      void loadBoth();
     }
   }
 
   $effect(() => {
-    void load();
+    void loadBoth();
     document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
-      controller?.abort();
+      controlController?.abort();
+      listController?.abort();
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   });
 </script>
 
-<section class="content" data-state={listState}>
-  {#if listState === "loading"}
-    <p class="state">
-      <span class="spinner" aria-hidden="true"></span>読み込み中…
-    </p>
-  {:else if listState === "empty"}
-    <p class="state">タスクがありません</p>
-  {:else if listState === "error"}
-    <div class="state-wrap">
-      <p class="state error">読み込みに失敗しました</p>
-      <button class="btn" type="button" onclick={() => void load()}>
-        再試行
-      </button>
-    </div>
-  {:else}
-    <ul class="cards">
-      {#each items as item (item.id)}
-        <li>
-          <a class="card" href={`/tasks/${item.id}`}>
-            <span class="name">{item.title}</span>
-            <span class="tags">
-              {#if item.kind === "instant:merge"}
-                <span class="badge">instant:merge</span>
-              {/if}
-              <span class="updated">{item.status}</span>
-            </span>
-          </a>
-        </li>
-      {/each}
-    </ul>
-  {/if}
-</section>
+<div class="content">
+  <ControlPanel
+    fetchState={controlState}
+    {plane}
+    {busy}
+    {result}
+    {onmerge}
+    {onrelease}
+    onretry={() => void loadControl()}
+  />
+  <StatusTaskList
+    fetchState={listState}
+    {items}
+    onretry={() => void loadList()}
+  />
+</div>
 
-<style lang="sass">
-  .cards
-    display: flex
-    flex-direction: column
-    gap: var(--sp-2)
-    margin: 0
-    padding: 0
-    list-style: none
-
-  .card
-    display: flex
-    align-items: baseline
-    justify-content: space-between
-    gap: var(--sp-2)
-    padding: 10px
-    border: 1px solid var(--c-border)
-    border-radius: var(--radius-md)
-    background: var(--c-surface-raised)
-    color: var(--c-on-surface)
-    text-decoration: none
-
-    &:hover
-      background: var(--c-hover-1)
-
-  .name
-    font-size: var(--fs-md)
-    font-weight: 500
-
-  .tags
-    display: flex
-    flex-shrink: 0
-    align-items: baseline
-    gap: var(--sp-2)
-
-  .badge
-    padding: var(--sp-1) var(--sp-2)
-    border: 1px solid var(--c-border)
-    border-radius: var(--radius-full)
-    font-size: var(--fs-xs)
-    line-height: 1.4
-    color: var(--c-muted)
-
-  .updated
-    flex-shrink: 0
-    font-size: var(--fs-xs)
-    color: var(--c-muted)
-</style>
+{#if modalOpen}
+  <ReleaseModal
+    releasable={plane?.releasable ?? []}
+    busy={busy === "release"}
+    error={releaseError}
+    onclose={closeModal}
+    onconfirm={(productId, tag) => void onconfirmRelease(productId, tag)}
+  />
+{/if}

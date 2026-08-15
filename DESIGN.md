@@ -158,9 +158,13 @@ components:
 ## Overview
 
 Task Server is the household **task control plane**. It ships the Sumi
-app shell — header, menu, theme system, a task-list top page and a Task
+app shell — header, menu, theme system, an operator top page and a Task
 Card detail page — so a human can read a card (body, verification,
 commit) and press an action, while workers claim and report over HTTP.
+The top page is where the two screen-level moves live: **merge** (issue
+the instant tasks that land finished work) and **release** (ship the
+landed work of one product under a tag), over the open work grouped by
+status.
 
 The personality is **calm, quiet, and tool-like**: content first, chrome
 recedes into neutral ink tones, color only where it means something. The
@@ -277,10 +281,22 @@ The shell stacks three rows:
    title link or the browser itself.
 3. **Main content**, the only scrolling region.
 
-One breakpoint: **768px**. Below it, a single column with `--sp-3` side
-gutters; at and above, the content column centers at max-width 720px with
-`--sp-5` gutters. Bands stay full-width at all widths. The page never
-scrolls horizontally at 320px and up.
+**Screen-level controls are content, not chrome.** A screen that offers
+actions on the whole screen's subject — the top page's merge and release
+— places them as the **first block inside the content column**. It is
+never a third band, never sticky, and never full-width: the two bands
+above stay the only bands, and main content stays the only scrolling
+region, so the controls scroll away with the work they act on.
+
+One breakpoint: **768px**, and it moves the **vertical** rhythm only.
+The content column is `max-width: 720px`, centered at every width, with
+`--sp-3` (12px) side gutters that never change — the max-width already
+does the horizontal work, so widening the gutter on a wide screen would
+only shorten the reading measure for nothing. Vertical padding is
+`--sp-4` below the breakpoint and `--sp-5` at and above it. Every box is
+`border-box`, so on a viewport wide enough for the whole column the
+column measures 720px and its children 696px. Bands stay full-width at
+all widths. The page never scrolls horizontally at 320px and up.
 
 Spacing snaps to the 4px scale `--sp-1..5` (4/8/12/16/24px). Default
 rhythm: 8px gap between cards, 10px card padding, 16px modal padding.
@@ -374,18 +390,104 @@ currently uses it.
   storage) and **does not close the modal** — the user watches the
   theme change live. Close via ×, Esc, or scrim; focus returns to the
   hamburger.
-- **Top page — task list:** cards per the family recipe
-  (surface-raised, 1px hairline, 8px radius, 10px padding) in a single
-  column with 8px gaps; each card links to its Task Card and shows the
-  task title (label) and status (caption muted). A task whose `kind` is
-  `instant:merge` also carries the outline badge, left of the status.
-  The list container
-  exposes `data-state="loading|empty|error|success"`:
+- **Top page — control panel over the task list.** The operator's
+  screen: one panel of screen-level controls, then the open work grouped
+  by status. It reads two sources — the control plane (what is
+  mergeable, what merges are already in flight, what is releasable) and
+  the task list — and **each region carries its own
+  `data-state`**, so a failure or an emptiness on one side never masks
+  the other.
+
+  **Control panel.** The first block of the content column, built from
+  the card recipe (surface-raised, 1px hairline, md radius, 10px
+  padding), `--sp-3` between its rows. It holds two control rows, each a
+  button beside a note that explains the button's current standing:
+
+  - **merge** — issues a merge task for every currently mergeable task,
+    one request per task, with **no confirmation step**: nothing is
+    chosen, so nothing is asked. It is the top page's **single primary
+    (accent-filled) button, and only while it is enabled**; with nothing
+    to merge it wears the default treatment plus the disabled one.
+  - **release** — a **default button, never accent-filled**, that opens
+    the release modal. Merge is the routine daily move and release is
+    the occasional one, so merge takes the page's one accent fill and
+    release takes its own inside the modal it opens.
+
+  Each note takes one of exactly two shapes: the **count pill** (badge
+  recipe, full radius) of what the button would act on when that count
+  is above zero, or the **muted caption naming the reason** when it is
+  zero — "merge 可能な task はありません" / "release 可能な product は
+  ありません". A disabled control always says why in text beside it and
+  points at that text with `aria-describedby`; opacity alone never
+  carries the reason.
+
+  When merges are in flight, the panel carries them below the rows: a
+  muted caption ("merge 進行中") over the ordinary card list of those
+  merge tasks. **A merge in flight is the state of the control, not open
+  work** — it appears here and nowhere in the status groups.
+
+  The panel exposes `data-state="loading|empty|error|success"` on the
+  same discipline as the list: _loading_ is the centered spinner line
+  with no control rows rendered (never a button that might be showing
+  the wrong standing); _error_ is the danger body-sm line plus a default
+  retry button; _empty_ — nothing mergeable, nothing pending, nothing
+  releasable — still renders **both buttons, both disabled, both with
+  their reason**, because a control that vanishes when idle teaches
+  nothing about what would bring it back; _success_ is the panel above.
+
+  **Result line.** One live region (`aria-live="polite"`) directly under
+  the control rows reports the outcome of the last control action: the
+  spinner line while an action is in flight, a muted caption on success
+  ("merge task を 3 件発行しました"), and the error-banner recipe with
+  `role="alert"` on failure. It persists until the next action —
+  **there is no toast, no timer, and no auto-dismissing message
+  anywhere in this product**. Every successful action reloads both
+  regions, so the changed counts and lists are the real receipt.
+
+  **Task list.** Below the panel, the open tasks grouped by status.
+  `released` is never shown, and `instant:merge` tasks never appear
+  (they belong to the panel). Groups follow the status vocabulary order
+  — `draft`, `ready`, `wip`, `done`, `merged`, then the sidetracks
+  `blocked`, `cancelled`, `dropped` — and **a group holding nothing is
+  not rendered at all**, heading included. Each group is a section
+  carrying its status as a data attribute, headed by a label-type
+  heading naming the status with its count pill beside it; under the
+  heading, cards per the family recipe (surface-raised, 1px hairline,
+  8px radius, 10px padding) in a single column with 8px gaps. A card
+  links to its Task Card and shows the task title (label) with the
+  product id as a muted caption — the group heading already carries the
+  status, so the card does not repeat it. The list container keeps
+  `data-state="loading|empty|error|success"`:
   - _loading:_ centered muted body-sm text with the accent spinner
     (1.5px-stroke circle, 1.1rem);
   - _empty:_ centered muted body-sm message;
   - _error:_ danger-colored body-sm message plus a default retry button;
-  - _success:_ the cards.
+  - _success:_ the groups.
+
+- **Release modal:** opened by the release button; the standard centered
+  modal (lg radius, 16px padding, scrim + shadow; ×, Esc, or scrim
+  closes it and focus returns to the release button). Contents in
+  order — the product choice, the tag field, the action row:
+  - **One releasable product:** no chooser. A muted caption names the
+    product id and how many merged tasks would ship.
+  - **Several:** a `role="radiogroup"` of product rows reusing the
+    selected-radio treatment (accent-subtle fill, sm radius), each row
+    showing the product id (label) and its count pill; the first row is
+    selected when the modal opens, so the field below is always
+    meaningful.
+  - **The tag is required.** One input per the Input recipe with its
+    caption-muted label above it, focused when the modal opens. The
+    confirm button is disabled while the field is blank or whitespace,
+    with the same rule as everywhere: the reason sits in text beside it.
+  - The action row is キャンセル (default) and the confirm
+    (accent-filled). **An open modal is its own primary region**, so
+    this confirm is the modal's single accent fill and does not compete
+    with the merge button behind the scrim.
+  - A refused release keeps the modal open **with the typed tag
+    intact** and shows the server's message in the error-banner recipe
+    inside the modal — a rejected tag is corrected where it was typed.
+    A successful one closes the modal and reports on the panel's result
+    line.
 - **Detail page — Task Card:** sub-header (title only) over a content
   column showing status (an outline badge — caption type, 1px border,
   muted text; neutral chrome, not a data color), `commit_sha` and
@@ -399,9 +501,22 @@ currently uses it.
   icon-dictionary fixture page.
 - **Buttons:** default = surface-raised bg, 1px hairline, label type,
   sm radius, 8×14px padding, hover fills `--c-hover-1`. Primary =
-  accent bg, `surface-raised`-token text — at most one per screen.
-  Quiet = transparent, for icon-buttons in bars. Disabled = 50%
-  opacity, no pointer.
+  accent bg, `surface-raised`-token text — **at most one per primary
+  region**, and a screen has exactly two kinds of region: the page and
+  an open modal. So the page shows at most one accent fill and an open
+  modal shows at most one of its own. A control that is primary only
+  while it is available **drops to the default treatment when it is
+  not** — a dimmed accent fill is never the disabled look.
+  Quiet = transparent, for icon-buttons in bars.
+  **Disabled** = 50% opacity, `cursor: not-allowed`, and activation does
+  nothing. A control disabled **by circumstance** (there is nothing to
+  act on, a required field is blank) stays **focusable** —
+  `aria-disabled="true"` rather than the `disabled` attribute — so a
+  keyboard reaches it and hears the reason its `aria-describedby` names.
+  The `disabled` attribute proper is for the moment an action is in
+  flight, when there is nothing to explain. Disabled text is the one
+  exemption from the AA floor, as an inactive component; nothing else
+  is.
 - **Inputs:** surface bg (one layer below their container), 1px
   hairline, sm radius, body type; focus swaps border to accent under
   the shared focus ring. Labels are caption muted above the field.
@@ -465,6 +580,54 @@ currently uses it.
      control per available transition, with `ready` as the only primary
      button when it is offered. After a successful POST the displayed
      status and buttons match the reloaded card.
+  10. On the top page the content column's first element child is the
+      control panel and the task list follows it. Each carries its own
+      `data-state`; forcing the list request to fail leaves the panel at
+      `success` with working buttons, and forcing the control request to
+      fail leaves the list rendering its groups.
+  11. With at least one mergeable task, the page region contains exactly
+      one accent-filled control and it is the merge button: its computed
+      background equals the accent (`rgb(94, 184, 199)` in Sumi,
+      `rgb(47, 111, 126)` in Kinari). Its note is a pill whose text is
+      the mergeable count and whose computed `border-radius` is 9999px.
+  12. With nothing mergeable, the merge button's computed background
+      equals surface-raised rather than the accent, `aria-disabled` is
+      `"true"`, `opacity` computes to 0.5, `cursor` is `not-allowed`,
+      Tab still lands on it and shows the 2px accent focus ring, the
+      element its `aria-describedby` names is visible with non-empty
+      text, and pressing it fires no request and changes no count.
+  13. Pressing an enabled merge sends exactly one POST per mergeable
+      task; afterwards the mergeable count has dropped to zero, the
+      pending-merge card list has grown by that same number, and the
+      result line (`aria-live="polite"`) is non-empty. At no point does
+      a card for an `instant:merge` task appear inside any status group.
+  14. The release modal opens centered per the modal geometry with the
+      tag input holding focus; its confirm button is `aria-disabled`
+      while the tag is blank or whitespace and drops the attribute once
+      a non-blank tag is typed. With several releasable products a
+      `role="radiogroup"` is present, its first row selected with an
+      accent-subtle background; with exactly one there is no radiogroup
+      and the product id appears as a caption. The open modal contains
+      exactly one accent-filled control. ×, Esc, and the scrim each
+      close it and return focus to the release button.
+  15. A refused release leaves the modal open with the typed tag still
+      in the field and the server's message rendered in the error-banner
+      colors (danger text on danger-subtle) inside the modal. A
+      successful one closes the modal, leaves a non-empty result line on
+      the panel, and the released tasks are gone from the `merged` group
+      on reload.
+  16. Status groups exist in the DOM only when non-empty; their document
+      order is draft, ready, wip, done, merged, blocked, cancelled,
+      dropped; no group for `released` ever exists; each heading's count
+      pill number equals the number of cards under it; `9999px` radius
+      is computed only on count pills and status badges.
+  17. At 375px the panel's buttons and notes wrap without
+      `document.documentElement.scrollWidth` exceeding the viewport,
+      every control's hit box is at least 36px tall, and no control row
+      overlaps another (bounding boxes disjoint). At 900px the content
+      column computes to 720px wide with 12px left and right padding and
+      equal left/right margins (±1px), and the panel — its child —
+      computes to 696px.
 
 ## Do's and Don'ts
 
@@ -472,7 +635,18 @@ currently uses it.
   components.
 - Do consume `--c-wash-*` / `--c-hover-*` for bands and hovers; don't
   reach for `accent-subtle` directly in those jobs.
-- Do keep exactly one accent-filled primary action per screen.
+- Do keep exactly one accent-filled primary action per region — one on
+  the page, one inside an open modal; don't dim an accent fill to say
+  "disabled", drop it to the default treatment instead.
+- Do name in text, beside the control, why a disabled control is
+  disabled, and point at that text with `aria-describedby`; don't ship a
+  control whose only signal is 50% opacity, and don't put an
+  unexplainable control out of the keyboard's reach.
+- Do report the outcome of a control action in place and reload the data
+  behind it; don't add a toast, a timer, or a message that dismisses
+  itself.
+- Do drop a status group entirely when it holds nothing; don't render a
+  heading with a zero pill under it.
 - Do present the menu as a hamburger-anchored dropdown; centered
   modals are for dialogs (theme settings), never for navigation.
 - Don't use emoji or text glyphs as icons; every icon is an

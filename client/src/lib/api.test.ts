@@ -1,6 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { fetchTasks, postTaskStatus, type TaskCard } from "./api";
+import {
+  ApiError,
+  fetchControl,
+  fetchTasks,
+  postMerge,
+  postRelease,
+  postTaskStatus,
+  type TaskCard,
+} from "./api";
 import { setSessionCsrf } from "./auth";
 
 const CARD: TaskCard = {
@@ -71,6 +79,97 @@ describe("api", () => {
     expect(headers.get("content-type")).toBe("application/json");
     expect(headers.get("X-CSRF-Token")).toBe("csrf-token-1");
     expect(card).toEqual(CARD);
+  });
+
+  it("reads the control plane from a plain GET", async () => {
+    const plane = {
+      mergeable: [],
+      pending_merges: [],
+      releasable: [{ product_id: "sunny-side/task-server", task_count: 3 }],
+    };
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(jsonResponse(plane));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const control = await fetchControl();
+
+    const [input, init] = fetchMock.mock.calls[0];
+    expect(String(input)).toBe("/api/control");
+    expect(init?.method).toBeUndefined();
+    expect(control).toEqual(plane);
+  });
+
+  it("issues one merge per task id with the auth headers", async () => {
+    setSessionCsrf("csrf-token-2");
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(jsonResponse({ id: "m-1" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await postMerge("t-a");
+
+    const [input, init] = fetchMock.mock.calls[0];
+    expect(String(input)).toBe("/api/merges");
+    expect(init?.method).toBe("POST");
+    expect(init?.body).toBe(JSON.stringify({ task_id: "t-a" }));
+    const headers = new Headers(init?.headers);
+    expect(headers.get("content-type")).toBe("application/json");
+    expect(headers.get("X-CSRF-Token")).toBe("csrf-token-2");
+  });
+
+  it("posts a release with product and tag and returns the released set", async () => {
+    setSessionCsrf("csrf-token-3");
+    const result = {
+      product_id: "sunny-side/task-server",
+      tag: "v0.2.0",
+      released: [],
+    };
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(jsonResponse(result));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const released = await postRelease("sunny-side/task-server", "v0.2.0");
+
+    const [input, init] = fetchMock.mock.calls[0];
+    expect(String(input)).toBe("/api/releases");
+    expect(init?.method).toBe("POST");
+    expect(init?.body).toBe(
+      JSON.stringify({ product_id: "sunny-side/task-server", tag: "v0.2.0" }),
+    );
+    const headers = new Headers(init?.headers);
+    expect(headers.get("content-type")).toBe("application/json");
+    expect(headers.get("X-CSRF-Token")).toBe("csrf-token-3");
+    expect(released).toEqual(result);
+  });
+
+  it("carries the server's refusal message and code to the caller", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            error: "task t-a already has a merge in flight",
+            code: "conflict",
+          }),
+          { status: 409, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    );
+
+    const error = await postMerge("t-a").then(
+      () => {
+        throw new Error("postMerge resolved but the server refused");
+      },
+      (rejected: unknown) => rejected,
+    );
+
+    expect(error).toBeInstanceOf(ApiError);
+    const refusal = error as ApiError;
+    expect(refusal.status).toBe(409);
+    expect(refusal.code).toBe("conflict");
+    expect(refusal.message).toBe("task t-a already has a merge in flight");
   });
 
   it("rejects when the server refuses the transition", async () => {

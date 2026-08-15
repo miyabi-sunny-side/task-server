@@ -117,6 +117,15 @@ a
 .btn.primary:hover
   background: var(--c-accent)
 
+// Disabled by circumstance: still focusable, the reason sits in text beside it
+// (DESIGN.md, Buttons).
+.btn[aria-disabled="true"]
+  opacity: 0.5
+  cursor: not-allowed
+
+.btn[aria-disabled="true"]:hover
+  background: var(--c-surface-raised)
+
 .icon-btn
   display: inline-flex
   align-items: center
@@ -132,6 +141,66 @@ a
 
 .icon-btn:hover
   background: var(--c-hover-1)
+
+// Card list recipe, shared by the task list and the panel's pending merges.
+.cards
+  display: flex
+  flex-direction: column
+  gap: var(--sp-2)
+  margin: 0
+  padding: 0
+  list-style: none
+
+.card
+  display: flex
+  align-items: baseline
+  justify-content: space-between
+  gap: var(--sp-2)
+  padding: 10px
+  border: 1px solid var(--c-border)
+  border-radius: var(--radius-md)
+  background: var(--c-surface-raised)
+  color: var(--c-on-surface)
+  text-decoration: none
+
+.card:hover
+  background: var(--c-hover-1)
+
+.card .name
+  font-size: var(--fs-md)
+  font-weight: 500
+  line-height: 1.2
+
+.card .product
+  flex-shrink: 0
+  font-size: var(--fs-xs)
+  line-height: 1.4
+  color: var(--c-muted)
+
+// Count pill (badge recipe) and the muted caption that replaces it at zero.
+.pill
+  padding: var(--sp-1) var(--sp-2)
+  border: 1px solid var(--c-border)
+  border-radius: var(--radius-full)
+  font-size: var(--fs-xs)
+  font-weight: 400
+  line-height: 1.4
+  color: var(--c-muted)
+
+.note
+  margin: 0
+  font-size: var(--fs-xs)
+  line-height: 1.4
+  color: var(--c-muted)
+
+.error-banner
+  margin: 0
+  padding: var(--sp-2)
+  border-radius: var(--radius-sm)
+  background: var(--c-danger-subtle)
+  color: var(--c-danger)
+  font-size: var(--fs-sm)
+  line-height: 1.5
 
 .state-wrap
   text-align: center
