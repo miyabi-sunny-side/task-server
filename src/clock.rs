@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
-use time::OffsetDateTime;
+use time::macros::format_description;
+use time::{OffsetDateTime, UtcOffset};
 
 pub trait Clock: Send + Sync {
     fn now(&self) -> OffsetDateTime;
@@ -41,4 +42,14 @@ impl Clock for SharedClock {
     fn now(&self) -> OffsetDateTime {
         *self.now.lock().expect("clock mutex")
     }
+}
+
+/// Render a datetime as the stored `YYYY-MM-DDTHH:MM:SSZ` form.
+#[must_use]
+pub fn format_z(dt: OffsetDateTime) -> String {
+    const FORMAT: &[time::format_description::FormatItem<'static>] =
+        format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
+    dt.to_offset(UtcOffset::UTC)
+        .format(FORMAT)
+        .expect("datetime format")
 }

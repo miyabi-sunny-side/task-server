@@ -196,7 +196,7 @@ fn require_field(doc: &Document, name: &str) -> Result<String, Error> {
         .ok_or_else(|| Error::Invalid(format!("missing {name}")))
 }
 
-fn check_product_id(name: &str, value: &str) -> Result<(), Error> {
+pub(crate) fn check_product_id(name: &str, value: &str) -> Result<(), Error> {
     let invalid = || Error::Invalid(format!("invalid {name} '{value}' (org/repo, not a path)"));
     if value.contains('\\') || value.contains("..") {
         return Err(invalid());

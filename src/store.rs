@@ -6,9 +6,10 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
-use time::{OffsetDateTime, PrimitiveDateTime, UtcOffset};
+use time::{OffsetDateTime, PrimitiveDateTime};
 
 use crate::actions::ActionTable;
+use crate::clock::format_z;
 use crate::error::Error;
 use crate::frontmatter::{Document, get_str, join_document, set_str, split_document};
 use crate::notify::flush_pending;
@@ -425,14 +426,6 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, Error> {
         )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-fn format_z(dt: OffsetDateTime) -> String {
-    const FORMAT: &[time::format_description::FormatItem<'static>] =
-        format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
-    dt.to_offset(UtcOffset::UTC)
-        .format(FORMAT)
-        .expect("datetime format")
 }
 
 fn parse_dt(raw: &str) -> Result<OffsetDateTime, Error> {

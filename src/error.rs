@@ -27,11 +27,19 @@ pub enum Error {
     Git(String),
     #[error("io: {0}")]
     Io(String),
+    #[error("db: {0}")]
+    Db(String),
 }
 
 impl From<std::io::Error> for Error {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value.to_string())
+    }
+}
+
+impl From<rusqlite::Error> for Error {
+    fn from(value: rusqlite::Error) -> Self {
+        Self::Db(value.to_string())
     }
 }
 
@@ -57,7 +65,9 @@ impl IntoResponse for Error {
             Self::UnknownAction | Self::ActionNotAllowed | Self::Invalid(_) => {
                 StatusCode::BAD_REQUEST
             }
-            Self::Frontmatter(_) | Self::Git(_) | Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Frontmatter(_) | Self::Git(_) | Self::Io(_) | Self::Db(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         };
         (status, Json(json!({ "error": self.to_string() }))).into_response()
     }

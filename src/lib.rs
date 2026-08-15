@@ -11,27 +11,33 @@ use tower_http::trace::TraceLayer;
 
 pub mod actions;
 pub mod clock;
+pub mod db;
 pub mod error;
 pub mod frontmatter;
 pub mod http;
 pub mod notify;
 pub mod outbox;
+pub mod product;
 pub mod state;
 pub mod status;
 pub mod store;
+pub mod task;
 
 pub use actions::{ActionEffect, ActionTable};
-pub use clock::{Clock, SharedClock, SystemClock};
+pub use clock::{Clock, SharedClock, SystemClock, format_z};
+pub use db::Db;
 pub use error::Error;
 pub use frontmatter::{Document, join_document, split_document};
 pub use notify::{FailingNotifier, HttpNotifier, NoopNotifier, Notifier, flush_pending};
 pub use outbox::NotificationIntent;
+pub use product::Product;
 pub use state::AppState;
 pub use status::{Status, TransitionContext, can_transition, validate_task};
 pub use store::{
     ClaimLease, ReportOutcome, ReportRequest, TaskCard, TaskSummary, apply_human_action, claim,
     get_task, list_tasks, report, self_service_awaiting_user,
 };
+pub use task::{NewTask, Task, TaskKind, TaskStatus};
 
 pub fn app(state: AppState) -> Router {
     let static_dir = state.static_dir.clone();
