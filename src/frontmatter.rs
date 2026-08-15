@@ -76,7 +76,8 @@ pub fn join_document(doc: &Document) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
-fn serialize_mapping(map: &Mapping) -> Result<String, Error> {
+/// Serialize a mapping as YAML with no document marker and a trailing newline.
+pub fn serialize_mapping(map: &Mapping) -> Result<String, Error> {
     let mut yaml = serde_norway::to_string(&Value::Mapping(map.clone()))?;
     if let Some(rest) = yaml.strip_prefix("---\n") {
         yaml = rest.to_owned();

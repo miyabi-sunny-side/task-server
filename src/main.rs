@@ -4,9 +4,16 @@ use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use task_server::AppState;
-use task_server::state::DEFAULT_BIND_ADDR;
+use task_server::db::Db;
+use task_server::import::{ImportSources, import_markdown};
+use task_server::state::{DEFAULT_BIND_ADDR, DEFAULT_DB_PATH};
+use task_server::{AppState, SystemClock};
 
+const USAGE: &str = "usage: task-server [import-markdown --live <DIR> [--archive <DIR>]]";
+
+/// No arguments is the server. The one subcommand is the markdown import, which
+/// is a migration an operator runs by hand, so it prints a summary and exits
+/// rather than binding a socket.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt()
@@ -15,6 +22,41 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .init();
 
+    let args: Vec<String> = env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None => serve().await,
+        Some("import-markdown") => run_import(&args[1..]),
+        Some(other) => refuse(&format!("unknown subcommand '{other}'")),
+    }
+}
+
+/// Print a usage refusal and exit non-zero. Returning the message as an error
+/// would render it through `Debug`, which escapes the line break the usage
+/// line needs.
+fn refuse(message: &str) -> ! {
+    eprintln!("{message}\n{USAGE}");
+    std::process::exit(1)
+}
+
+/// Import the markdown queue into the database at `APP_DB_PATH`. A refusal is
+/// printed whole — every file and every reason — and exits non-zero, because
+/// nothing was written and the operator has one list to work from.
+fn run_import(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let sources = ImportSources::from_args(args).unwrap_or_else(|error| refuse(&error.to_string()));
+    let db = Db::open(env::var("APP_DB_PATH").unwrap_or_else(|_| DEFAULT_DB_PATH.to_owned()))?;
+    match import_markdown(&db, &sources, &SystemClock) {
+        Ok(summary) => {
+            print!("{summary}");
+            Ok(())
+        }
+        Err(error) => {
+            eprint!("{error}");
+            std::process::exit(1)
+        }
+    }
+}
+
+async fn serve() -> Result<(), Box<dyn Error>> {
     let bind_addr = bind_addr_from_env()?;
     // Fail before the socket exists: a listener that logs "listening" and then
     // exits over a bad seed file is worse than never binding at all.

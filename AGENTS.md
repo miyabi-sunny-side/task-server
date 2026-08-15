@@ -24,6 +24,35 @@ JSON API, the MCP endpoints, and the compiled client.
   transaction. Unreadable, unparseable, or invalid seeds fail the startup with
   nothing written. The roster itself is operational data and is not in the
   repository.
+- `task-server import-markdown --live <DIR> [--archive <DIR>]` is the only
+  subcommand; no arguments is the server. Either directory alone is valid, both
+  omitted is a usage error, and each is read recursively for `*.md` into
+  `APP_DB_PATH`. The import is all or nothing: every file is parsed and checked
+  first, then one transaction writes the lot, so an unreadable file, a missing
+  `title` or `status`, a duplicate id, an unmappable status, or a row already
+  in the database with different content writes nothing and exits non-zero with
+  every refused file listed. The markdown is only read — the import never
+  writes, moves, or deletes a file under either directory.
+- A task id is the file stem, so the same stem in the live queue and the
+  archive is two files claiming one row, not a merge. A file that would write
+  the row already under its id is skipped, so re-running the same input leaves
+  every row as it was.
+- Every v0.1 status reaches the v0.2 vocabulary — `running → wip`,
+  `awaiting_user → done`, `done`, `release_requested`, and `release_failed` →
+  `merged`, everything else under its own name — and an unknown one refuses the
+  import rather than being dropped. `done` is the decision, not a rename: v0.1
+  `done` was accepted, finished work, and importing it as `done` would raise
+  every finished task of the old queue as a merge candidate.
+- Frontmatter the schema has no column for is folded onto the end of the body
+  as one `## Imported v0.1 metadata` YAML block, led by the pre-mapping status,
+  so nothing written down is lost and the mapping reads backwards. Imported rows
+  are `normal` tasks at priority 0 with no branch and no claim. A product the
+  import names that the catalogue lacks is a warning, never a refusal and never
+  an auto-created row; the `ready` gate is what asks for it later.
+- A product reference that does not read as `org/repo` is not a refusal either.
+  It leaves `product_id` unset, keeps its value in the folded block, and is
+  counted on its own summary line — a queue older than the convention migrates
+  without rewriting its archive, and the `ready` gate decides the product later.
 - Every refusal the domain owns — and every unknown `/api/*` path — answers
   `{"error": "<message>", "code": "<slug>"}`. The slug is stable and is what an
   automated client branches on; the message is not. A request body that is not

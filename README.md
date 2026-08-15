@@ -219,6 +219,120 @@ work). Behind a reverse proxy, list the `Host` the proxy forwards, not the
 internal address. `TASK_SERVER_ENV=production` refuses to start without it. Treat
 `MCP_CAPABILITY` and `WORKER_CAPABILITY` as secrets in any case.
 
+## Importing the markdown queue
+
+Before sqlite the queue was a directory of markdown files with YAML
+frontmatter — a live queue and an archive. `import-markdown` is the one
+subcommand, and it reads them into the database; with no arguments the binary
+is still the server.
+
+```sh
+APP_DB_PATH=data/task-server.db \
+  cargo run --locked -- import-markdown --live queue --archive archive
+```
+
+Either directory alone is a valid import and omitting both is a usage error.
+Each is read recursively for `*.md`, so an archive split into year directories
+needs no flattening and no other layout is assumed. The task id is the file
+stem: `queue/t-101.md` becomes task `t-101`, and so the same stem under both
+directories is two files claiming one row rather than a merge. The database is
+whichever one `APP_DB_PATH` names, created with its parent directory if it is
+not there yet, so importing into a fresh file is a normal first run.
+
+The markdown itself is only ever read. The import writes, moves, and deletes
+nothing under either directory; removing the old queue afterwards is a separate
+decision for whoever ran it.
+
+The run is all or nothing. Every file is parsed and checked first, then a
+single transaction writes the lot, so one unreadable file, one file with no
+`title` or `status`, one duplicate id, one status nobody can map, or one row
+already in the database with different content leaves the database exactly as it
+was. Every file the run refused is listed at once rather than one per
+attempt, and the exit code is non-zero:
+
+```text
+import refused (1 problem(s)); nothing was written
+  queue/t-103.md: unknown v0.1 status 'frobnicated'
+```
+
+A run that goes through prints what it did:
+
+```text
+read 3 file(s): 2 live, 1 archive
+inserted 3: wip 1, done 1, merged 1
+skipped 0 (already imported, unchanged)
+warning: 2 product(s) not in the catalogue: example/other, example/repo
+```
+
+Re-running the same input changes nothing: a file that would write the row
+already sitting under its id is skipped, so the second run over those three
+files reports `inserted 0` and `skipped 3`, and no row is rewritten. Editing a
+file that was already imported is not an update — it is the conflict above, and
+it stops the whole run.
+
+The v0.1 statuses land in the v0.2 vocabulary like this:
+
+| v0.1 status | imported as |
+| --- | --- |
+| `running` | `wip` |
+| `awaiting_user` | `done` |
+| `done` | `merged` |
+| `release_requested` | `merged` |
+| `release_failed` | `merged` |
+| `draft`, `ready`, `released`, `blocked`, `cancelled`, `dropped` | unchanged |
+
+`done` is the one that carries a decision rather than a rename: in v0.1 it meant
+the human had accepted the work and it was over, which is `merged` here.
+Importing it as `done` would raise every finished task of the old queue as a
+merge candidate. A status neither the table nor the vocabulary knows refuses the
+import instead of being quietly dropped.
+
+Frontmatter that has a column of its own keeps it: `title`, `commit_sha`,
+`verification`, `release_tag`, and the product, which is `target_space` or
+`product_id` when there is no `target_space`. The product reaches its column
+only when it reads as `org/repo`; a queue old enough to predate that convention
+carries names like `tasks`, and refusing those would mean editing archived
+history to migrate it. Such a row imports with no product, and the value it did
+carry stays in the folded block below. Everything else is folded onto the
+end of the body as one marked YAML block, led by the pre-mapping status, so
+nothing that was written down is lost and the mapping can be read backwards:
+
+````text
+# wire up the health probe
+
+Original body, kept verbatim.
+
+---
+
+## Imported v0.1 metadata
+
+```yaml
+status: running
+area: development
+tags:
+- infra
+```
+````
+
+Imported rows are ordinary work — `normal` kind, priority 0, no branch and no
+claim — and their `created_at` and `updated_at` record when the import ran.
+
+A product the imported rows name but the catalogue does not carry is a warning
+and never a refusal: the import registers no product it was not given. The
+catalogue gate is what asks for it later, so add the product with
+`PUT /api/products/{id}` before promoting an imported task to `ready`. A row
+that kept a pre-convention product reference is counted on its own line and
+reaches the same gate, which refuses it with `product_required` until someone
+decides which product it belongs to:
+
+```text
+read 3 file(s): 1 live, 2 archive
+inserted 3: done 1, merged 1, released 1
+skipped 0 (already imported, unchanged)
+2 task(s) kept a legacy product reference in the body (product_id left unset)
+warning: 1 product(s) not in the catalogue: example/repo
+```
+
 ## Development
 
 Terminal 1, from the repository root:
@@ -260,7 +374,7 @@ cargo build --locked --release
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `APP_DB_PATH` | `data/task-server.db` | SQLite database. Created with its parent directory on first start. |
+| `APP_DB_PATH` | `data/task-server.db` | SQLite database, for the server and for `import-markdown` alike. Created with its parent directory on first use. |
 | `APP_BIND_ADDR` | `127.0.0.1:3000` | HTTP listener. Keep loopback unless you are sure you want otherwise. |
 | `CLAIM_TTL_SECS` | `3600` | Lease lifetime for a claim. |
 | `WORKER_CAPABILITY` | `dev-worker-capability` | Shared secret for `/worker/*`, including `/worker/mcp`. Identity headers never substitute. |

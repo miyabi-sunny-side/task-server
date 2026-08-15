@@ -12,7 +12,7 @@ const COLUMNS: &str = "id, title, body, status, kind, product_id, priority, bran
                        release_tag, created_at, updated_at, merge_target_task_id, checks_json";
 
 /// Every status, in vocabulary order. Used to enumerate legal transitions.
-const ALL_STATUSES: [TaskStatus; 9] = [
+pub(crate) const ALL_STATUSES: [TaskStatus; 9] = [
     TaskStatus::Draft,
     TaskStatus::Ready,
     TaskStatus::Wip,
@@ -780,7 +780,7 @@ pub fn can_transition(from: TaskStatus, to: TaskStatus) -> bool {
     )
 }
 
-fn read(conn: &Connection, id: &str) -> Result<Task, Error> {
+pub(crate) fn read(conn: &Connection, id: &str) -> Result<Task, Error> {
     let sql = format!("SELECT {COLUMNS} FROM tasks WHERE id = ?1");
     query_all(conn, &sql, &[&id])?.pop().ok_or(Error::NotFound)
 }
