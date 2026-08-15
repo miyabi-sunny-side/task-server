@@ -22,10 +22,10 @@ pub use clock::{Clock, SharedClock, SystemClock, format_z};
 pub use db::Db;
 pub use error::Error;
 pub use frontmatter::{Document, join_document, split_document};
-pub use http::{TaskCard, TaskSummary};
+pub use http::{ControlPlane, ReleaseResult, TaskCard, TaskSummary};
 pub use product::Product;
 pub use state::AppState;
-pub use task::{NewTask, Task, TaskKind, TaskPatch, TaskStatus, can_transition};
+pub use task::{Check, NewTask, Releasable, Task, TaskKind, TaskPatch, TaskStatus, can_transition};
 
 pub fn app(state: AppState) -> Router {
     let static_dir = state.static_dir.clone();
@@ -38,6 +38,9 @@ pub fn app(state: AppState) -> Router {
             get(http::api_task).patch(http::api_patch_task),
         )
         .route("/tasks/{id}/status", post(http::api_set_status))
+        .route("/control", get(http::api_control))
+        .route("/merges", post(http::api_issue_merge))
+        .route("/releases", post(http::api_release))
         .route("/products", get(http::api_products))
         // Product ids are `org/repo`, so the capture has to span two segments.
         .route(

@@ -38,17 +38,56 @@ creates the database (and its parent directory) on first start.
 | POST | `/api/tasks` | create a task in `draft`, returns 201 |
 | GET | `/api/tasks/{id}` | Task Card: the task plus `available_transitions` |
 | PATCH | `/api/tasks/{id}` | edit `title`, `body`, `product_id`, `priority`, `branch` |
-| POST | `/api/tasks/{id}/status` | move the task to `{"status": "..."}` |
+| POST | `/api/tasks/{id}/status` | move the task to `{"status": "..."}`; `merged` and `released` are refused |
+| GET | `/api/control` | `{ mergeable, pending_merges, releasable }` |
+| POST | `/api/merges` | `{"task_id": "..."}` issues the merge task, returns 201 |
+| POST | `/api/releases` | `{"product_id": "...", "tag": "..."}` releases everything merged |
 | GET | `/api/products` | product list |
 | GET | `/api/products/{id}` | one product |
 | PUT | `/api/products/{id}` | create or replace a product |
 | POST | `/worker/claim` | lease the next ready task |
-| POST | `/worker/report` | report a commit against a lease |
+| POST | `/worker/report` | report a commit, and `checks`, against a lease |
 
 Reads need an allowlisted `X-Auth-User`. Mutations additionally need a matching
 `Origin` and `X-CSRF-Token`. Worker routes need `X-Worker-Capability` instead,
 and nothing else grants them. Tasks are never physically deleted; discard one by
 moving it to `cancelled` or `dropped`.
+
+## Merging and releasing
+
+The last two steps of a task are not buttons a human presses on the status API;
+they are earned.
+
+A task becomes **mergeable** once a worker reported it `done` with a branch and
+a commit, and no live merge already targets it. `POST /api/merges` then issues
+one `instant:merge` task that inherits the target's product, branch, and commit,
+starts in `ready`, and is claimed ahead of ordinary work. Only one live merge may
+target a task, so a second issue answers 409. Cancelling or dropping the attempt
+frees the target again, and the retry is issued under its own id: `merge:<id>`
+first, then `merge:<id>~2`, `~3`, and so on.
+
+The worker that claims it rebases the branch onto the main line and reports back
+with the checks it ran:
+
+```jsonc
+{
+  "claim_id": "...",
+  "commit_sha": "abc1234",
+  "verification": "cargo test",
+  "checks": [{ "name": "cargo test", "exit_code": 0 }]
+}
+```
+
+A merge report with no checks, or with any non-zero `exit_code`, is refused and
+changes nothing — including a repeat report against a merge that already landed.
+When every check passed, the merge finishes and its target moves to `merged` in
+the same transaction.
+
+Merged work then piles up per product. For a product with `releases` set,
+`GET /api/control` reports how much is waiting, and `POST /api/releases` stamps
+every merged task of that product with one `release_tag` and moves them all to
+`released`. A product that does not release, or one with nothing merged,
+answers 409.
 
 Stop the service with <kbd>Ctrl</kbd>+<kbd>C</kbd>.
 

@@ -4,11 +4,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
-use crate::db::Db;
 use crate::error::Error;
 use crate::product::{self, Product};
 use crate::state::AppState;
-use crate::task::{self, NewTask, Task, TaskKind, TaskPatch, TaskStatus};
+use crate::task::{self, Check, NewTask, Releasable, Task, TaskKind, TaskPatch, TaskStatus};
 
 /// A row in the task list: enough to render a card in a list, no body.
 #[derive(Debug, Serialize)]
@@ -54,6 +53,35 @@ pub struct ReportBody {
     pub claim_id: String,
     pub commit_sha: String,
     pub verification: String,
+    #[serde(default)]
+    pub checks: Vec<Check>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MergeBody {
+    pub task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReleaseBody {
+    pub product_id: String,
+    pub tag: String,
+}
+
+/// What the admin screen needs to decide whether "merge" and "release" are
+/// live buttons.
+#[derive(Debug, Serialize)]
+pub struct ControlPlane {
+    pub mergeable: Vec<TaskSummary>,
+    pub pending_merges: Vec<TaskSummary>,
+    pub releasable: Vec<Releasable>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReleaseResult {
+    pub product_id: String,
+    pub tag: String,
+    pub released: Vec<TaskSummary>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,12 +186,16 @@ fn require_human_mutation(headers: &HeaderMap, state: &AppState) -> Result<(), E
     }
 }
 
-fn card(db: &Db, task: Task) -> Result<TaskCard, Error> {
-    let available_transitions = task::available_transitions(db, &task)?;
-    Ok(TaskCard {
+fn card(task: Task) -> TaskCard {
+    let available_transitions = task::available_transitions(&task);
+    TaskCard {
         task,
         available_transitions,
-    })
+    }
+}
+
+fn summaries(tasks: Vec<Task>) -> Vec<TaskSummary> {
+    tasks.into_iter().map(TaskSummary::from).collect()
 }
 
 pub async fn healthz() -> &'static str {
@@ -195,7 +227,7 @@ pub async fn api_tasks(
         Some(raw) => task::list_by_status(&state.db, TaskStatus::parse(&raw)?)?,
         None => task::list_active(&state.db)?,
     };
-    Ok(Json(tasks.into_iter().map(TaskSummary::from).collect()))
+    Ok(Json(summaries(tasks)))
 }
 
 pub async fn api_create_task(
@@ -220,7 +252,7 @@ pub async fn api_create_task(
         },
         state.clock.now(),
     )?;
-    Ok((StatusCode::CREATED, Json(card(&state.db, created)?)).into_response())
+    Ok((StatusCode::CREATED, Json(card(created))).into_response())
 }
 
 pub async fn api_task(
@@ -230,7 +262,7 @@ pub async fn api_task(
 ) -> Result<Json<TaskCard>, Error> {
     require_identity(&headers, &state)?;
     let task = task::get(&state.db, &id)?;
-    Ok(Json(card(&state.db, task)?))
+    Ok(Json(card(task)))
 }
 
 pub async fn api_patch_task(
@@ -241,7 +273,7 @@ pub async fn api_patch_task(
 ) -> Result<Json<TaskCard>, Error> {
     require_human_mutation(&headers, &state)?;
     let updated = task::update(&state.db, &id, &patch, state.clock.now())?;
-    Ok(Json(card(&state.db, updated)?))
+    Ok(Json(card(updated)))
 }
 
 pub async fn api_set_status(
@@ -252,8 +284,55 @@ pub async fn api_set_status(
 ) -> Result<Json<TaskCard>, Error> {
     require_human_mutation(&headers, &state)?;
     let to = TaskStatus::parse(&body.status)?;
+    // Landing and shipping are earned, not pressed: a task reaches `merged`
+    // only when a merge reported green checks, and `released` only through a
+    // product release.
+    if matches!(to, TaskStatus::Merged | TaskStatus::Released) {
+        return Err(Error::Invalid(format!(
+            "{} is granted by the control plane (POST /api/merges, POST /api/releases), \
+             not by a status change",
+            to.as_str()
+        )));
+    }
     let moved = task::set_status(&state.db, &id, to, state.clock.now())?;
-    Ok(Json(card(&state.db, moved)?))
+    Ok(Json(card(moved)))
+}
+
+pub async fn api_control(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ControlPlane>, Error> {
+    require_identity(&headers, &state)?;
+    Ok(Json(ControlPlane {
+        mergeable: summaries(task::mergeable(&state.db)?),
+        pending_merges: summaries(task::pending_merges(&state.db)?),
+        releasable: task::releasable(&state.db)?,
+    }))
+}
+
+pub async fn api_issue_merge(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<MergeBody>,
+) -> Result<Response, Error> {
+    require_human_mutation(&headers, &state)?;
+    let issued = task::issue_merge(&state.db, &body.task_id, state.clock.now())?;
+    Ok((StatusCode::CREATED, Json(card(issued))).into_response())
+}
+
+pub async fn api_release(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ReleaseBody>,
+) -> Result<Json<ReleaseResult>, Error> {
+    require_human_mutation(&headers, &state)?;
+    let released =
+        task::release_product(&state.db, &body.product_id, &body.tag, state.clock.now())?;
+    Ok(Json(ReleaseResult {
+        product_id: body.product_id,
+        tag: body.tag,
+        released: summaries(released),
+    }))
 }
 
 pub async fn api_products(
@@ -306,7 +385,7 @@ pub async fn worker_claim(
         state.claim_ttl_secs,
     )?;
     match leased {
-        Some(task) => Ok(Json(card(&state.db, task)?).into_response()),
+        Some(task) => Ok(Json(card(task)).into_response()),
         None => Ok((
             StatusCode::OK,
             Json(serde_json::json!({ "status": "no-work" })),
@@ -326,9 +405,10 @@ pub async fn worker_report(
         &body.claim_id,
         &body.commit_sha,
         &body.verification,
+        &body.checks,
         state.clock.now(),
     )?;
-    Ok(Json(card(&state.db, reported)?))
+    Ok(Json(card(reported)))
 }
 
 pub async fn api_not_found() -> impl IntoResponse {

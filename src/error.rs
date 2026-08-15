@@ -15,6 +15,10 @@ pub enum Error {
     ClaimMismatch,
     #[error("{0}")]
     Invalid(String),
+    /// The request is well formed but the current state refuses it: another
+    /// merge already owns the target, or a release has nothing to stamp.
+    #[error("{0}")]
+    Conflict(String),
     #[error("frontmatter: {0}")]
     Frontmatter(String),
     #[error("io: {0}")]
@@ -53,7 +57,7 @@ impl IntoResponse for Error {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
-            Self::ClaimMismatch => StatusCode::CONFLICT,
+            Self::ClaimMismatch | Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Invalid(_) => StatusCode::BAD_REQUEST,
             Self::Frontmatter(_) | Self::Io(_) | Self::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };

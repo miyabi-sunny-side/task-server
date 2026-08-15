@@ -20,6 +20,7 @@ const ORIGIN: &str = "https://task-server.test";
 const CSRF: &str = "test-csrf";
 const CAPABILITY: &str = "test-capability";
 const PRODUCT: &str = "sunny-side/task-server";
+const KEEPER: &str = "sunny-side/workers";
 
 fn state_for(db: &Arc<Db>) -> AppState {
     AppState::for_test()
@@ -160,6 +161,143 @@ fn report_body(claim_id: &str, commit_sha: &str) -> Value {
     })
 }
 
+fn report_with_checks(claim_id: &str, commit_sha: &str, checks: &Value) -> Value {
+    json!({
+        "claim_id": claim_id,
+        "commit_sha": commit_sha,
+        "verification": "cargo test",
+        "checks": checks,
+    })
+}
+
+fn green_checks() -> Value {
+    json!([
+        {"name": "cargo test", "exit_code": 0},
+        {"name": "cargo clippy", "exit_code": 0},
+    ])
+}
+
+fn claim_id_of(lease: &Value) -> String {
+    lease["claim_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .expect("claim_id")
+        .to_owned()
+}
+
+async fn get_task(state: &AppState, id: &str) -> (StatusCode, Value) {
+    send(state, read(&format!("/api/tasks/{id}"))).await
+}
+
+async fn post_status(state: &AppState, id: &str, to: &str) -> (StatusCode, Value) {
+    send(
+        state,
+        human(
+            "POST",
+            &format!("/api/tasks/{id}/status"),
+            &json!({"status": to}),
+        ),
+    )
+    .await
+}
+
+async fn post_report(state: &AppState, body: &Value) -> (StatusCode, Value) {
+    send(state, worker("/worker/report", body)).await
+}
+
+async fn post_merge(state: &AppState, task_id: &str) -> (StatusCode, Value) {
+    send(
+        state,
+        human("POST", "/api/merges", &json!({"task_id": task_id})),
+    )
+    .await
+}
+
+async fn post_release(state: &AppState, product_id: &str, tag: &str) -> (StatusCode, Value) {
+    send(
+        state,
+        human(
+            "POST",
+            "/api/releases",
+            &json!({"product_id": product_id, "tag": tag}),
+        ),
+    )
+    .await
+}
+
+/// Lease the next task and assert the scheduler handed out the expected one.
+async fn claim_next(state: &AppState, expected_id: &str) -> String {
+    let (status, lease) = send(state, worker("/worker/claim", &json!({"worker": "grok"}))).await;
+    assert_eq!(status, StatusCode::OK, "claim: {lease}");
+    assert_eq!(lease["id"], expected_id, "unexpected lease: {lease}");
+    claim_id_of(&lease)
+}
+
+/// Claim a ready task and report a commit against the lease.
+async fn work_to_done(state: &AppState, id: &str, commit_sha: &str) -> Value {
+    let claim_id = claim_next(state, id).await;
+    let (status, done) = post_report(state, &report_body(&claim_id, commit_sha)).await;
+    assert_eq!(status, StatusCode::OK, "report {id}: {done}");
+    assert_eq!(done["status"], "done");
+    done
+}
+
+/// Claim an issued merge and land it with checks that all passed.
+async fn land_merge(state: &AppState, merge_id: &str, commit_sha: &str) -> Value {
+    let claim_id = claim_next(state, merge_id).await;
+    let (status, landed) = post_report(
+        state,
+        &report_with_checks(&claim_id, commit_sha, &green_checks()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "land {merge_id}: {landed}");
+    assert_eq!(landed["status"], "done");
+    landed
+}
+
+/// Drive one task the whole way to `merged` through the control plane.
+async fn drive_to_merged(state: &AppState, id: &str, product_id: &str, commit_sha: &str) -> String {
+    create_task(
+        state,
+        &json!({"id": id, "title": format!("task {id}"), "product_id": product_id}),
+    )
+    .await;
+    set_status(state, id, "ready").await;
+    work_to_done(state, id, commit_sha).await;
+
+    let (status, merge) = post_merge(state, id).await;
+    assert_eq!(status, StatusCode::CREATED, "issue merge for {id}: {merge}");
+    let merge_id = merge["id"].as_str().expect("merge id").to_owned();
+    land_merge(state, &merge_id, commit_sha).await;
+
+    let (status, target) = get_task(state, id).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(target["status"], "merged", "{id} must be merged: {target}");
+    merge_id
+}
+
+/// A refused merge report leaves both rows exactly where they were.
+async fn assert_merge_did_not_land(state: &AppState, merge_id: &str, target_id: &str) {
+    let (status, merge) = send(state, read(&format!("/api/tasks/{merge_id}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        merge["status"], "wip",
+        "the merge must still be leased: {merge}"
+    );
+    let (status, target) = send(state, read(&format!("/api/tasks/{target_id}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        target["status"], "done",
+        "the target must not have moved: {target}"
+    );
+}
+
+async fn control(state: &AppState) -> Value {
+    let (status, value) = send(state, read("/api/control")).await;
+    assert_eq!(status, StatusCode::OK, "control plane: {value}");
+    value
+}
+
 fn transitions(card: &Value) -> Vec<String> {
     card["available_transitions"]
         .as_array()
@@ -215,39 +353,471 @@ async fn http_alone_drives_a_task_from_creation_to_release() {
         lease["branch"], "task/t-cutover",
         "the branch name is derived from the task id"
     );
-    let claim_id = lease["claim_id"]
-        .as_str()
-        .filter(|id| !id.is_empty())
-        .expect("claim_id")
-        .to_owned();
+    let claim_id = claim_id_of(&lease);
 
-    let (status, reported) = send(
-        &state,
-        worker("/worker/report", &report_body(&claim_id, "abc1234")),
-    )
-    .await;
+    let (status, reported) = post_report(&state, &report_body(&claim_id, "abc1234")).await;
     assert_eq!(status, StatusCode::OK, "report: {reported}");
     assert_eq!(reported["status"], "done");
     assert_eq!(reported["commit_sha"], "abc1234");
     assert_eq!(reported["verification"], "cargo test");
 
-    let merged = set_status(&state, "t-cutover", "merged").await;
-    assert!(
-        transitions(&merged).contains(&"released".to_owned()),
-        "a merged task of a releasing product can be released: {merged}"
+    // `merged` is the control plane's to grant, never a human status change.
+    let (status, refused) = post_status(&state, "t-cutover", "merged").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "merged is not a human transition: {refused}"
     );
 
-    let released = set_status(&state, "t-cutover", "released").await;
+    let (status, merge) = post_merge(&state, "t-cutover").await;
+    assert_eq!(status, StatusCode::CREATED, "issue merge: {merge}");
+    let merge_id = merge["id"].as_str().expect("merge id").to_owned();
+    assert_eq!(merge["kind"], "instant:merge");
+    assert_eq!(merge["status"], "ready");
+    assert_eq!(merge["merge_target_task_id"], "t-cutover");
+    assert_eq!(merge["branch"], "task/t-cutover");
+
+    land_merge(&state, &merge_id, "abc1234").await;
+
+    let (status, merged) = get_task(&state, "t-cutover").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(merged["status"], "merged", "a green merge lands: {merged}");
     assert!(
-        transitions(&released).is_empty(),
-        "released is terminal: {released}"
+        !transitions(&merged).contains(&"released".to_owned()),
+        "released is granted by the release API, not by a status change: {merged}"
     );
+
+    let (status, released) = post_release(&state, PRODUCT, "v0.2.0").await;
+    assert_eq!(status, StatusCode::OK, "release: {released}");
+    assert_eq!(released["product_id"], PRODUCT);
+    assert_eq!(released["tag"], "v0.2.0");
+    assert_eq!(ids_of(&released["released"]), ["t-cutover"]);
 
     let state = reopen(&dir, state);
-    let (status, final_card) = send(&state, read("/api/tasks/t-cutover")).await;
+    let (status, final_card) = get_task(&state, "t-cutover").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(final_card["status"], "released");
+    assert_eq!(final_card["release_tag"], "v0.2.0");
     assert_eq!(final_card["branch"], "task/t-cutover");
+    assert!(
+        transitions(&final_card).is_empty(),
+        "released is terminal: {final_card}"
+    );
+}
+
+#[tokio::test]
+async fn merge_candidates_are_done_tasks_and_are_issued_once() {
+    let (_dir, state) = file_backed_state();
+    put_product(&state, PRODUCT, true).await;
+
+    for id in ["t-a-done", "t-b-wip", "t-c-ready", "t-d-draft"] {
+        create_task(
+            &state,
+            &json!({"id": id, "title": format!("task {id}"), "product_id": PRODUCT}),
+        )
+        .await;
+    }
+    for id in ["t-a-done", "t-b-wip", "t-c-ready"] {
+        set_status(&state, id, "ready").await;
+    }
+
+    work_to_done(&state, "t-a-done", "abc1234").await;
+    // Left leased on purpose: a wip task is not a merge candidate.
+    claim_next(&state, "t-b-wip").await;
+
+    let plane = control(&state).await;
+    assert_eq!(
+        ids_of(&plane["mergeable"]),
+        ["t-a-done"],
+        "only a done task is mergeable: {plane}"
+    );
+    assert_eq!(
+        ids_of(&plane["pending_merges"]),
+        Vec::<&str>::new(),
+        "nothing is in flight yet: {plane}"
+    );
+
+    let (status, merge) = post_merge(&state, "t-a-done").await;
+    assert_eq!(status, StatusCode::CREATED, "issue merge: {merge}");
+    let merge_id = merge["id"].as_str().expect("merge id").to_owned();
+    assert_eq!(merge["kind"], "instant:merge");
+    assert_eq!(merge["status"], "ready", "a merge is claimable at once");
+    assert_eq!(merge["merge_target_task_id"], "t-a-done");
+    assert_eq!(
+        merge["product_id"], PRODUCT,
+        "the merge inherits the target's product"
+    );
+    assert_eq!(
+        merge["branch"], "task/t-a-done",
+        "the merge inherits the target's branch"
+    );
+    assert_eq!(
+        merge["commit_sha"], "abc1234",
+        "the merge inherits the target's commit"
+    );
+
+    let plane = control(&state).await;
+    assert_eq!(
+        ids_of(&plane["mergeable"]),
+        Vec::<&str>::new(),
+        "a task with a live merge is no longer a candidate: {plane}"
+    );
+    assert_eq!(ids_of(&plane["pending_merges"]), [merge_id.as_str()]);
+
+    let (status, listing) = send(&state, read("/api/tasks")).await;
+    assert_eq!(status, StatusCode::OK);
+    let before = listing.as_array().expect("array").len();
+
+    let (status, again) = post_merge(&state, "t-a-done").await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a second merge for the same target conflicts: {again}"
+    );
+
+    let (status, listing) = send(&state, read("/api/tasks")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        listing.as_array().expect("array").len(),
+        before,
+        "a refused merge must not create a task: {listing}"
+    );
+
+    for (id, expected) in [
+        ("t-c-ready", StatusCode::BAD_REQUEST),
+        ("t-missing", StatusCode::NOT_FOUND),
+    ] {
+        let (status, refused) = post_merge(&state, id).await;
+        assert_eq!(status, expected, "merge {id}: {refused}");
+    }
+}
+
+#[tokio::test]
+async fn a_merge_only_lands_when_every_check_passed() {
+    let (_dir, state) = file_backed_state();
+    put_product(&state, PRODUCT, true).await;
+
+    create_task(
+        &state,
+        &json!({"id": "t-land", "title": "land me", "product_id": PRODUCT}),
+    )
+    .await;
+    set_status(&state, "t-land", "ready").await;
+    let done = work_to_done(&state, "t-land", "abc1234").await;
+    assert!(
+        !transitions(&done).contains(&"merged".to_owned()),
+        "a human cannot press merged: {done}"
+    );
+
+    let (status, merge) = post_merge(&state, "t-land").await;
+    assert_eq!(status, StatusCode::CREATED, "issue merge: {merge}");
+    let merge_id = merge["id"].as_str().expect("merge id").to_owned();
+    let claim_id = claim_next(&state, &merge_id).await;
+
+    // (a) A merge without evidence and (b) a merge with one red check are both
+    // refused, and neither leaves a trace.
+    let red = json!([
+        {"name": "cargo test", "exit_code": 101},
+        {"name": "cargo clippy", "exit_code": 0},
+    ]);
+    for (body, why) in [
+        (report_body(&claim_id, "abc1234"), "a report without checks"),
+        (
+            report_with_checks(&claim_id, "abc1234", &red),
+            "a report with a red check",
+        ),
+    ] {
+        let (status, refused) = post_report(&state, &body).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{why} must be refused: {refused}"
+        );
+        assert_merge_did_not_land(&state, &merge_id, "t-land").await;
+    }
+
+    // (c) All green: the merge finishes and the target lands in one step. The
+    // lease the refusals rolled back is still the live one.
+    let (status, landed) = post_report(
+        &state,
+        &report_with_checks(&claim_id, "abc1234", &green_checks()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a green report lands: {landed}");
+    assert_eq!(landed["status"], "done");
+    assert_eq!(landed["checks"][0]["name"], "cargo test");
+    assert_eq!(landed["checks"][0]["exit_code"], 0);
+
+    let (status, target) = get_task(&state, "t-land").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(target["status"], "merged", "the target lands: {target}");
+    for forbidden in ["merged", "released"] {
+        assert!(
+            !transitions(&target).contains(&forbidden.to_owned()),
+            "{forbidden} must not be offered to a human: {target}"
+        );
+        let (status, refused) = post_status(&state, "t-land", forbidden).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "status {forbidden} must be refused: {refused}"
+        );
+        assert!(
+            refused["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("control plane")),
+            "the refusal must name the control plane: {refused}"
+        );
+    }
+
+    let (status, still) = get_task(&state, "t-land").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        still["status"], "merged",
+        "refusals change nothing: {still}"
+    );
+}
+
+/// A landed merge is not a pass forever: the evidence rule applies to every
+/// report, so a repeat without green checks is still a 400 and moves nothing.
+#[tokio::test]
+async fn a_landed_merge_still_refuses_a_report_without_green_checks() {
+    let (_dir, state) = file_backed_state();
+    put_product(&state, PRODUCT, true).await;
+
+    create_task(
+        &state,
+        &json!({"id": "t-again", "title": "land me twice", "product_id": PRODUCT}),
+    )
+    .await;
+    set_status(&state, "t-again", "ready").await;
+    work_to_done(&state, "t-again", "abc1234").await;
+
+    let (status, merge) = post_merge(&state, "t-again").await;
+    assert_eq!(status, StatusCode::CREATED, "issue merge: {merge}");
+    let merge_id = merge["id"].as_str().expect("merge id").to_owned();
+    let claim_id = claim_next(&state, &merge_id).await;
+
+    let (status, landed) = post_report(
+        &state,
+        &report_with_checks(&claim_id, "abc1234", &green_checks()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a green report lands: {landed}");
+
+    let red = json!([
+        {"name": "cargo test", "exit_code": 101},
+        {"name": "cargo clippy", "exit_code": 0},
+    ]);
+    for (body, why) in [
+        (report_body(&claim_id, "abc1234"), "a repeat without checks"),
+        (
+            report_with_checks(&claim_id, "abc1234", &red),
+            "a repeat with a red check",
+        ),
+    ] {
+        let (status, refused) = post_report(&state, &body).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{why} must be refused even after the merge landed: {refused}"
+        );
+
+        let (status, merge) = get_task(&state, &merge_id).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(merge["status"], "done", "{why} moved the merge: {merge}");
+        assert_eq!(
+            merge["checks"],
+            green_checks(),
+            "{why} overwrote the evidence: {merge}"
+        );
+        let (status, target) = get_task(&state, "t-again").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            target["status"], "merged",
+            "{why} moved the target: {target}"
+        );
+    }
+
+    // The gate-satisfying repeat is still idempotent.
+    let (status, again) = post_report(
+        &state,
+        &report_with_checks(&claim_id, "abc1234", &green_checks()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a green repeat is accepted: {again}"
+    );
+    assert_eq!(again["status"], "done");
+    let (status, target) = get_task(&state, "t-again").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(target["status"], "merged", "the target stays landed");
+}
+
+/// Cancelling a merge frees its target, and the retry has to be reachable under
+/// an id of its own that is still a single URL segment.
+#[tokio::test]
+async fn a_cancelled_merge_can_be_issued_again() {
+    let (_dir, state) = file_backed_state();
+    put_product(&state, PRODUCT, true).await;
+
+    create_task(
+        &state,
+        &json!({"id": "t-retry", "title": "retry me", "product_id": PRODUCT}),
+    )
+    .await;
+    set_status(&state, "t-retry", "ready").await;
+    work_to_done(&state, "t-retry", "abc1234").await;
+
+    let (status, first) = post_merge(&state, "t-retry").await;
+    assert_eq!(status, StatusCode::CREATED, "issue merge: {first}");
+    let first_id = first["id"].as_str().expect("merge id").to_owned();
+
+    let (status, again) = post_merge(&state, "t-retry").await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a live merge still blocks a second issue: {again}"
+    );
+
+    let (status, cancelled) = post_status(&state, &first_id, "cancelled").await;
+    assert_eq!(status, StatusCode::OK, "cancel the merge: {cancelled}");
+    assert_eq!(cancelled["status"], "cancelled");
+
+    let plane = control(&state).await;
+    assert_eq!(
+        ids_of(&plane["mergeable"]),
+        ["t-retry"],
+        "a cancelled merge frees its target: {plane}"
+    );
+
+    let (status, retry) = post_merge(&state, "t-retry").await;
+    assert_eq!(status, StatusCode::CREATED, "reissue merge: {retry}");
+    let retry_id = retry["id"].as_str().expect("merge id").to_owned();
+    assert_ne!(retry_id, first_id, "the retry needs an id of its own");
+    assert!(
+        !retry_id.contains('/'),
+        "a task id is one path segment: {retry_id}"
+    );
+    assert_eq!(retry["kind"], "instant:merge");
+    assert_eq!(retry["status"], "ready");
+    assert_eq!(retry["merge_target_task_id"], "t-retry");
+    assert_eq!(retry["product_id"], PRODUCT);
+    assert_eq!(retry["branch"], "task/t-retry");
+    assert_eq!(retry["commit_sha"], "abc1234");
+
+    // The retry is addressable and claimable exactly like the first attempt.
+    let (status, card) = get_task(&state, &retry_id).await;
+    assert_eq!(status, StatusCode::OK, "the retry is readable: {card}");
+    assert_eq!(card["id"], retry_id.as_str());
+    let (status, still) = get_task(&state, &first_id).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        still["status"], "cancelled",
+        "the cancelled attempt stays on the record: {still}"
+    );
+
+    land_merge(&state, &retry_id, "abc1234").await;
+    let (status, target) = get_task(&state, "t-retry").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(target["status"], "merged", "the retry lands: {target}");
+}
+
+#[tokio::test]
+async fn release_stamps_every_merged_task_of_a_releasing_product() {
+    let (_dir, state) = file_backed_state();
+    put_product(&state, PRODUCT, true).await;
+    put_product(&state, KEEPER, false).await;
+
+    drive_to_merged(&state, "t-rel-1", PRODUCT, "aaa1111").await;
+    drive_to_merged(&state, "t-rel-2", PRODUCT, "bbb2222").await;
+    drive_to_merged(&state, "t-keep-1", KEEPER, "ccc3333").await;
+
+    // A done task of the same product is not part of a release.
+    create_task(
+        &state,
+        &json!({"id": "t-open", "title": "not merged yet", "product_id": PRODUCT}),
+    )
+    .await;
+    set_status(&state, "t-open", "ready").await;
+    work_to_done(&state, "t-open", "ddd4444").await;
+
+    let plane = control(&state).await;
+    assert_eq!(
+        plane["releasable"],
+        json!([{"product_id": PRODUCT, "task_count": 2}]),
+        "only a releasing product accumulates a release: {plane}"
+    );
+
+    for (product_id, tag, expected, why) in [
+        (
+            KEEPER,
+            "v9",
+            StatusCode::CONFLICT,
+            "a product that does not release",
+        ),
+        (PRODUCT, "  ", StatusCode::BAD_REQUEST, "a blank tag"),
+        (
+            "sunny-side/missing",
+            "v1",
+            StatusCode::NOT_FOUND,
+            "an unknown product",
+        ),
+    ] {
+        let (status, refused) = post_release(&state, product_id, tag).await;
+        assert_eq!(status, expected, "{why} must be refused: {refused}");
+    }
+
+    let (status, released) = post_release(&state, PRODUCT, "v0.2.0").await;
+    assert_eq!(status, StatusCode::OK, "release: {released}");
+    assert_eq!(released["product_id"], PRODUCT);
+    assert_eq!(released["tag"], "v0.2.0");
+    assert_eq!(ids_of(&released["released"]), ["t-rel-1", "t-rel-2"]);
+
+    for id in ["t-rel-1", "t-rel-2"] {
+        let (status, card) = get_task(&state, id).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(card["status"], "released", "{id}: {card}");
+        assert_eq!(card["release_tag"], "v0.2.0", "{id}: {card}");
+    }
+
+    let (status, keeper) = get_task(&state, "t-keep-1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        keeper["status"], "merged",
+        "another product is untouched: {keeper}"
+    );
+    assert_eq!(keeper["release_tag"], Value::Null);
+
+    let (status, open) = get_task(&state, "t-open").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        open["status"], "done",
+        "a done task is not released: {open}"
+    );
+    assert_eq!(open["release_tag"], Value::Null);
+
+    let plane = control(&state).await;
+    assert_eq!(
+        plane["releasable"],
+        json!([]),
+        "the release emptied the queue: {plane}"
+    );
+
+    let (status, empty) = post_release(&state, PRODUCT, "v0.2.1").await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a release with nothing merged conflicts: {empty}"
+    );
+
+    for id in ["t-rel-1", "t-rel-2"] {
+        let (status, card) = get_task(&state, id).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(card["release_tag"], "v0.2.0", "{id} keeps its tag: {card}");
+    }
 }
 
 #[tokio::test]
@@ -292,23 +862,41 @@ async fn claim_prefers_instant_merge_and_listing_hides_released() {
         "a stale claim_id must conflict: {rejected}"
     );
 
-    let (status, _) = send(
+    // A merge task nobody issued has nothing to land, so it is dropped by hand.
+    let (status, orphan) = post_report(
         &state,
-        worker("/worker/report", &report_body(&claim_id, "abc1234")),
+        &report_with_checks(&claim_id, "abc1234", &green_checks()),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    set_status(&state, "t-instant", "merged").await;
-    set_status(&state, "t-instant", "released").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a merge without a target lands nothing: {orphan}"
+    );
+    set_status(&state, "t-instant", "dropped").await;
+
+    // The remaining task takes the whole control-plane path to `released`.
+    work_to_done(&state, "t-normal", "def5678").await;
+    let (status, merge) = post_merge(&state, "t-normal").await;
+    assert_eq!(status, StatusCode::CREATED, "issue merge: {merge}");
+    let merge_id = merge["id"].as_str().expect("merge id").to_owned();
+    land_merge(&state, &merge_id, "def5678").await;
+    let (status, released) = post_release(&state, PRODUCT, "v0.2.0").await;
+    assert_eq!(status, StatusCode::OK, "release: {released}");
 
     let (status, listing) = send(&state, read("/api/tasks")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        ids_of(&listing),
-        ["t-normal"],
-        "the default listing hides released"
-    );
-    let summary = &listing.as_array().unwrap()[0];
+    let mut listed = ids_of(&listing);
+    listed.sort_unstable();
+    let mut expected = vec!["t-instant", merge_id.as_str()];
+    expected.sort_unstable();
+    assert_eq!(listed, expected, "the default listing hides released");
+    let summary = listing
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "t-instant")
+        .expect("t-instant summary");
     for field in [
         "id",
         "title",
@@ -330,7 +918,7 @@ async fn claim_prefers_instant_merge_and_listing_hides_released() {
 
     let (status, released) = send(&state, read("/api/tasks?status=released")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(ids_of(&released), ["t-instant"]);
+    assert_eq!(ids_of(&released), ["t-normal"]);
 
     let (status, _) = send(&state, read("/api/tasks?status=not-a-status")).await;
     assert_eq!(
