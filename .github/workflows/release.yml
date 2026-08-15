@@ -3,9 +3,8 @@ name: Release container
 on:
   # Manual runs must select a v-prefixed tag ref.
   workflow_dispatch:
-  # To enable automatic releases, uncomment the next two lines.
-  # push:
-  #   tags: ['v*.*.*']
+  push:
+    tags: ['v*.*.*']
 
 permissions:
   contents: read
