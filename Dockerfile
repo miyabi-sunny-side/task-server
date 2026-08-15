@@ -11,6 +11,8 @@ FROM rust:1.96-bookworm AS backend
 WORKDIR /app
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY src/ src/
+# actions.rs が include_str! で参照するため build 時に必要
+COPY config/ config/
 RUN cargo build --locked --release
 
 FROM debian:bookworm-slim AS runtime
