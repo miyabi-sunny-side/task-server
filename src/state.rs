@@ -2,18 +2,17 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::actions::ActionTable;
 use crate::clock::{Clock, SystemClock};
+use crate::db::Db;
 use crate::error::Error;
-use crate::notify::{HttpNotifier, NoopNotifier, Notifier};
 
 pub const DEFAULT_CLAIM_TTL_SECS: u64 = 3600;
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3000";
+pub const DEFAULT_DB_PATH: &str = "data/task-server.db";
 
 #[derive(Clone)]
 pub struct AppState {
-    pub tasks_git_dir: PathBuf,
-    pub outbox_dir: PathBuf,
+    pub db: Arc<Db>,
     pub static_dir: PathBuf,
     pub worker_capability: String,
     pub allowlist: Vec<String>,
@@ -22,18 +21,13 @@ pub struct AppState {
     pub dev_identity: Option<String>,
     pub claim_ttl_secs: u64,
     pub clock: Arc<dyn Clock>,
-    pub notifier: Arc<dyn Notifier>,
-    pub action_table: ActionTable,
 }
 
 impl AppState {
     #[must_use]
-    pub fn for_test(tasks_git_dir: impl Into<PathBuf>) -> Self {
-        let tasks_git_dir = tasks_git_dir.into();
-        let outbox_dir = tasks_git_dir.join(".outbox");
+    pub fn for_test() -> Self {
         Self {
-            tasks_git_dir,
-            outbox_dir,
+            db: Arc::new(Db::open_in_memory().expect("in-memory database")),
             static_dir: PathBuf::from("client"),
             worker_capability: "test-capability".into(),
             allowlist: vec!["miyabi".into()],
@@ -42,15 +36,14 @@ impl AppState {
             dev_identity: None,
             claim_ttl_secs: DEFAULT_CLAIM_TTL_SECS,
             clock: Arc::new(SystemClock),
-            notifier: Arc::new(NoopNotifier),
-            action_table: ActionTable::default(),
         }
     }
 
     /// # Errors
     ///
     /// Returns `Error::Invalid` when production secrets are missing or
-    /// `CLAIM_TTL_SECS` is not a number.
+    /// `CLAIM_TTL_SECS` is not a number, and `Error::Db` when the database at
+    /// `APP_DB_PATH` cannot be opened.
     pub fn from_env() -> Result<Self, Error> {
         Self::from_vars(|key| env::var(key).ok())
     }
@@ -61,11 +54,6 @@ impl AppState {
         let require = |name: &str| -> Result<String, Error> {
             get(name).ok_or_else(|| Error::Invalid(format!("{name} is required")))
         };
-        let tasks_git_dir = get("TASKS_GIT_DIR").map_or_else(
-            || PathBuf::from("/nonexistent-tasks-git-dir"),
-            PathBuf::from,
-        );
-        let outbox_dir = tasks_git_dir.join(".outbox");
         let static_dir =
             get("APP_STATIC_DIR").map_or_else(|| PathBuf::from("client/dist"), PathBuf::from);
         let worker_capability = if production {
@@ -78,12 +66,7 @@ impl AppState {
         } else {
             get("APP_AUTH_ALLOWLIST").unwrap_or_else(|| "miyabi".into())
         };
-        let allowlist = allowlist_raw
-            .split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
+        let allowlist = split_list(&allowlist_raw);
         if allowlist.is_empty() {
             return Err(Error::Invalid("APP_AUTH_ALLOWLIST is empty".into()));
         }
@@ -92,22 +75,11 @@ impl AppState {
         } else {
             get("APP_CSRF_TOKEN").unwrap_or_else(|| "dev-csrf".into())
         };
-        let allowed_origins: Vec<String> = if production {
-            require("APP_ALLOWED_ORIGINS")?
-                .split(',')
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(ToOwned::to_owned)
-                .collect()
+        let allowed_origins = if production {
+            split_list(&require("APP_ALLOWED_ORIGINS")?)
         } else {
             get("APP_ALLOWED_ORIGINS")
-                .map(|raw| {
-                    raw.split(',')
-                        .map(str::trim)
-                        .filter(|item| !item.is_empty())
-                        .map(ToOwned::to_owned)
-                        .collect()
-                })
+                .map(|raw| split_list(&raw))
                 .unwrap_or_default()
         };
         if production && allowed_origins.is_empty() {
@@ -129,20 +101,11 @@ impl AppState {
                 .map_err(|_| Error::Invalid(format!("invalid CLAIM_TTL_SECS: {raw}")))?,
             None => DEFAULT_CLAIM_TTL_SECS,
         };
-        let action_table = match get("ACTION_TABLE_PATH") {
-            Some(path) => ActionTable::load_path(path)?,
-            None => ActionTable::default(),
-        };
-        let notifier: Arc<dyn Notifier> = match get("NTFY_URL") {
-            Some(url) if !url.is_empty() => Arc::new(HttpNotifier { url }),
-            _ if production => {
-                return Err(Error::Invalid("NTFY_URL is required".into()));
-            }
-            _ => Arc::new(NoopNotifier),
-        };
+        // Opened last, so a fail-closed startup never creates a database file.
+        let db_path = get("APP_DB_PATH").unwrap_or_else(|| DEFAULT_DB_PATH.to_owned());
+        let db = Arc::new(Db::open(db_path)?);
         Ok(Self {
-            tasks_git_dir,
-            outbox_dir,
+            db,
             static_dir,
             worker_capability,
             allowlist,
@@ -151,20 +114,18 @@ impl AppState {
             dev_identity,
             claim_ttl_secs,
             clock: Arc::new(SystemClock),
-            notifier,
-            action_table,
         })
+    }
+
+    #[must_use]
+    pub fn with_db(mut self, db: Arc<Db>) -> Self {
+        self.db = db;
+        self
     }
 
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
-        self
-    }
-
-    #[must_use]
-    pub fn with_notifier(mut self, notifier: Arc<dyn Notifier>) -> Self {
-        self.notifier = notifier;
         self
     }
 
@@ -179,10 +140,12 @@ impl AppState {
         self.static_dir = dir.into();
         self
     }
+}
 
-    #[must_use]
-    pub fn with_action_table(mut self, table: ActionTable) -> Self {
-        self.action_table = table;
-        self
-    }
+fn split_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }

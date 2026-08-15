@@ -13,18 +13,10 @@ pub enum Error {
     NotFound,
     #[error("claim mismatch")]
     ClaimMismatch,
-    #[error("unknown action")]
-    UnknownAction,
-    #[error("action not allowed")]
-    ActionNotAllowed,
-    #[error("dirty worktree")]
-    DirtyWorktree,
     #[error("{0}")]
     Invalid(String),
     #[error("frontmatter: {0}")]
     Frontmatter(String),
-    #[error("git: {0}")]
-    Git(String),
     #[error("io: {0}")]
     Io(String),
     #[error("db: {0}")]
@@ -61,13 +53,9 @@ impl IntoResponse for Error {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
-            Self::ClaimMismatch | Self::DirtyWorktree => StatusCode::CONFLICT,
-            Self::UnknownAction | Self::ActionNotAllowed | Self::Invalid(_) => {
-                StatusCode::BAD_REQUEST
-            }
-            Self::Frontmatter(_) | Self::Git(_) | Self::Io(_) | Self::Db(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Self::ClaimMismatch => StatusCode::CONFLICT,
+            Self::Invalid(_) => StatusCode::BAD_REQUEST,
+            Self::Frontmatter(_) | Self::Io(_) | Self::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, Json(json!({ "error": self.to_string() }))).into_response()
     }

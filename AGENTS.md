@@ -1,54 +1,65 @@
 # task-server
 
-Household task control plane. Single writer over a dedicated tasks git work
-tree. Version 0.1.0.
+Task control plane. One Axum process owns one sqlite database and serves both
+the JSON API and the compiled client.
 
 ## Invariants
 
-- Git is truth. The transaction boundary is a git commit.
-- Tasks root is `TASKS_GIT_DIR`. Do not hardcode a household path.
-- Claim returns a lease only after the claim commit.
-- Report accept and the status flip to `awaiting_user` are the same commit.
-- Push and notify are not in that commit; they go to `$TASKS_GIT_DIR/.outbox`.
-- Rewrite YAML frontmatter only. Markdown body bytes after the closing `---`
-  fence stay bit-identical.
-- Status truth is the `status:` field only. Do not encode state in the path.
+- SQLite is truth. The transaction boundary is a sqlite transaction, taken
+  `IMMEDIATE` so concurrent writers serialize at `BEGIN`.
+- The database lives at `APP_DB_PATH` (default `data/task-server.db`).
+  Migrations run at open and are keyed on `PRAGMA user_version`.
+- HTTP is the only way in. There is no file store and no git side effect.
+- There is no physical delete. Discarding a task is a transition to
+  `cancelled` or `dropped`, so the row stays auditable.
+- Product ids are `org/repo`, never a path. Task ids are one path segment.
+- A task may only reach `released` when its product has `releases` set.
+  `available_transitions` and `set_status` decide that with the same code.
+- Claim hands out the next `ready` task, `instant:merge` first, then higher
+  `priority`, then oldest. The row is only taken while it is still `ready`,
+  so two workers never hold the same task.
+- One task, one branch. A claim on a task without a `branch` sets
+  `task/<id>`; an existing branch is never rewritten.
+- A report is matched by `claim_id`. A stale or unknown `claim_id` is
+  rejected with 409. Reporting the same `commit_sha` twice is idempotent.
+- Clock is injectable. Default claim TTL is 3600 seconds (`CLAIM_TTL_SECS`).
 - Listen on `127.0.0.1` by default (`APP_BIND_ADDR` may override).
 - Worker routes require `X-Worker-Capability` equal to the configured secret.
   An identity header alone does not authenticate.
 - Human identity comes from ingress (`X-Auth-User` or `Tailscale-User-Login`).
-  The browser does not mint identity. `TASK_SERVER_ENV=production` is
-  fail-closed without `WORKER_CAPABILITY`, `APP_AUTH_ALLOWLIST`,
-  `APP_CSRF_TOKEN`, `APP_ALLOWED_ORIGINS`, and `NTFY_URL`.
+  The browser does not mint identity.
 - Human mutation requires an allowlisted ingress identity, a matching
   `Origin`, and `X-CSRF-Token`. Worker capability is not sufficient.
-- Action names come from `config/actions.json` (or `ACTION_TABLE_PATH`).
-- After report, pending outbox intents are POSTed to `NTFY_URL`. 2xx marks
-  `delivered`. Notify failure does not roll back the status commit. Startup
-  flushes the outbox again.
-- Unexpired running claims are exclusive. An expired lease may be reclaimed
-  with a new `claim_id`. A report with a stale `claim_id` is rejected.
-- Clock is injectable. Default claim TTL is 3600 seconds (`CLAIM_TTL_SECS`).
-- `available_actions(status)` and action translation share one table.
-- If `target_space` is `household/tasks`, `ready → awaiting_user` is allowed
-  without `running` (self-service).
+- `TASK_SERVER_ENV=production` is fail-closed without `WORKER_CAPABILITY`,
+  `APP_AUTH_ALLOWLIST`, `APP_CSRF_TOKEN`, and `APP_ALLOWED_ORIGINS`.
+- Unknown `/api/*` paths return 404. Every other unknown path falls back to
+  `client/dist/index.html` so the client router can restore a deep link.
 
 ## Status vocabulary
 
-`draft → ready → running → awaiting_user → done → release_requested → released | release_failed`
+`draft → ready → wip → done → merged → released`
 
-Sideways: `blocked` / `cancelled` / `dropped`.
+Sideways from any live status: `blocked`, `cancelled`, `dropped`.
+`blocked` returns to `ready`. `wip` may fall back to `ready`.
+`released`, `cancelled`, and `dropped` are terminal.
 
-Required fields:
+## API
 
-- ready: `next_action`; development: `target_space` or `product_id`
-- running: `claim_id`, `claimed_at`, `worker`, `claim_expires_at`
-- awaiting_user: `commit_sha`, `verification`
-- release_requested: `release_repo`, `release_sha`, `bump` in {patch,minor,major}
-- released: the triple plus `release_tag`
-- release_failed: the triple plus a non-empty `failure`
+| Method | Path | Authorization |
+| --- | --- | --- |
+| GET | `/healthz`, `/api/health` | none |
+| GET | `/api/session` | read |
+| GET | `/api/tasks`, `/api/tasks/{id}` | read |
+| POST | `/api/tasks` | human mutation |
+| PATCH | `/api/tasks/{id}` | human mutation |
+| POST | `/api/tasks/{id}/status` | human mutation |
+| GET | `/api/products`, `/api/products/{id}` | read |
+| PUT | `/api/products/{id}` | human mutation |
+| POST | `/worker/claim`, `/worker/report` | worker capability |
 
-Datetimes: `YYYY-MM-DDTHH:MM:SSZ` or `YYYY-MM-DDTHH:MM:SS±HH:MM`.
+`GET /api/tasks` returns summaries and hides `released` unless `?status=` asks
+for a status explicitly; an unknown status is a 400. Single-task responses are
+the full task plus `available_transitions`.
 
 ## Build / test / run
 
@@ -57,8 +68,8 @@ npm --prefix client ci
 npm --prefix client test
 npm --prefix client run build
 cargo test --locked
-TASKS_GIT_DIR=/path/to/tasks-clone cargo run --locked
+cargo run --locked
 ```
 
-The store expects `$TASKS_GIT_DIR/projects/queue/tasks/<id>.md`. Tests create
-their own `git init` fixtures; they do not use a live household clone.
+Tests open their own database, in memory or under a temporary directory. They
+never touch a deployed database file.

@@ -5,37 +5,23 @@
     task,
     busy = false,
     error = "",
-    onaction,
+    ontransition,
   }: {
     task: Task;
     busy?: boolean;
     error?: string;
-    onaction?: (action: string, bump?: string) => void;
+    ontransition?: (status: string) => void;
   } = $props();
 
-  type ActionButton = { action: string; bump?: string; label: string };
-
-  let buttons = $derived.by((): ActionButton[] => {
-    const out: ActionButton[] = [];
-    for (const action of task.available_actions) {
-      if (action === "bump-tag") {
-        for (const bump of ["patch", "minor", "major"] as const) {
-          out.push({ action, bump, label: `bump-tag ${bump}` });
-        }
-      } else {
-        out.push({ action, label: action });
-      }
-    }
-    return out;
-  });
-
-  function isPrimary(button: ActionButton): boolean {
-    return button.action === "done";
-  }
+  let transitions = $derived(task.available_transitions);
+  let instantMerge = $derived(task.kind === "instant:merge");
 </script>
 
 <p class="meta">
   <span class="badge">{task.status}</span>
+  {#if instantMerge}
+    <span class="badge">instant:merge</span>
+  {/if}
 </p>
 <p class="caption" data-field="commit_sha">
   <span class="caption-label">commit_sha</span>
@@ -49,17 +35,17 @@
 {#if error}
   <p class="state error">{error}</p>
 {/if}
-{#if buttons.length > 0}
+{#if transitions.length > 0}
   <div class="actions">
-    {#each buttons as button (button.label)}
+    {#each transitions as status (status)}
       <button
         class="btn"
-        class:primary={isPrimary(button)}
+        class:primary={status === "ready"}
         type="button"
         disabled={busy}
-        onclick={() => onaction?.(button.action, button.bump)}
+        onclick={() => ontransition?.(status)}
       >
-        {button.label}
+        {status}
       </button>
     {/each}
   </div>

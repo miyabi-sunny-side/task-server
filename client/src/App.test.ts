@@ -12,11 +12,22 @@ import App from "./App.svelte";
 const TASK = {
   id: "sumi",
   title: "Sumi ダークテーマ",
-  status: "awaiting_user",
   body: "本文テキスト",
-  verification: "ok",
+  status: "draft",
+  kind: "normal",
+  product_id: "sunny-side/task-server",
+  priority: 0,
+  branch: null,
+  claimed_by: null,
+  claim_id: null,
+  claimed_at: null,
+  claim_expires_at: null,
   commit_sha: "abc1234",
-  available_actions: ["done"],
+  verification: "ok",
+  release_tag: null,
+  created_at: "2026-08-15T10:00:00Z",
+  updated_at: "2026-08-15T12:00:00Z",
+  available_transitions: ["ready"],
 };
 
 describe("App", () => {

@@ -63,7 +63,12 @@
         <li>
           <a class="card" href={`/tasks/${item.id}`}>
             <span class="name">{item.title}</span>
-            <span class="updated">{item.status}</span>
+            <span class="tags">
+              {#if item.kind === "instant:merge"}
+                <span class="badge">instant:merge</span>
+              {/if}
+              <span class="updated">{item.status}</span>
+            </span>
           </a>
         </li>
       {/each}
@@ -98,6 +103,20 @@
   .name
     font-size: var(--fs-md)
     font-weight: 500
+
+  .tags
+    display: flex
+    flex-shrink: 0
+    align-items: baseline
+    gap: var(--sp-2)
+
+  .badge
+    padding: var(--sp-1) var(--sp-2)
+    border: 1px solid var(--c-border)
+    border-radius: var(--radius-full)
+    font-size: var(--fs-xs)
+    line-height: 1.4
+    color: var(--c-muted)
 
   .updated
     flex-shrink: 0

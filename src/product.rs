@@ -5,7 +5,6 @@ use time::OffsetDateTime;
 use crate::clock::format_z;
 use crate::db::Db;
 use crate::error::Error;
-use crate::status::check_product_id;
 
 const COLUMNS: &str = "id, repository, description, releases";
 
@@ -80,6 +79,31 @@ fn validate(product: &Product) -> Result<(), Error> {
         return Err(Error::Invalid("repository is required".into()));
     }
     Ok(())
+}
+
+/// A product id is `org/repo`, never a path. Shared with task validation.
+pub(crate) fn check_product_id(name: &str, value: &str) -> Result<(), Error> {
+    let invalid = || Error::Invalid(format!("invalid {name} '{value}' (org/repo, not a path)"));
+    if value.contains('\\') || value.contains("..") {
+        return Err(invalid());
+    }
+    let mut parts = value.split('/');
+    let (Some(org), Some(repo), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(invalid());
+    };
+    if !segment_ok(org) || !segment_ok(repo) {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn segment_ok(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
 }
 
 #[cfg(test)]

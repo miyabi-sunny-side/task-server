@@ -20,9 +20,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     info!(%bind_addr, "server listening");
 
     let state = AppState::from_env()?;
-    if let Err(err) = task_server::flush_pending(&state.outbox_dir, state.notifier.as_ref()) {
-        tracing::warn!("startup outbox flush failed: {err}");
-    }
 
     axum::serve(listener, task_server::app(state))
         .with_graceful_shutdown(shutdown_signal())

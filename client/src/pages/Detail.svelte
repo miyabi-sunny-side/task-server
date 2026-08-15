@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { fetchTask, postTaskAction, type TaskCard as Task } from "../lib/api";
+  import { fetchTask, postTaskStatus, type TaskCard as Task } from "../lib/api";
   import TaskCard from "../lib/TaskCard.svelte";
 
   let { id }: { id: string } = $props();
@@ -25,14 +25,14 @@
     }
   }
 
-  async function onaction(action: string, bump?: string) {
+  async function ontransition(status: string) {
     if (!task) {
       return;
     }
     busy = true;
     actionError = "";
     try {
-      await postTaskAction(task.id, action, bump);
+      await postTaskStatus(task.id, status);
       await load(task.id);
     } catch {
       actionError = "操作に失敗しました";
@@ -59,7 +59,7 @@
   {:else if detailState === "error"}
     <p class="state error">読み込みに失敗しました</p>
   {:else if task}
-    <TaskCard {task} {busy} error={actionError} {onaction} />
+    <TaskCard {task} {busy} error={actionError} {ontransition} />
   {/if}
 </div>
 

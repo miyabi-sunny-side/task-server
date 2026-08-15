@@ -14,11 +14,19 @@ const TASKS = [
     id: "theme",
     title: "テーマ切替",
     status: "ready",
+    kind: "normal",
+    product_id: "sunny-side/task-server",
+    priority: 0,
+    updated_at: "2026-08-15T12:00:00Z",
   },
   {
     id: "router",
     title: "ルーター",
-    status: "awaiting_user",
+    status: "wip",
+    kind: "instant:merge",
+    product_id: "sunny-side/task-server",
+    priority: 1,
+    updated_at: "2026-08-15T11:00:00Z",
   },
 ];
 
@@ -61,6 +69,24 @@ describe("Home", () => {
     const card = screen.getByRole("link", { name: /テーマ切替/ });
     expect(card.getAttribute("href")).toBe("/tasks/theme");
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the status caption and marks only instant:merge items", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(TASKS)),
+    );
+
+    render(Home);
+    await waitFor(() => expect(listContainer().dataset.state).toBe("success"));
+
+    const instant = screen.getByRole("link", { name: /ルーター/ });
+    expect(instant.textContent).toContain("wip");
+    expect(instant.textContent).toContain("instant:merge");
+
+    const normal = screen.getByRole("link", { name: /テーマ切替/ });
+    expect(normal.textContent).toContain("ready");
+    expect(normal.textContent).not.toContain("instant:merge");
   });
 
   it("reloads the list when the tab becomes visible again", async () => {

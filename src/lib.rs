@@ -9,44 +9,41 @@ use axum::routing::{get, post};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
-pub mod actions;
 pub mod clock;
 pub mod db;
 pub mod error;
 pub mod frontmatter;
 pub mod http;
-pub mod notify;
-pub mod outbox;
 pub mod product;
 pub mod state;
-pub mod status;
-pub mod store;
 pub mod task;
 
-pub use actions::{ActionEffect, ActionTable};
 pub use clock::{Clock, SharedClock, SystemClock, format_z};
 pub use db::Db;
 pub use error::Error;
 pub use frontmatter::{Document, join_document, split_document};
-pub use notify::{FailingNotifier, HttpNotifier, NoopNotifier, Notifier, flush_pending};
-pub use outbox::NotificationIntent;
+pub use http::{TaskCard, TaskSummary};
 pub use product::Product;
 pub use state::AppState;
-pub use status::{Status, TransitionContext, can_transition, validate_task};
-pub use store::{
-    ClaimLease, ReportOutcome, ReportRequest, TaskCard, TaskSummary, apply_human_action, claim,
-    get_task, list_tasks, report, self_service_awaiting_user,
-};
-pub use task::{NewTask, Task, TaskKind, TaskStatus};
+pub use task::{NewTask, Task, TaskKind, TaskPatch, TaskStatus, can_transition};
 
 pub fn app(state: AppState) -> Router {
     let static_dir = state.static_dir.clone();
     let api = Router::new()
         .route("/health", get(http::api_health))
         .route("/session", get(http::api_session))
-        .route("/tasks", get(http::api_tasks))
-        .route("/tasks/{id}", get(http::api_task))
-        .route("/tasks/{id}/actions/{action}", post(http::api_action))
+        .route("/tasks", get(http::api_tasks).post(http::api_create_task))
+        .route(
+            "/tasks/{id}",
+            get(http::api_task).patch(http::api_patch_task),
+        )
+        .route("/tasks/{id}/status", post(http::api_set_status))
+        .route("/products", get(http::api_products))
+        // Product ids are `org/repo`, so the capture has to span two segments.
+        .route(
+            "/products/{*id}",
+            get(http::api_product).put(http::api_put_product),
+        )
         .fallback(http::api_not_found);
 
     Router::new()
@@ -63,7 +60,7 @@ pub fn app(state: AppState) -> Router {
 
 /// Convenience for tests that only need a static file root.
 pub fn app_with_static(static_dir: impl AsRef<Path>) -> Router {
-    app(AppState::for_test("/nonexistent-tasks-git-dir").with_static_dir(static_dir.as_ref()))
+    app(AppState::for_test().with_static_dir(static_dir.as_ref()))
 }
 
 #[cfg(test)]

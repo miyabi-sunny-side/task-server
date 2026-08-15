@@ -1,6 +1,7 @@
 .git
 .github
 target
+data
 client/node_modules
 client/dist
 *.log

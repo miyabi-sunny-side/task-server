@@ -377,7 +377,9 @@ currently uses it.
 - **Top page — task list:** cards per the family recipe
   (surface-raised, 1px hairline, 8px radius, 10px padding) in a single
   column with 8px gaps; each card links to its Task Card and shows the
-  task title (label) and status (caption muted). The list container
+  task title (label) and status (caption muted). A task whose `kind` is
+  `instant:merge` also carries the outline badge, left of the status.
+  The list container
   exposes `data-state="loading|empty|error|success"`:
   - _loading:_ centered muted body-sm text with the accent spinner
     (1.5px-stroke circle, 1.1rem);
@@ -388,11 +390,13 @@ currently uses it.
   column showing status (an outline badge — caption type, 1px border,
   muted text; neutral chrome, not a data color), `commit_sha` and
   `verification` as muted captions when present, body text (body, 1.6,
-  pre-line), and `available_actions` as a row of default buttons. The
-  `done` action, when present, is the single primary (accent-filled)
-  button. `bump-tag` expands to three buttons posting `bump` =
-  patch / minor / major. After a successful action the card reloads so
-  status and actions update. There is no icon-dictionary fixture page.
+  pre-line), and `available_transitions` as a row of default buttons,
+  one per reachable status. An `instant:merge` task carries a second
+  outline badge next to the status. The `ready` transition, when
+  present, is the single primary (accent-filled) button — it is the
+  human decision the screen exists for. After a successful transition
+  the card reloads so status and buttons update. There is no
+  icon-dictionary fixture page.
 - **Buttons:** default = surface-raised bg, 1px hairline, label type,
   sm radius, 8×14px padding, hover fills `--c-hover-1`. Primary =
   accent bg, `surface-raised`-token text — at most one per screen.
@@ -458,9 +462,9 @@ currently uses it.
   8. A Task Card sub-header contains the task title and zero
      buttons or links.
   9. A Task Card shows body, verification, commit_sha, status, and one
-     control per available action (`bump-tag` appears as three bump
-     buttons). After a successful POST the displayed status and actions
-     match the reloaded card.
+     control per available transition, with `ready` as the only primary
+     button when it is offered. After a successful POST the displayed
+     status and buttons match the reloaded card.
 
 ## Do's and Don'ts
 

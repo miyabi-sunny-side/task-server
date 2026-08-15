@@ -15,16 +15,31 @@ export interface TaskSummary {
   id: string;
   title: string;
   status: string;
+  kind: string;
+  product_id: string;
+  priority: number;
+  updated_at: string;
 }
 
 export interface TaskCard {
   id: string;
   title: string;
-  status: string;
   body: string;
-  verification: string | null;
+  status: string;
+  kind: string;
+  product_id: string;
+  priority: number;
+  branch: string | null;
+  claimed_by: string | null;
+  claim_id: string | null;
+  claimed_at: string | null;
+  claim_expires_at: string | null;
   commit_sha: string | null;
-  available_actions: string[];
+  verification: string | null;
+  release_tag: string | null;
+  created_at: string;
+  updated_at: string;
+  available_transitions: string[];
 }
 
 async function requestJson<T>(url: string, init: RequestInit = {}): Promise<T> {
@@ -41,25 +56,24 @@ async function requestJson<T>(url: string, init: RequestInit = {}): Promise<T> {
   return (await response.json()) as T;
 }
 
-export function fetchTasks(signal?: AbortSignal): Promise<TaskSummary[]> {
-  return requestJson("/api/tasks", { signal });
+export function fetchTasks(
+  signal?: AbortSignal,
+  status?: string,
+): Promise<TaskSummary[]> {
+  const url = status
+    ? `/api/tasks?status=${encodeURIComponent(status)}`
+    : "/api/tasks";
+  return requestJson(url, { signal });
 }
 
 export function fetchTask(id: string, signal?: AbortSignal): Promise<TaskCard> {
   return requestJson(`/api/tasks/${encodeURIComponent(id)}`, { signal });
 }
 
-export function postTaskAction(
-  id: string,
-  action: string,
-  bump?: string,
-): Promise<TaskCard> {
-  return requestJson(
-    `/api/tasks/${encodeURIComponent(id)}/actions/${encodeURIComponent(action)}`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(bump ? { bump } : {}),
-    },
-  );
+export function postTaskStatus(id: string, status: string): Promise<TaskCard> {
+  return requestJson(`/api/tasks/${encodeURIComponent(id)}/status`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ status }),
+  });
 }
