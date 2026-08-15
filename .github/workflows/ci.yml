@@ -93,3 +93,30 @@ jobs:
 
       - name: Build container image
         run: docker build --tag task-server:test .
+
+      # Continuous backup is a sidecar a deployment adds, never something the
+      # image needs. The default image, given no backup variables at all, still
+      # has to come up on its own and create its database.
+      - name: Smoke-test the image without any backup configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --detach --name task-server-smoke \
+            --publish 127.0.0.1:3000:3000 task-server:test
+          trap 'docker rm --force task-server-smoke >/dev/null 2>&1 || true' EXIT
+
+          for attempt in {1..40}; do
+            if curl --fail --silent --show-error http://127.0.0.1:3000/healthz >/dev/null; then
+              break
+            fi
+            if [[ "$attempt" == 40 ]]; then
+              docker logs task-server-smoke
+              exit 1
+            fi
+            sleep 0.5
+          done
+
+          test "$(curl --fail --silent http://127.0.0.1:3000/healthz)" = "ok"
+          # The database and its write-ahead log are what a sidecar replicates.
+          docker exec task-server-smoke sh -c 'test -s /app/data/task-server.db'
+          docker exec task-server-smoke sh -c 'test -e /app/data/task-server.db-wal'

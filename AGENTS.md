@@ -9,6 +9,24 @@ JSON API, the MCP endpoints, and the compiled client.
   `IMMEDIATE` so concurrent writers serialize at `BEGIN`.
 - The database lives at `APP_DB_PATH` (default `data/task-server.db`).
   Migrations run at open and are keyed on `PRAGMA user_version`.
+- A database on disk is in WAL or it does not open. `Db::open` reads
+  `journal_mode` back and refuses anything else, because continuous backup
+  follows the write-ahead log and a replica of a `delete` mode database would
+  quietly stop tracking the truth. `busy_timeout` is read back the same way.
+- What is exempt from that is decided from the path asked for, never from what
+  sqlite reports afterwards: sqlite names a temporary database exactly as it
+  names an in-memory one, so a blank `APP_DB_PATH` would otherwise open a
+  scratch database that is neither replicated nor persisted. A blank or
+  whitespace-only path is refused outright. Only the literal `:memory:` — and
+  the internal in-memory open the tests use — is exempt; URI spellings such as
+  `file::memory:` are treated as files and so fail the WAL read-back.
+- The write-ahead log is left to sqlite. `wal_autocheckpoint` is never set and no
+  checkpoint is ever forced: trimming the log is sqlite's business, and where the
+  log is replicated the replicator has to have read a frame before it goes.
+- Backup is a sidecar, never the server. The process replicates nothing and
+  starts no Litestream, so an image given no backup configuration starts exactly
+  as it always did. `deploy/litestream.yml.example` reaches every credential,
+  bucket, and endpoint through the environment and carries none of them.
 - HTTP is the only way in, carrying both the JSON API and the MCP endpoints.
   There is no file store and no git side effect.
 - There is no physical delete. Discarding a task is a transition to

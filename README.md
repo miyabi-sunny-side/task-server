@@ -333,6 +333,67 @@ skipped 0 (already imported, unchanged)
 warning: 1 product(s) not in the catalogue: example/repo
 ```
 
+## Continuous backup
+
+The database is the whole control plane, and it sits on one volume. Litestream
+follows the write-ahead log and streams it to S3-compatible object storage, so
+losing the volume costs about a second of writes instead of everything.
+
+The server does none of this. It never starts Litestream and knows nothing
+about a replica, so an image given no backup configuration comes up exactly as
+it always did. Backup is a **sidecar**: a pinned `litestream/litestream` image
+beside the server container, both mounting one **local named volume** so they
+reach the same `/app/data/task-server.db`.
+
+That arrangement has real limits, and they are not advisory:
+
+- The volume must be a local one on the same Docker host. A network filesystem
+  (NFS, SMB, GlusterFS) cannot carry sqlite's locks, and a Docker Desktop host
+  bind mount can corrupt the write-ahead log.
+- Both processes must run on the same kernel, so their file locks agree.
+- Exactly one server and exactly one Litestream, never two of either.
+- Both need write access to the volume; the image owns `/app/data` as
+  `10001:10001`, so run the sidecar as `--user 10001:10001` too.
+
+[`deploy/litestream.yml.example`](deploy/litestream.yml.example) is the config,
+mounted at `/etc/litestream.yml`. Every value that names or opens the bucket is
+an environment reference — `R2_ENDPOINT`, `R2_BUCKET`, `R2_PREFIX`,
+`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` — injected as secrets by whatever
+runs the containers. Only `region: auto` and the database path are fixed. No
+credential, bucket name, or endpoint belongs in this repository.
+
+Writing the compose file, creating the bucket, and holding the secrets belong
+to the deployment that runs the service, as its own change in its own
+repository.
+
+### Restoring
+
+Restore is something a person does, never something startup does.
+
+1. Stop the server and the sidecar.
+2. Create an **empty new volume** — restoring over a live database is refused,
+   and keeping the old one means you can still compare.
+3. Run the same pinned Litestream image with the same config against it:
+   `litestream restore -integrity-check full /app/data/task-server.db`.
+4. Read the restored database before trusting it.
+5. Swap the volume in, then start the **sidecar first and the server second**,
+   so replication is watching before writes resume.
+
+A backup that has never been restored is a guess.
+[`deploy/restore-drill.sh`](deploy/restore-drill.sh) is the rehearsal: it
+stands up a local MinIO as a stand-in for R2, replicates from a running server
+while a task is created through the API, restores into a fresh volume with a
+full integrity check, reads that task back out of the restored database, and
+cleans up after itself. It uses public images and credentials it generates on
+the spot; it never touches the real bucket.
+
+```sh
+deploy/restore-drill.sh
+```
+
+Docker is the only prerequisite. `TASK_SERVER_IMAGE`, `DRILL_PORT`, and
+`DRILL_RESTORED_PORT` override the defaults.
+
 ## Development
 
 Terminal 1, from the repository root:
@@ -397,6 +458,7 @@ With `TASK_SERVER_ENV=production` the process refuses to start unless
 ```text
 .
 ├── client/             # Svelte 5 Task Card UI
+├── deploy/             # Litestream config template and the restore drill
 ├── src/                # Axum router, MCP endpoints, sqlite store, status machine
 ├── tests/              # Contract tests against the public API
 ├── Cargo.toml

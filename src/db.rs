@@ -110,6 +110,29 @@ CREATE UNIQUE INDEX tasks_open_merge_target_idx ON tasks(merge_target_task_id)
   WHERE merge_target_task_id IS NOT NULL AND status NOT IN ('cancelled', 'dropped');
 ";
 
+/// How long a writer waits for a lock before giving up, in milliseconds.
+const BUSY_TIMEOUT_MS: i64 = 5000;
+
+/// The one path that asks for an in-memory database.
+///
+/// Nothing else spells it. In particular the URI forms sqlite also understands
+/// — `file::memory:`, `file:name?mode=memory` — are **not** recognised here as
+/// in-memory: they are classified as files, so the WAL read-back refuses them
+/// rather than letting a database with no file behind it through.
+const IN_MEMORY_PATH: &str = ":memory:";
+
+/// Whether a database has a file behind it.
+///
+/// Continuous backup follows the write-ahead log, so a database on disk that is
+/// not in WAL is refused outright: a replica of a `delete` mode database would
+/// silently stop tracking the truth. An in-memory database has no file to
+/// replicate and keeps whatever journal mode sqlite gives it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Backing {
+    File,
+    Memory,
+}
+
 /// The sqlite database that holds the control plane state.
 pub struct Db {
     conn: Mutex<Connection>,
@@ -117,25 +140,45 @@ pub struct Db {
 
 impl Db {
     /// Open (creating if needed) the database at `path`, running migrations.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `path` is blank, when the file cannot be opened, when it
+    /// cannot be put into WAL mode, or when a migration is refused.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent()
+        let backing = backing_asked_for(path)?;
+        if backing == Backing::File
+            && let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
             fs::create_dir_all(parent)?;
         }
-        Self::from_connection(Connection::open(path)?)
+        Self::from_connection(Connection::open(path)?, backing)
     }
 
     /// Open a private in-memory database, running migrations.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a migration is refused.
     pub fn open_in_memory() -> Result<Self, Error> {
-        Self::from_connection(Connection::open_in_memory()?)
+        Self::from_connection(Connection::open_in_memory()?, Backing::Memory)
     }
 
-    fn from_connection(conn: Connection) -> Result<Self, Error> {
-        // WAL is meaningless for in-memory databases; that refusal is not fatal.
-        drop(conn.execute_batch("PRAGMA journal_mode=WAL;"));
-        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
+    fn from_connection(conn: Connection, backing: Backing) -> Result<Self, Error> {
+        conn.execute_batch(&format!(
+            "PRAGMA foreign_keys=ON; PRAGMA busy_timeout={BUSY_TIMEOUT_MS};"
+        ))?;
+        if backing == Backing::File {
+            // `PRAGMA journal_mode` answers with the mode it settled on, so it
+            // is a query, not a statement to execute and forget.
+            conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))
+                .map_err(|error| {
+                    Error::Db(format!("the database could not enter WAL mode: {error}"))
+                })?;
+        }
+        confirm_pragmas(&conn, backing)?;
         migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -162,6 +205,48 @@ impl Db {
         tx.commit()?;
         Ok(value)
     }
+}
+
+/// Decide from the requested path what kind of database the caller asked for.
+///
+/// The decision cannot be left to sqlite after the fact: `Connection::path`
+/// answers `Some("")` for a *temporary* database just as it does for an
+/// in-memory one, so reading the exemption off that report made `Db::open("")`
+/// succeed against a scratch database that is neither replicated nor persisted,
+/// with the WAL requirement skipped. Only [`IN_MEMORY_PATH`] asks for memory;
+/// every other path is a file and must be in WAL. A blank path asks for
+/// nothing at all and is refused here, before a connection exists.
+fn backing_asked_for(path: &Path) -> Result<Backing, Error> {
+    match path.to_str() {
+        Some(text) if text.trim().is_empty() => Err(Error::Invalid(format!(
+            "a database path is required: name a file, or `{IN_MEMORY_PATH}` for an in-memory database"
+        ))),
+        Some(text) if text == IN_MEMORY_PATH => Ok(Backing::Memory),
+        _ => Ok(Backing::File),
+    }
+}
+
+/// Read back what the open asked for, because a pragma that was refused, or
+/// quietly ignored, is indistinguishable from one that was applied.
+///
+/// The write-ahead log itself is left alone: no `wal_autocheckpoint` is set and
+/// no checkpoint is ever forced. Trimming the log is sqlite's business, and a
+/// deployment that replicates the log needs the replicator to have read a frame
+/// before it goes.
+fn confirm_pragmas(conn: &Connection, backing: Backing) -> Result<(), Error> {
+    let busy_timeout: i64 = conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
+    if busy_timeout != BUSY_TIMEOUT_MS {
+        return Err(Error::Db(format!(
+            "busy_timeout is {busy_timeout}ms, not the {BUSY_TIMEOUT_MS}ms writers are serialized on"
+        )));
+    }
+    let journal_mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    if backing == Backing::File && !journal_mode.eq_ignore_ascii_case("wal") {
+        return Err(Error::Db(format!(
+            "a database on disk must be in WAL mode so a backup can follow it, but this one is in {journal_mode} mode"
+        )));
+    }
+    Ok(())
 }
 
 fn migrate(conn: &Connection) -> Result<(), Error> {
@@ -227,9 +312,116 @@ mod tests {
 
     use super::{Db, SCHEMA_V1, SCHEMA_V2};
 
+    fn pragma_string(db: &Db, pragma: &str) -> String {
+        db.with_conn(|conn| Ok(conn.query_row(&format!("PRAGMA {pragma}"), [], |row| row.get(0))?))
+            .unwrap()
+    }
+
+    fn pragma_int(db: &Db, pragma: &str) -> i64 {
+        db.with_conn(|conn| Ok(conn.query_row(&format!("PRAGMA {pragma}"), [], |row| row.get(0))?))
+            .unwrap()
+    }
+
     fn user_version(db: &Db) -> i64 {
         db.with_conn(|conn| Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?))
             .unwrap()
+    }
+
+    /// Continuous backup reads the WAL, so a database on disk that is not in WAL
+    /// is not a database this server may serve: the replica would silently fall
+    /// behind the truth. `Db::open` therefore reads the mode back and refuses
+    /// rather than carrying on in `delete` mode. An in-memory database has no
+    /// WAL to keep and is exempt.
+    #[test]
+    fn a_file_backed_database_is_wal_or_it_does_not_open() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let db = Db::open(dir.path().join("sqlite.db")).unwrap();
+        assert_eq!(pragma_string(&db, "journal_mode"), "wal");
+        assert_eq!(pragma_int(&db, "busy_timeout"), 5000);
+        drop(db);
+
+        let memory = Db::open_in_memory().unwrap();
+        assert_eq!(
+            pragma_string(&memory, "journal_mode"),
+            "memory",
+            "an in-memory database keeps its own journal mode"
+        );
+        assert_eq!(pragma_int(&memory, "busy_timeout"), 5000);
+
+        // `APP_DB_PATH=:memory:` arrives through the same door as a file and is
+        // still not a file, so it is exempt too.
+        let named_memory = Db::open(":memory:").unwrap();
+        assert_eq!(pragma_string(&named_memory, "journal_mode"), "memory");
+
+        // Sqlite refuses to change journal mode while another connection holds
+        // the file, so a `delete` database with a reader on it is a disk
+        // database that cannot reach WAL. Reading it still works — only a
+        // deliberate check of the mode catches this.
+        let contested = dir.path().join("contested.db");
+        drop(Db::open(&contested).unwrap());
+        let reader = Connection::open(&contested).unwrap();
+        let mode: String = reader
+            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete", "the fixture must start outside WAL");
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM products;")
+            .unwrap();
+
+        let Err(error) = Db::open(&contested) else {
+            panic!("a disk database that cannot be WAL must not open");
+        };
+        assert!(
+            matches!(error, crate::error::Error::Db(_)),
+            "a database that cannot be WAL must be refused as a database fault, got {error:?}"
+        );
+    }
+
+    /// Sqlite reports a temporary database exactly like an in-memory one: no
+    /// filename at all. Reading the exemption off that report let an empty
+    /// `APP_DB_PATH` open a temporary database in `delete` mode — neither
+    /// replicated nor persisted — with the WAL requirement quietly skipped. A
+    /// path is required, and only an explicit in-memory database is exempt.
+    #[test]
+    fn a_blank_path_is_refused_and_only_an_explicit_memory_database_is_exempt() {
+        for blank in ["", " ", "\t\n"] {
+            let Err(error) = Db::open(blank) else {
+                panic!(
+                    "a blank database path must be refused, not opened as a temporary database ({blank:?})"
+                );
+            };
+            assert!(
+                matches!(error, crate::error::Error::Invalid(_)),
+                "a blank path is a bad argument, not a database fault, got {error:?}"
+            );
+        }
+
+        // The explicit spellings stay exempt, and still migrate.
+        let named = Db::open(":memory:").unwrap();
+        assert_eq!(pragma_string(&named, "journal_mode"), "memory");
+        assert_eq!(pragma_int(&named, "busy_timeout"), 5000);
+        assert_eq!(user_version(&named), 3);
+
+        let private = Db::open_in_memory().unwrap();
+        assert_eq!(pragma_int(&private, "busy_timeout"), 5000);
+        assert_eq!(user_version(&private), 3);
+
+        // A URI spelling is not one of them. Only the exact `:memory:` is
+        // exempt, so a URI is an ordinary filename: it lands on disk in WAL,
+        // where a replica can follow it, rather than becoming an unbacked
+        // database that quietly holds the control plane in RAM.
+        let dir = tempfile::tempdir().unwrap();
+        for uri in ["file::memory:", "file:cache?mode=memory"] {
+            let asked = dir.path().join(uri);
+            let db = Db::open(&asked).expect("a URI spelling is just a filename");
+            assert_eq!(
+                pragma_string(&db, "journal_mode"),
+                "wal",
+                "a URI memory spelling must not become an in-memory database ({uri})"
+            );
+            assert!(asked.is_file(), "{uri} must have produced a real file");
+        }
     }
 
     /// Every column of one task row, in schema order, as `(name, value)`. A
