@@ -18,15 +18,7 @@ pub struct AppState {
     /// Bearer capability for the administrative MCP endpoint. Kept apart from
     /// `worker_capability` on purpose: a worker credential never opens CRUD.
     pub mcp_capability: String,
-    /// `Host` authorities the MCP endpoints answer to. Empty means rmcp's own
-    /// default, which is loopback only — the protection against a page that
-    /// re-resolves its name to `127.0.0.1` and then talks to this server from
-    /// its own origin. A published deployment declares its names here; nothing
-    /// switches the guard off.
-    pub mcp_allowed_hosts: Vec<String>,
-    pub allowlist: Vec<String>,
     pub csrf_token: String,
-    pub allowed_origins: Vec<String>,
     pub dev_identity: Option<String>,
     pub claim_ttl_secs: u64,
     pub clock: Arc<dyn Clock>,
@@ -40,10 +32,7 @@ impl AppState {
             static_dir: PathBuf::from("client"),
             worker_capability: "test-capability".into(),
             mcp_capability: "test-mcp-capability".into(),
-            mcp_allowed_hosts: Vec::new(),
-            allowlist: vec!["miyabi".into()],
             csrf_token: "test-csrf".into(),
-            allowed_origins: vec!["https://task-server.test".into()],
             dev_identity: None,
             claim_ttl_secs: DEFAULT_CLAIM_TTL_SECS,
             clock: Arc::new(SystemClock),
@@ -77,30 +66,11 @@ impl AppState {
         } else {
             get("MCP_CAPABILITY").unwrap_or_else(|| "dev-mcp-capability".into())
         };
-        let allowlist_raw = if production {
-            require("APP_AUTH_ALLOWLIST")?
-        } else {
-            get("APP_AUTH_ALLOWLIST").unwrap_or_else(|| "miyabi".into())
-        };
-        let allowlist = split_list(&allowlist_raw);
-        if allowlist.is_empty() {
-            return Err(Error::Invalid("APP_AUTH_ALLOWLIST is empty".into()));
-        }
         let csrf_token = if production {
             require("APP_CSRF_TOKEN")?
         } else {
             get("APP_CSRF_TOKEN").unwrap_or_else(|| "dev-csrf".into())
         };
-        let allowed_origins = if production {
-            split_list(&require("APP_ALLOWED_ORIGINS")?)
-        } else {
-            get("APP_ALLOWED_ORIGINS")
-                .map(|raw| split_list(&raw))
-                .unwrap_or_default()
-        };
-        if production && allowed_origins.is_empty() {
-            return Err(Error::Invalid("APP_ALLOWED_ORIGINS is empty".into()));
-        }
         if worker_capability.is_empty() || csrf_token.is_empty() {
             return Err(Error::Invalid(
                 "WORKER_CAPABILITY and APP_CSRF_TOKEN must be non-empty".into(),
@@ -108,21 +78,6 @@ impl AppState {
         }
         if mcp_capability.is_empty() {
             return Err(Error::Invalid("MCP_CAPABILITY must be non-empty".into()));
-        }
-        // Left empty in development, where rmcp's loopback default is exactly
-        // right. In production the deployment answers to its own name, and the
-        // guard is that the set of accepted authorities is declared rather than
-        // open: an undeclared list would mean either refusing every real request
-        // or admitting every rebound one, so production must state it.
-        let mcp_allowed_hosts = if production {
-            split_list(&require("APP_MCP_ALLOWED_HOSTS")?)
-        } else {
-            get("APP_MCP_ALLOWED_HOSTS")
-                .map(|raw| split_list(&raw))
-                .unwrap_or_default()
-        };
-        if production && mcp_allowed_hosts.is_empty() {
-            return Err(Error::Invalid("APP_MCP_ALLOWED_HOSTS is empty".into()));
         }
         let dev_identity = if production {
             None
@@ -143,10 +98,7 @@ impl AppState {
             static_dir,
             worker_capability,
             mcp_capability,
-            mcp_allowed_hosts,
-            allowlist,
             csrf_token,
-            allowed_origins,
             dev_identity,
             claim_ttl_secs,
             clock: Arc::new(SystemClock),
@@ -171,27 +123,11 @@ impl AppState {
         self
     }
 
-    /// Declare the `Host` authorities the MCP endpoints answer to, replacing
-    /// rmcp's loopback default.
-    #[must_use]
-    pub fn with_mcp_allowed_hosts(mut self, hosts: impl IntoIterator<Item = String>) -> Self {
-        self.mcp_allowed_hosts = hosts.into_iter().collect();
-        self
-    }
-
     #[must_use]
     pub fn with_static_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.static_dir = dir.into();
         self
     }
-}
-
-fn split_list(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
 }
 
 #[cfg(test)]
@@ -201,28 +137,52 @@ mod tests {
     use super::AppState;
     use crate::error::Error;
 
-    /// The production secrets a start needs before `MCP_CAPABILITY` is added.
+    /// Everything a production start needs. What used to sit beside these —
+    /// an allowlist of identities, of origins, of `Host` authorities — is the
+    /// reverse proxy's to decide, so all that is left is the secrets no proxy
+    /// can supply.
     fn production() -> HashMap<&'static str, &'static str> {
         HashMap::from([
             ("TASK_SERVER_ENV", "production"),
             ("WORKER_CAPABILITY", "worker-secret"),
-            ("APP_AUTH_ALLOWLIST", "miyabi"),
+            ("MCP_CAPABILITY", "mcp-secret"),
             ("APP_CSRF_TOKEN", "csrf-secret"),
-            ("APP_ALLOWED_ORIGINS", "https://task-server.test"),
+            ("APP_DB_PATH", ":memory:"),
         ])
     }
 
-    /// A capability that opens task CRUD to an agent is a secret, so a
-    /// production start without one fails closed instead of defaulting.
+    /// Each secret is required on its own, and the refusal names the one that
+    /// is missing: a deployment that forgets one is told which, instead of
+    /// starting on a default this README publishes.
     #[test]
-    fn production_requires_an_mcp_capability() {
+    fn production_names_the_secret_it_is_missing() {
+        for missing in ["WORKER_CAPABILITY", "MCP_CAPABILITY", "APP_CSRF_TOKEN"] {
+            let mut vars = production();
+            vars.remove(missing);
+            let error = AppState::from_vars(|key| vars.get(key).map(|value| (*value).to_owned()))
+                .err()
+                .unwrap_or_else(|| panic!("a production start without {missing} must fail"));
+            assert!(
+                matches!(&error, Error::Invalid(message) if message.contains(missing)),
+                "unexpected error for {missing}: {error:?}"
+            );
+        }
+    }
+
+    /// Those secrets are the whole production contract. A start holding them
+    /// needs nothing further declared — no identities, origins, or hosts, all
+    /// of which the reverse proxy in front decides.
+    #[test]
+    fn production_starts_on_its_secrets_alone() {
         let vars = production();
-        let error = AppState::from_vars(|key| vars.get(key).map(|value| (*value).to_owned()))
-            .err()
-            .expect("a production start without MCP_CAPABILITY must fail");
+        let state = AppState::from_vars(|key| vars.get(key).map(|value| (*value).to_owned()))
+            .expect("the secrets are the whole contract");
+        assert_eq!(state.worker_capability, "worker-secret");
+        assert_eq!(state.mcp_capability, "mcp-secret");
+        assert_eq!(state.csrf_token, "csrf-secret");
         assert!(
-            matches!(&error, Error::Invalid(message) if message.contains("MCP_CAPABILITY")),
-            "unexpected error: {error:?}"
+            state.dev_identity.is_none(),
+            "production must not mint an identity of its own"
         );
     }
 
@@ -237,54 +197,5 @@ mod tests {
         .expect("a development start needs no secrets");
         assert_eq!(state.mcp_capability, "dev-mcp-capability");
         assert_ne!(state.mcp_capability, state.worker_capability);
-        assert!(
-            state.mcp_allowed_hosts.is_empty(),
-            "an undeclared allowlist means rmcp's loopback default, not none"
-        );
-    }
-
-    /// Behind a reverse proxy the `Host` a client sends is the deployment's own
-    /// name, which the server cannot infer. The allowlist is what keeps a
-    /// rebound name out, so production declares it or does not start.
-    #[test]
-    fn production_requires_the_mcp_host_allowlist() {
-        let mut vars = production();
-        vars.insert("MCP_CAPABILITY", "mcp-secret");
-        let error = AppState::from_vars(|key| vars.get(key).map(|value| (*value).to_owned()))
-            .err()
-            .expect("a production start without APP_MCP_ALLOWED_HOSTS must fail");
-        assert!(
-            matches!(&error, Error::Invalid(message) if message.contains("APP_MCP_ALLOWED_HOSTS")),
-            "unexpected error: {error:?}"
-        );
-
-        vars.insert(
-            "APP_MCP_ALLOWED_HOSTS",
-            "tasks.example.test, tasks.internal",
-        );
-        vars.insert("APP_DB_PATH", ":memory:");
-        let state = AppState::from_vars(|key| vars.get(key).map(|value| (*value).to_owned()))
-            .expect("a declared allowlist starts");
-        assert_eq!(
-            state.mcp_allowed_hosts,
-            ["tasks.example.test", "tasks.internal"]
-        );
-    }
-
-    /// An empty declaration is not a declaration: it would clear the allowlist
-    /// and admit every `Host`, which is the state this variable exists to
-    /// prevent.
-    #[test]
-    fn production_refuses_an_empty_mcp_host_allowlist() {
-        let mut vars = production();
-        vars.insert("MCP_CAPABILITY", "mcp-secret");
-        vars.insert("APP_MCP_ALLOWED_HOSTS", " , ");
-        let error = AppState::from_vars(|key| vars.get(key).map(|value| (*value).to_owned()))
-            .err()
-            .expect("an empty allowlist must fail");
-        assert!(
-            matches!(&error, Error::Invalid(message) if message.contains("APP_MCP_ALLOWED_HOSTS")),
-            "unexpected error: {error:?}"
-        );
     }
 }

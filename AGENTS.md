@@ -118,8 +118,10 @@ JSON API, the MCP endpoints, and the compiled client.
   An identity header alone does not authenticate.
 - Human identity comes from ingress (`X-Auth-User` or `Tailscale-User-Login`).
   The browser does not mint identity.
-- Human mutation requires an allowlisted ingress identity, a matching
-  `Origin`, and `X-CSRF-Token`. Worker capability is not sufficient.
+- Human mutation requires an ingress identity and `X-CSRF-Token`. The identity
+  is taken at face value and `Origin` is not read: which clients reach this
+  server is the reverse proxy's decision, and the token is what a cross-site
+  page cannot produce. Worker capability is not sufficient.
 - MCP is a second transport, not a second domain. `/mcp` and `/worker/mcp` are
   Streamable HTTP endpoints in the same process, and every tool decodes its
   arguments and calls `src/task.rs` or `src/product.rs`. The transition table,
@@ -129,12 +131,10 @@ JSON API, the MCP endpoints, and the compiled client.
   CRUD. The check runs before rmcp sees the request, so a missing or mismatched
   bearer is 401 and gets no JSON-RPC answer at all.
 - Ingress identity, `Origin`, and CSRF are not applied to MCP; the bearer is the
-  gate for authorization. The `Host` allowlist is a separate gate and stays on:
-  rmcp's loopback-only default is what stops DNS rebinding, and the bearer does
-  not replace it because a development capability is a published constant. An
-  undeclared `Host` is refused with 403 before JSON-RPC. `APP_MCP_ALLOWED_HOSTS`
-  declares the authorities a published deployment answers to and replaces the
-  default; it is never switched off.
+  whole gate. rmcp's loopback-only `Host` allowlist is switched off with
+  `disable_allowed_hosts()`, because this server is reached through a reverse
+  proxy that already decides which names it serves and the default would refuse
+  the name that proxy forwards.
 - `/mcp` carries `product_list`, `task_create`, `task_get`, `task_list`,
   `task_update`, and `task_set_status`; `/worker/mcp` carries `task_claim` and
   `task_report`. Catalogue writes, merges, and releases are human decisions and
@@ -147,8 +147,8 @@ JSON API, the MCP endpoints, and the compiled client.
   deserialize are also `isError: true` but carry text alone and no `code`; an
   unknown method or tool name is a JSON-RPC error.
 - `TASK_SERVER_ENV=production` is fail-closed without `WORKER_CAPABILITY`,
-  `MCP_CAPABILITY`, `APP_MCP_ALLOWED_HOSTS`, `APP_AUTH_ALLOWLIST`,
-  `APP_CSRF_TOKEN`, and `APP_ALLOWED_ORIGINS`.
+  `MCP_CAPABILITY`, and `APP_CSRF_TOKEN`. Nothing a reverse proxy can decide is
+  configured here.
 - Unknown `/api/*` paths return the 404 JSON refusal, code `not_found`. Every
   other unknown path falls back to `client/dist/index.html` so the client router
   can restore a deep link.

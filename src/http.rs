@@ -143,38 +143,20 @@ fn ingress_identity<'a>(headers: &'a HeaderMap, state: &'a AppState) -> Option<&
         .or(state.dev_identity.as_deref())
 }
 
+/// The name the ingress put on the request. Which names may reach this server
+/// at all is the reverse proxy's call — it is the one that can tell a LAN
+/// client from anything else — so all that is asked here is that a name came.
 fn require_identity(headers: &HeaderMap, state: &AppState) -> Result<String, Error> {
-    let Some(name) = ingress_identity(headers, state) else {
-        return Err(Error::Unauthorized);
-    };
-    if state.allowlist.iter().any(|allowed| allowed == name) {
-        Ok(name.to_owned())
-    } else {
-        Err(Error::Unauthorized)
-    }
+    ingress_identity(headers, state)
+        .map(ToOwned::to_owned)
+        .ok_or(Error::Unauthorized)
 }
 
-fn origin_allowed(state: &AppState, origin: &str) -> bool {
-    if state
-        .allowed_origins
-        .iter()
-        .any(|allowed| allowed == origin)
-    {
-        return true;
-    }
-    state.dev_identity.is_some()
-        && state.allowed_origins.is_empty()
-        && (origin.starts_with("http://127.0.0.1") || origin.starts_with("http://localhost"))
-}
-
+/// Identity, then the CSRF token. `Origin` is not read: the token is what a
+/// cross-site page cannot produce, and refusing requests that carry no
+/// `Origin` at all would only turn away `curl` while stopping nobody.
 fn require_human_mutation(headers: &HeaderMap, state: &AppState) -> Result<(), Error> {
     require_identity(headers, state)?;
-    let Some(origin) = header_value(headers, "origin") else {
-        return Err(Error::Unauthorized);
-    };
-    if !origin_allowed(state, origin) {
-        return Err(Error::Forbidden);
-    }
     let token = header_value(headers, "x-csrf-token");
     if state.csrf_token.is_empty() {
         return Err(Error::Unauthorized);

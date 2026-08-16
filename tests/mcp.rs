@@ -241,9 +241,8 @@ fn handshake() -> Value {
     })
 }
 
-/// A raw POST that chooses its own `Host`, which is what a DNS-rebinding
-/// attempt controls: the page keeps the origin it was served under and the
-/// name resolves to the loopback address the server listens on.
+/// A raw POST that chooses its own `Host`, the header rmcp would have refused
+/// on while its allowlist was still in play.
 async fn post_with_host(
     router: &Router,
     path: &str,
@@ -603,13 +602,12 @@ async fn a_worker_drives_a_task_over_mcp_and_http_sees_the_same_row() {
     assert_eq!(card["title"], "renamed over mcp");
 }
 
-/// DNS rebinding is the attack the `Host` allowlist exists for: a page served
-/// from an attacker's name re-resolves that name to `127.0.0.1` and then talks
-/// to this server from its own origin. The bearer capability is no defence,
-/// because the development default is a published constant. So the guard has to
-/// be the `Host` header, and it is on unless a deployment declares its names.
+/// The `Host` a client sends decides nothing here. A deployment answers to its
+/// own name behind a reverse proxy, and that proxy is what chooses the names it
+/// serves — leaving rmcp's loopback default on would only refuse the name the
+/// proxy forwards. The bearer capability stays the gate on the endpoint.
 #[tokio::test]
-async fn an_undeclared_host_is_refused_and_loopback_still_works() {
+async fn any_host_reaches_both_endpoints() {
     let (_dir, state) = file_backed_state();
     let router = task_server::app(state);
 
@@ -619,59 +617,21 @@ async fn an_undeclared_host_is_refused_and_loopback_still_works() {
         } else {
             WORKER_CAPABILITY
         };
-        let (status, body) =
-            post_with_host(&router, path, capability, "evil.test", &handshake()).await;
-        assert_eq!(
-            status,
-            StatusCode::FORBIDDEN,
-            "a rebound Host must be refused on {path}: {body}"
-        );
-        assert!(
-            !body.contains("jsonrpc"),
-            "a refused Host gets no JSON-RPC answer: {body}"
-        );
-
-        for host in ["localhost", "127.0.0.1:3000", "[::1]:3000"] {
+        for host in [
+            "tasks.example.test",
+            "evil.test",
+            "localhost",
+            "127.0.0.1:3000",
+        ] {
             let (status, body) =
                 post_with_host(&router, path, capability, host, &handshake()).await;
             assert_eq!(
                 status,
                 StatusCode::OK,
-                "a loopback client must still reach {path} with Host {host}: {body}"
+                "{path} must answer a client sending Host {host}: {body}"
             );
         }
     }
-}
-
-/// A published deployment answers to its own name, so the allowlist is widened
-/// by declaring it — never by switching the guard off.
-#[tokio::test]
-async fn a_declared_host_is_accepted_and_anything_else_is_still_refused() {
-    let (_dir, state) = file_backed_state();
-    let state = state.with_mcp_allowed_hosts(["tasks.example.test".to_owned()]);
-    let router = task_server::app(state);
-
-    let (status, body) = post_with_host(
-        &router,
-        "/mcp",
-        MCP_CAPABILITY,
-        "tasks.example.test",
-        &handshake(),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "the declared host is the deployment's own: {body}"
-    );
-
-    let (status, body) =
-        post_with_host(&router, "/mcp", MCP_CAPABILITY, "evil.test", &handshake()).await;
-    assert_eq!(
-        status,
-        StatusCode::FORBIDDEN,
-        "declaring one name does not admit another: {body}"
-    );
 }
 
 /// `instant:merge` is issued by the control plane and by nothing else, so the

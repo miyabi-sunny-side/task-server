@@ -1046,7 +1046,7 @@ async fn creating_an_instant_merge_task_by_hand_is_refused() {
 }
 
 #[tokio::test]
-async fn mutation_requires_identity_origin_and_csrf_while_worker_requires_capability() {
+async fn mutation_requires_identity_and_csrf_while_worker_requires_capability() {
     let (_dir, state) = file_backed_state();
     put_product(&state, PRODUCT, true).await;
 
@@ -1074,16 +1074,6 @@ async fn mutation_requires_identity_origin_and_csrf_while_worker_requires_capabi
     let (status, denied_body) = send(&state, no_identity).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "identity is required");
     assert_eq!(denied_body["code"], "unauthorized", "{denied_body}");
-
-    let wrong_origin = request("POST", "/api/tasks")
-        .header("x-auth-user", USER)
-        .header("origin", "https://evil.example")
-        .header("x-csrf-token", CSRF)
-        .body(Body::from(denied.to_string()))
-        .unwrap();
-    let (status, foreign) = send(&state, wrong_origin).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "a foreign Origin is refused");
-    assert_eq!(foreign["code"], "forbidden", "{foreign}");
 
     let no_csrf = request("POST", "/api/tasks")
         .header("x-auth-user", USER)
@@ -1408,10 +1398,10 @@ async fn a_claim_with_nothing_to_hand_out_answers_no_work() {
     );
 }
 
-/// Authorization has to check the values, not merely the presence of headers,
-/// and a refused mutation must leave nothing behind.
+/// The CSRF token is checked by value rather than by presence, and a refused
+/// mutation must leave nothing behind.
 #[tokio::test]
-async fn mutations_refuse_wrong_header_values_without_writing() {
+async fn mutations_refuse_a_wrong_csrf_token_without_writing() {
     let (_dir, state) = file_backed_state();
     put_product(&state, PRODUCT, true).await;
 
@@ -1422,47 +1412,6 @@ async fn mutations_refuse_wrong_header_values_without_writing() {
             "product_id": PRODUCT,
         })
     };
-
-    // An identity outside the allowlist is not an identity.
-    let intruder = request("POST", "/api/tasks")
-        .header("x-auth-user", "intruder")
-        .header("origin", ORIGIN)
-        .header("x-csrf-token", CSRF)
-        .body(Body::from(denied("t-intruder").to_string()))
-        .unwrap();
-    let (status, _) = send(&state, intruder).await;
-    assert_eq!(
-        status,
-        StatusCode::UNAUTHORIZED,
-        "an identity outside the allowlist is refused"
-    );
-
-    // The ingress header the reverse proxy sets is checked the same way.
-    let intruder_ingress = request("POST", "/api/tasks")
-        .header("tailscale-user-login", "intruder")
-        .header("origin", ORIGIN)
-        .header("x-csrf-token", CSRF)
-        .body(Body::from(denied("t-ingress").to_string()))
-        .unwrap();
-    let (status, _) = send(&state, intruder_ingress).await;
-    assert_eq!(
-        status,
-        StatusCode::UNAUTHORIZED,
-        "an unlisted ingress identity is refused"
-    );
-
-    // A missing Origin is refused, so a bare cross-site form post cannot write.
-    let no_origin = request("POST", "/api/tasks")
-        .header("x-auth-user", USER)
-        .header("x-csrf-token", CSRF)
-        .body(Body::from(denied("t-no-origin").to_string()))
-        .unwrap();
-    let (status, _) = send(&state, no_origin).await;
-    assert_eq!(
-        status,
-        StatusCode::UNAUTHORIZED,
-        "a mutation without an Origin is refused"
-    );
 
     // A present but wrong CSRF token is refused: presence alone proves nothing.
     let wrong_csrf = request("POST", "/api/tasks")
@@ -1492,14 +1441,74 @@ async fn mutations_refuse_wrong_header_values_without_writing() {
         "a wrong CSRF token is refused on status changes too"
     );
 
-    for id in ["t-intruder", "t-ingress", "t-no-origin", "t-wrong-csrf"] {
-        let (status, leaked) = send(&state, read(&format!("/api/tasks/{id}"))).await;
-        assert_eq!(
-            status,
-            StatusCode::NOT_FOUND,
-            "a refused mutation must not have written {id}: {leaked}"
-        );
+    let (status, leaked) = send(&state, read("/api/tasks/t-wrong-csrf")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a refused mutation must not have written: {leaked}"
+    );
+}
+
+/// Which identities and origins reach this server is settled at the ingress —
+/// nginx on the LAN, Tailscale Serve on the tailnet — so the server takes the
+/// name it is handed and asks nothing about `Origin`. The CSRF token is what
+/// remains, because it is the one thing a cross-site page cannot produce.
+#[tokio::test]
+async fn any_ingress_identity_writes_with_the_csrf_token_alone() {
+    let (_dir, state) = file_backed_state();
+    put_product(&state, PRODUCT, true).await;
+
+    let body = |id: &str| {
+        json!({
+            "id": id,
+            "title": "written by whoever the ingress named",
+            "product_id": PRODUCT,
+        })
+    };
+
+    // A name no allowlist would have carried, over an Origin no allowlist would
+    // have carried either.
+    let stranger = request("POST", "/api/tasks")
+        .header("x-auth-user", "someone-else")
+        .header("origin", "https://evil.example")
+        .header("x-csrf-token", CSRF)
+        .body(Body::from(body("t-stranger").to_string()))
+        .unwrap();
+    let (status, created) = send(&state, stranger).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["id"], "t-stranger");
+
+    // The tailnet header names people the LAN never sees, and no Origin arrives
+    // from a client that is not a browser.
+    let tailnet = request("POST", "/api/tasks")
+        .header("tailscale-user-login", "someone@example.test")
+        .header("x-csrf-token", CSRF)
+        .body(Body::from(body("t-tailnet").to_string()))
+        .unwrap();
+    let (status, created) = send(&state, tailnet).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["id"], "t-tailnet");
+
+    // Both writes are real, and reads answer the same way.
+    for id in ["t-stranger", "t-tailnet"] {
+        let stored = request("GET", &format!("/api/tasks/{id}"))
+            .header("x-auth-user", "a-third-name")
+            .body(Body::empty())
+            .unwrap();
+        let (status, card) = send(&state, stored).await;
+        assert_eq!(status, StatusCode::OK, "{card}");
+        assert_eq!(card["id"], id);
     }
+
+    // The session echoes back whatever name arrived, since that is now the
+    // whole of what the server knows about who is asking.
+    let session = request("GET", "/api/session")
+        .header("x-auth-user", "someone-else")
+        .body(Body::empty())
+        .unwrap();
+    let (status, who) = send(&state, session).await;
+    assert_eq!(status, StatusCode::OK, "{who}");
+    assert_eq!(who["user"], "someone-else");
 }
 
 #[test]
@@ -1525,12 +1534,7 @@ fn production_startup_is_fail_closed_without_secrets() {
         // The MCP admin endpoint opens task CRUD to an agent, so production
         // demands its own capability for it too.
         "MCP_CAPABILITY" => Some("secret-mcp-cap".into()),
-        "APP_AUTH_ALLOWLIST" => Some("miyabi".into()),
         "APP_CSRF_TOKEN" => Some("secret-csrf".into()),
-        "APP_ALLOWED_ORIGINS" => Some("https://task-server.test".into()),
-        // A published deployment answers to its own name, and the `Host`
-        // allowlist that stops DNS rebinding cannot guess it.
-        "APP_MCP_ALLOWED_HOSTS" => Some("tasks.example.test".into()),
         "APP_DB_PATH" => Some(db_path.to_string_lossy().into_owned()),
         _ => None,
     })
@@ -1538,7 +1542,6 @@ fn production_startup_is_fail_closed_without_secrets() {
     assert!(ok.dev_identity.is_none());
     assert_eq!(ok.worker_capability, "secret-cap");
     assert_eq!(ok.mcp_capability, "secret-mcp-cap");
-    assert_eq!(ok.mcp_allowed_hosts, ["tasks.example.test"]);
     assert!(db_path.is_file(), "APP_DB_PATH must be opened at startup");
 }
 

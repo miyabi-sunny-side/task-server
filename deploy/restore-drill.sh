@@ -125,9 +125,7 @@ step "starting task-server and the Litestream sidecar on one shared volume"
 docker run --detach --name "${PREFIX}-app" --network "${NETWORK}" \
   --publish "127.0.0.1:${PORT}:3000" \
   --volume "${LIVE_VOLUME}:/app/data" \
-  --env "APP_AUTH_ALLOWLIST=${IDENTITY}" \
   --env "APP_CSRF_TOKEN=${CSRF}" \
-  --env "APP_ALLOWED_ORIGINS=http://127.0.0.1:${PORT}" \
   "${image}" >/dev/null
 wait_for_http "http://127.0.0.1:${PORT}/healthz" "${PREFIX}-app"
 echo "task-server is up on 127.0.0.1:${PORT}"
@@ -183,9 +181,7 @@ step "starting task-server on the restored volume"
 docker run --detach --name "${PREFIX}-restored-app" --network "${NETWORK}" \
   --publish "127.0.0.1:${RESTORED_PORT}:3000" \
   --volume "${RESTORED_VOLUME}:/app/data" \
-  --env "APP_AUTH_ALLOWLIST=${IDENTITY}" \
   --env "APP_CSRF_TOKEN=${CSRF}" \
-  --env "APP_ALLOWED_ORIGINS=http://127.0.0.1:${RESTORED_PORT}" \
   "${image}" >/dev/null
 wait_for_http "http://127.0.0.1:${RESTORED_PORT}/healthz" "${PREFIX}-restored-app"
 

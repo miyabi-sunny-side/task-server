@@ -50,8 +50,11 @@ creates the database (and its parent directory) on first start.
 | POST | `/mcp` | MCP over Streamable HTTP: the catalogue and the task lifecycle |
 | POST | `/worker/mcp` | MCP over Streamable HTTP: claim and report |
 
-Reads need an allowlisted `X-Auth-User`. Mutations additionally need a matching
-`Origin` and `X-CSRF-Token`. Worker routes need `X-Worker-Capability` instead,
+Reads need an `X-Auth-User` (or `Tailscale-User-Login`) from the ingress, and
+the name it carries is taken as given: which clients reach this server at all
+is settled in front of it. Mutations additionally need `X-CSRF-Token`, which is
+the one thing a cross-site page cannot produce. `Origin` is not read. Worker
+routes need `X-Worker-Capability` instead,
 and nothing else grants them. The two MCP endpoints are opened by a bearer
 capability alone — see [MCP](#mcp). Tasks are never physically deleted; discard
 one by moving it to `cancelled` or `dropped`.
@@ -204,20 +207,15 @@ Two failures fall outside that shape. Arguments that do not deserialize also
 answer `isError: true`, but with a plain-text explanation and no `code` to
 branch on; an unknown method or tool name is a JSON-RPC error, not a result.
 
-Both endpoints validate the `Host` header, which is what stops DNS rebinding: a
-page served under an attacker's name can re-resolve that name to `127.0.0.1` and
-then reach a loopback server from its own origin, with no CORS preflight in the
-way. The bearer capability is no answer to that on its own — the development
-default is a published constant, printed in this README — so the allowlist is on
-by default and accepts loopback `Host` values only. A request carrying any other
-`Host` is answered `403` before it reaches JSON-RPC.
+Neither endpoint reads the `Host` header. rmcp answers loopback authorities
+alone by default — a guard against a page that re-resolves its own name to
+`127.0.0.1` — and that default is switched off here, because a deployment is
+reached through a reverse proxy under a name the proxy chooses, and the default
+would refuse exactly that name. Deciding which names and which clients arrive is
+the proxy's job; the bearer capability is this server's.
 
-A deployment reached under its own name declares that name in
-`APP_MCP_ALLOWED_HOSTS`, which replaces the loopback default with exactly the
-authorities listed (so include `127.0.0.1` there if loopback clients must still
-work). Behind a reverse proxy, list the `Host` the proxy forwards, not the
-internal address. `TASK_SERVER_ENV=production` refuses to start without it. Treat
-`MCP_CAPABILITY` and `WORKER_CAPABILITY` as secrets in any case.
+So treat `MCP_CAPABILITY` and `WORKER_CAPABILITY` as secrets, and put the MCP
+endpoints behind an ingress you trust.
 
 ## Importing the markdown queue
 
@@ -440,18 +438,17 @@ cargo build --locked --release
 | `CLAIM_TTL_SECS` | `3600` | Lease lifetime for a claim. |
 | `WORKER_CAPABILITY` | `dev-worker-capability` | Shared secret for `/worker/*`, including `/worker/mcp`. Identity headers never substitute. |
 | `MCP_CAPABILITY` | `dev-mcp-capability` | Bearer secret for `/mcp`. Kept apart from the worker capability so a worker credential never opens task CRUD. |
-| `APP_MCP_ALLOWED_HOSTS` | (unset) | Comma-separated `Host` authorities the MCP endpoints answer to, replacing the loopback-only default that stops DNS rebinding. Unset means loopback only. Required in production. |
-| `APP_AUTH_ALLOWLIST` | `miyabi` | Comma-separated identities accepted as `X-Auth-User`. |
 | `APP_CSRF_TOKEN` | `dev-csrf` | Required on human mutation as `X-CSRF-Token`. |
-| `APP_ALLOWED_ORIGINS` | (unset) | Comma-separated origins accepted on mutation. Outside production, loopback origins are accepted when this is unset. |
 | `APP_STATIC_DIR` | `client/dist` | Directory of the production frontend. |
 | `APP_PRODUCTS_SEED` | (unset) | Path to a JSON product roster upserted into the catalogue at startup. Unset means the catalogue is curated over the API alone. |
-| `TASK_SERVER_ENV` | (unset) | Set to `production` to require the six variables listed below and drop the development identity. |
+| `TASK_SERVER_ENV` | (unset) | Set to `production` to require the three secrets listed below and drop the development identity. |
 | `RUST_LOG` | `info` | `tracing-subscriber` filter, for example `task_server=debug,tower_http=debug`. |
 
 With `TASK_SERVER_ENV=production` the process refuses to start unless
-`WORKER_CAPABILITY`, `MCP_CAPABILITY`, `APP_MCP_ALLOWED_HOSTS`,
-`APP_AUTH_ALLOWLIST`, `APP_CSRF_TOKEN`, and `APP_ALLOWED_ORIGINS` are all set.
+`WORKER_CAPABILITY`, `MCP_CAPABILITY`, and `APP_CSRF_TOKEN` are all set. Those
+are the secrets, and secrets are all this server configures: which identities,
+origins, and hostnames may reach it is decided by the ingress in front of it,
+which is the only thing positioned to know.
 
 ## Repository structure
 

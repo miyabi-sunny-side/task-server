@@ -361,40 +361,31 @@ where
         "/mcp",
         Admin::new(state.clone()),
         state.mcp_capability.clone(),
-        &state.mcp_allowed_hosts,
     )
     .merge(endpoint(
         "/worker/mcp",
         Worker::new(state.clone()),
         state.worker_capability.clone(),
-        &state.mcp_allowed_hosts,
     ))
 }
 
 /// One Streamable HTTP endpoint, refusing anything that does not present
 /// `capability` before the MCP service ever sees the request.
 ///
-/// `allowed_hosts` widens rmcp's `Host` allowlist, which is DNS-rebinding
-/// protection: a page served under an attacker's name can re-resolve that name
-/// to `127.0.0.1` and then reach this server from its own origin, with no CORS
-/// preflight in the way. The bearer capability is no answer to that — the
-/// development default is a published constant — so the allowlist stays on. It
-/// defaults to loopback; a deployment reached under its own name declares that
-/// name (`APP_MCP_ALLOWED_HOSTS`) and replaces the default with it.
-fn endpoint<S, H>(path: &str, handler: H, capability: String, allowed_hosts: &[String]) -> Router<S>
+/// rmcp answers loopback `Host` values alone unless told otherwise, as a guard
+/// against a page that re-resolves its own name to `127.0.0.1`. That guard is
+/// off here: this server is reached through a reverse proxy that already
+/// decides which names it serves, and the default would refuse the proxy's own
+/// name. The bearer capability remains the gate on the endpoint itself.
+fn endpoint<S, H>(path: &str, handler: H, capability: String) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
     H: ServerHandler + Clone + Send + Sync + 'static,
 {
-    let config = if allowed_hosts.is_empty() {
-        StreamableHttpServerConfig::default()
-    } else {
-        StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts.to_vec())
-    };
     let service = StreamableHttpService::new(
         move || Ok(handler.clone()),
         Arc::new(LocalSessionManager::default()),
-        config,
+        StreamableHttpServerConfig::default().disable_allowed_hosts(),
     );
     Router::new()
         .nest_service(path, service)
