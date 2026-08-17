@@ -362,6 +362,96 @@ currently uses it.
   name-and-geometry entry — no automatic sync, no submodule, no runtime
   dependency; every project's DESIGN.md and build stay self-contained.
 
+## App Icon & Install Manifest
+
+The app icon is a **separate register from the `Icon.svelte` dictionary**,
+and the two never trade places. A dictionary entry is a 24×24 stroked
+glyph that inherits `currentColor` from the text beside it; the app icon
+is a standalone tile an OS draws with no context, no text, and no theme,
+so it carries its own ground and its own fixed colors. Neither is
+authored from the other, and the dictionary gains no entry from this
+chapter.
+
+**One source, tracked rasters.** `client/public/icon.svg` is the original
+drawing; every raster is rendered from it with `rsvg-convert`, and the
+rendered PNGs are tracked as well — `client/dist/` is gitignored and Vite
+copies `client/public/` through untouched, so `public/` is the only place
+a shipped asset can live. No second drawing exists.
+
+**The mark.** A 512×512 viewBox holding exactly two shapes:
+
+- **Ground:** the full square in `#191919` (Sumi surface), corner radius
+  64 — 12.5% of the edge, which lands on `--radius-sm` (6px) at the ~48px
+  a launcher actually draws. This is the one radius outside the CSS radius
+  scale, permitted because the tile is not a CSS box: every OS re-masks it
+  anyway.
+- **Mark:** one path, `M112 264 200 352 392 160`, `fill="none"`,
+  `stroke="#5eb8c7"` (Sumi accent), `stroke-width="56"`, round cap and
+  round join. Both arms are exact 45° diagonals in an 88 : 192 ratio — a
+  geometric check, not a drawn one. The stroke is heavier than the
+  dictionary's 2/24 because this mark stands alone at 48px with no label
+  beside it.
+- **Flat, per Elevation & Depth:** two flat fills, no gradient, no
+  shadow, no third color. No emoji, no text glyph, no lettering — the
+  Iconography bans hold here too.
+
+**Teal on Sumi, never the inverse.** `:root` IS Sumi, so the product's
+self-portrait is dark and matches the `theme-color` the launcher paints
+behind it. It also measures better: `#5eb8c7` on `#191919` is 7.67:1,
+while a dark mark on a `#2f6f7e` flood is 3.09:1 and loses its shape at
+launcher scale. And a neutral tile carrying one accent stroke is the UI's
+own grammar — one accent-filled element per region — where an
+accent-flooded tile would make the accent the ground.
+
+**One geometry, two corner treatments.** All ink stays inside the central
+80% circle (max ink radius 194.2 against the 204.8 the Android maskable
+safe zone allows), so nothing meaningful can be cropped and no second,
+tighter drawing is needed. The purposes differ in the corners alone:
+
+| File                            | Render                        | Job                                                                                                                     |
+| ------------------------------- | ----------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `icon.svg`                      | the source                    | document favicon (`rel="icon"`)                                                                                         |
+| `icon-192.png` / `icon-512.png` | `rsvg-convert -w N -h N`      | manifest `purpose: "any"` — transparent corners, so the tile keeps its own radius where nothing masks it                 |
+| `icon-maskable-512.png`         | the same, plus `-b '#191919'` | manifest `purpose: "maskable"` — corners flattened to the ground so a square or squircle mask finds no transparent notch |
+| `apple-touch-icon.png`          | 180px, `-b '#191919'`         | iOS, which never reads manifest icons and composites transparency on black                                              |
+
+**Manifest.** `client/public/manifest.webmanifest`, linked from
+`client/index.html`. `id`, `start_url`, and `scope` are all `/`, so the
+app resolves against whatever host and port serves it — the tailnet URL
+carries a non-default port and installability must not depend on it.
+`display` is `standalone`; `lang` is `ja`. Icons are **PNG only**: the
+tracked SVG is the origin of the rasters, not a delivery format for
+launchers.
+
+- **`name` is `Task Server`** — the same string as `<title>`.
+- **`short_name` is `Task`**, the launcher label. `task` is the noun this
+  Japanese UI already uses untranslated ("merge 可能な task はありません"),
+  so the label speaks the UI's register without inventing a katakana
+  translation, and four characters never truncate or wrap where
+  `Task Server` sits at the 12-character ceiling. The full name still
+  shows in the install prompt.
+- **`description` is Japanese**, matching `lang="ja"` and the UI's voice —
+  it is install-UI copy read by the operator. `<meta name="description">`
+  is document metadata for a different audience and is not governed here.
+- **`theme_color` and `background_color` are both `#191919`.** The
+  manifest is theme-blind and therefore states Sumi, the default theme.
+  A Kinari user's splash is dark for the frame before the bootstrap
+  script paints — the same trade the existing
+  `<meta name="theme-color" content="#191919">` already makes, not a new
+  regression. Naming Kinari's `#faf6ef` instead would be wrong for the
+  default theme in order to be right for the override, and no
+  `prefers-color-scheme` variant can see an explicit `data-theme` choice
+  anyway.
+
+**Installability stops at manifest and icons.** There is no service
+worker and no offline behaviour; adding either is its own delivery, not a
+consequence of this chapter.
+
+**No new tokens.** `#191919` and `#5eb8c7` are the Sumi counterparts of
+`surface` and `accent`, already documented in Colors. The frontmatter
+carries the Kinari palette, and a theme-blind asset has no Kinari
+counterpart to carry, so it earns no token pair.
+
 ## Components
 
 - **App header:** per Layout. The title link keeps on-surface ink with
@@ -628,6 +718,39 @@ currently uses it.
       column computes to 720px wide with 12px left and right padding and
       equal left/right margins (±1px), and the panel — its child —
       computes to 696px.
+  18. Every install asset is really served, not swallowed by the SPA
+      fallback: the static server answers unknown paths with
+      `index.html`, so a missing file still returns 200. `GET
+      /manifest.webmanifest` therefore has to answer
+      `content-type: application/manifest+json` with a body that
+      `JSON.parse`s, and each icon path has to answer `image/png`
+      (`image/svg+xml` for `/icon.svg`). A `text/html` content type on
+      any of them is a failure even at status 200.
+  19. In the loaded document there is exactly one
+      `link[rel="manifest"]`, one `link[rel="icon"]`, and one
+      `link[rel="apple-touch-icon"]`, each resolving to a URL that
+      passes invariant 18. Over the real `https://<host>:8443/` origin
+      the browser's manifest inspector reports no manifest or icon
+      error and shows `name` `Task Server`, `short_name` `Task`,
+      `display` `standalone`, `theme_color` and `background_color`
+      `#191919`, and `id` / `start_url` / `scope` all resolving to the
+      origin root with the non-default port intact — the port never
+      appears as a scope mismatch. Switching to ライト changes none of
+      those manifest values.
+  20. Measured on the files themselves: `icon-192.png` is 192×192,
+      `icon-512.png` and `icon-maskable-512.png` are 512×512,
+      `apple-touch-icon.png` is 180×180. The maskable and apple-touch
+      rasters have alpha 255 at all four corner pixels; the `any`
+      rasters have alpha 0 there. No accent-ink pixel of
+      `icon-maskable-512.png` lies farther than 0.4 × 512 from the
+      center, so a circular launcher mask crops ground only. Re-running
+      the documented render commands reproduces byte-identical files.
+  21. The mark survives launcher scale: downscale
+      `icon-maskable-512.png` to 48×48 and clip it to a centered circle
+      of 80% diameter — the accent-ink pixel count is unchanged by the
+      clip (no ink lost) and the ink bounding box is at least 28px wide
+      of the 48, so what remains is the whole check rather than a
+      fragment.
 
 ## Do's and Don'ts
 
@@ -649,8 +772,11 @@ currently uses it.
   heading with a zero pill under it.
 - Do present the menu as a hamburger-anchored dropdown; centered
   modals are for dialogs (theme settings), never for navigation.
-- Don't use emoji or text glyphs as icons; every icon is an
+- Don't use emoji or text glyphs as icons; every UI icon is an
   `Icon.svelte` dictionary entry.
+- Do render every app-icon raster from `client/public/icon.svg` and track
+  the output; don't hand-edit a PNG, and don't let the app icon and the
+  `Icon.svelte` dictionary borrow each other's artwork.
 - Don't introduce font sizes, radii, spacing values, or shadows outside
   the defined scales — the modal shadow is the only shadow.
 - Do give the list every one of its four states; don't ship a page where
