@@ -346,6 +346,8 @@ pub async fn api_put_product(
             repository: body.repository,
             description: body.description,
             releases: body.releases,
+            // The mark belongs to the walk of the project tree, not to a caller.
+            archived: false,
         },
         state.clock.now(),
     )?;

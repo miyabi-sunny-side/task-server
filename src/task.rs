@@ -318,13 +318,29 @@ fn check_catalogued(conn: &Connection, task: &Task) -> Result<(), Error> {
         });
     };
     match product::read(conn, product_id) {
+        Ok(product) if product.archived => Err(Error::Precondition {
+            code: "product_archived",
+            message: format!(
+                "product '{product_id}' is archived: its working copy is not in the \
+                 project tree any more, so task {} cannot become ready and nobody \
+                 could check it out; restore the clone at {product_id} and restart, \
+                 or move the task to a product that is there",
+                task.id
+            ),
+        }),
         Ok(_) => Ok(()),
+        // The catalogue is derived from the project tree wherever one is
+        // configured, so "add the product" is the wrong instruction there: no
+        // clone sits at this id, and a row typed in by hand would be archived by
+        // the next walk. The remedy is the tree, with the API named only for the
+        // deployment that has no tree at all.
         Err(Error::NotFound) => Err(Error::Precondition {
             code: "product_not_catalogued",
             message: format!(
                 "product '{product_id}' is not in the product catalogue, \
-                 so task {} cannot become ready; \
-                 add it first with PUT /api/products/{product_id}",
+                 so task {} cannot become ready; the catalogue follows the project tree, \
+                 so put a clone at {product_id} or correct the product_id \
+                 (with no project tree configured, add it with PUT /api/products/{product_id})",
                 task.id
             ),
         }),
@@ -860,6 +876,7 @@ mod tests {
                 repository: "https://example.test/a/b.git".into(),
                 description: String::new(),
                 releases: true,
+                archived: false,
             },
             now(),
         )
@@ -1076,6 +1093,7 @@ mod tests {
                 repository: "https://example.test/nobody/knows.git".into(),
                 description: String::new(),
                 releases: false,
+                archived: false,
             },
             now(),
         )
@@ -1086,6 +1104,79 @@ mod tests {
                 .status,
             TaskStatus::Ready,
             "cataloguing the product is the whole remedy"
+        );
+    }
+
+    /// The accident this prevents: a directory was deleted, so the product is
+    /// archived, and someone files new work against it anyway. The catalogue still
+    /// carries the row — every task that named it must keep resolving — so
+    /// "missing" is the wrong answer. The promotion is refused under its own code,
+    /// because the remedy is different: restore the clone, do not add a product.
+    #[test]
+    fn ready_is_refused_while_the_product_is_archived() {
+        let db = db_with_product();
+        let history = NewTask {
+            product_id: Some("a/b".into()),
+            ..new_task("t-old", TaskKind::Normal, 0)
+        };
+        create(&db, &history, now()).unwrap();
+        force_status(&db, "t-old", "merged");
+        create(&db, &new_task("t-new", TaskKind::Normal, 0), now()).unwrap();
+
+        // The walk stopped finding the working copy of `a/b`, and found another
+        // product instead. An empty walk would have archived nothing.
+        let other = Product {
+            id: "z/z".into(),
+            repository: "https://example.test/z/z.git".into(),
+            description: String::new(),
+            releases: true,
+            archived: false,
+        };
+        let report = product::reconcile(&db, std::slice::from_ref(&other), now()).unwrap();
+        assert_eq!(report.archived.len(), 1, "a/b left the tree");
+        assert_eq!(report.archived[0].tasks, 2, "both tasks still name it");
+
+        let listed = product::list(&db).unwrap();
+        assert_eq!(listed[0].id, "a/b", "the row stays in the catalogue");
+        assert!(listed[0].archived);
+
+        // History is untouched: the merged task still resolves its product.
+        let old = get(&db, "t-old").unwrap();
+        assert_eq!(old.product_id.as_deref(), Some("a/b"));
+        assert_eq!(old.status, TaskStatus::Merged);
+
+        let err = set_status(&db, "t-new", TaskStatus::Ready, later()).unwrap_err();
+        let Error::Precondition { code, message } = &err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert_ne!(
+            *code, "product_not_catalogued",
+            "an archived product is catalogued; the reason is that its clone is gone"
+        );
+        assert_eq!(*code, "product_archived");
+        assert!(message.contains("a/b"), "{message}");
+        assert_eq!(
+            get(&db, "t-new").unwrap().status,
+            TaskStatus::Draft,
+            "a refused promotion leaves the row where it was"
+        );
+
+        // The remedy is the directory coming back, which the walk undoes.
+        let restored = Product {
+            id: "a/b".into(),
+            repository: "https://example.test/a/b.git".into(),
+            description: String::new(),
+            releases: true,
+            archived: false,
+        };
+        let report = product::reconcile(&db, &[restored, other], later()).unwrap();
+        assert_eq!(report.unarchived, ["a/b"]);
+        assert_eq!(
+            set_status(&db, "t-new", TaskStatus::Ready, later())
+                .unwrap()
+                .status,
+            TaskStatus::Ready,
+            "restoring the clone is the whole remedy"
         );
     }
 
@@ -1613,6 +1704,7 @@ mod tests {
                 repository: "https://example.test/c/d.git".into(),
                 description: String::new(),
                 releases: false,
+                archived: false,
             },
             now(),
         )

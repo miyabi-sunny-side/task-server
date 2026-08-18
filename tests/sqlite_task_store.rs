@@ -13,6 +13,7 @@ fn product_at(id: &str, releases: bool) -> Product {
         repository: format!("https://github.com/{id}.git"),
         description: String::new(),
         releases,
+        archived: false,
     }
 }
 

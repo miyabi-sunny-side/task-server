@@ -1,11 +1,12 @@
 use std::{env, error::Error, net::SocketAddr};
 
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use task_server::db::Db;
 use task_server::import::{ImportSources, import_markdown};
+use task_server::scan::{self, Catalogue};
 use task_server::state::{DEFAULT_BIND_ADDR, DEFAULT_DB_PATH};
 use task_server::{AppState, SystemClock};
 
@@ -58,10 +59,13 @@ fn run_import(args: &[String]) -> Result<(), Box<dyn Error>> {
 
 async fn serve() -> Result<(), Box<dyn Error>> {
     let bind_addr = bind_addr_from_env()?;
+    // Read before the database is opened, so a refused configuration never
+    // leaves a database file behind.
+    let catalogue = scan::source_from_vars(|key| env::var(key).ok())?;
     // Fail before the socket exists: a listener that logs "listening" and then
-    // exits over a bad seed file is worse than never binding at all.
+    // exits over an unreadable project tree is worse than never binding at all.
     let state = AppState::from_env()?;
-    seed_products(&state)?;
+    derive_catalogue(&state, &catalogue)?;
 
     let listener = TcpListener::bind(bind_addr).await?;
     info!(%bind_addr, "server listening");
@@ -74,15 +78,55 @@ async fn serve() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Upsert the roster at `APP_PRODUCTS_SEED`, if one is configured. Unset means
-/// the catalogue is curated over the API alone; set and unusable is fatal, so a
-/// typo in the path never boots a server with an empty catalogue.
-fn seed_products(state: &AppState) -> Result<(), Box<dyn Error>> {
-    let Some(path) = env::var("APP_PRODUCTS_SEED").ok().filter(|p| !p.is_empty()) else {
+/// Make the catalogue equal the project tree, when one is configured.
+///
+/// With no tree the catalogue is curated over the API alone and nothing is
+/// touched. With one, the walk is fail-closed — a root that cannot be read stops
+/// the startup rather than reporting an empty tree, which would read as every
+/// product having been deleted at once.
+///
+/// The log is the operator's record of the drift that was closed: what came and
+/// went, what was left alone, and for each product that left the tree, how many
+/// tasks still name it.
+fn derive_catalogue(state: &AppState, catalogue: &Catalogue) -> Result<(), Box<dyn Error>> {
+    let Catalogue::Derived(root) = catalogue else {
         return Ok(());
     };
-    let seeded = task_server::product::seed_from_path(&state.db, &path, state.clock.now())?;
-    info!(seeded, path, "products seeded");
+    let scanned = scan::scan(root)?;
+    for skipped in &scanned.skipped {
+        info!(
+            entry = %skipped.name,
+            reason = skipped.reason.as_str(),
+            "project skipped"
+        );
+    }
+    let report = task_server::product::reconcile(&state.db, &scanned.products, state.clock.now())?;
+    for archived in &report.archived {
+        warn!(
+            id = %archived.id,
+            tasks = archived.tasks,
+            "product left the project tree and was archived: it answers history but takes no new work"
+        );
+    }
+    for id in &report.unarchived {
+        info!(id = %id, "product came back to the project tree and was unarchived");
+    }
+    if report.skipped_archive_all {
+        warn!(
+            root = %root.display(),
+            "the walk found no products, so none were archived: check that the project tree is there"
+        );
+    }
+    info!(
+        root = %root.display(),
+        inserted = report.inserted,
+        updated = report.updated,
+        unchanged = report.unchanged,
+        archived = report.archived.len(),
+        unarchived = report.unarchived.len(),
+        skipped = ?scanned.skipped_by_reason(),
+        "catalogue derived from the project tree"
+    );
     Ok(())
 }
 

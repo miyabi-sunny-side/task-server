@@ -68,9 +68,22 @@ Filing work and curating the catalogue are two different moments, so
 `POST /api/tasks` accepts a `product_id` the catalogue has never heard of and
 the task starts in `draft` as usual. Promoting it is where identity is required:
 `POST /api/tasks/{id}/status` with `ready` answers 409 when the product is not
-catalogued, or when the task has no `product_id` at all, and the task stays
-where it was. Add the product with `PUT /api/products/{id}` and the same
-promotion goes through.
+catalogued, when its working copy is gone, or when the task has no `product_id`
+at all, and the task stays where it was.
+
+Where the remedy lies depends on where the catalogue comes from, and the two
+refusals are deliberately different codes:
+
+| Code | What it means | The remedy |
+| --- | --- | --- |
+| `product_not_catalogued` | No product is registered under that id. With a project tree configured, that means no clone sits at `<org>/<repo>`. | Correct the task's `product_id`, or put the clone in the tree and restart. With no tree configured, `PUT /api/products/{id}`. |
+| `product_archived` | The product *is* registered, and its working copy left the tree. | Restore that one clone; the next walk clears the mark by itself. |
+| `product_required` | The task names no product at all. | Set a `product_id`. |
+
+With [a project tree configured](#derived-from-the-project-tree) the catalogue is
+a derived value, so `PUT /api/products/{id}` is not the way back from either
+refusal: a row typed in by hand is archived by the next walk unless the tree
+agrees with it.
 
 Refusals that come from the server's own domain carry a stable `code` next to
 their human `error` message, so an automated client branches on the reason
@@ -78,40 +91,95 @@ rather than on the prose:
 
 ```json
 {
-  "error": "product 'org/repo' is not in the product catalogue, so task t-1 cannot become ready; add it first with PUT /api/products/org/repo",
+  "error": "product 'org/repo' is not in the product catalogue, so task t-1 cannot become ready; the catalogue follows the project tree, so put a clone at org/repo or correct the product_id (with no project tree configured, add it with PUT /api/products/org/repo)",
   "code": "product_not_catalogued"
 }
 ```
 
 The codes are `unauthorized`, `forbidden`, `not_found`, `claim_mismatch`,
 `invalid`, `conflict`, `product_required`, `product_not_catalogued`,
-`frontmatter`, `io`, and `db`. An unknown `/api/*` path answers in the same
-shape, as a 404 with code `not_found`.
+`product_archived`, `frontmatter`, `io`, and `db`. An unknown `/api/*` path
+answers in the same shape, as a 404 with code `not_found`.
 
 One kind of failure is outside that contract: a request body that is not valid
 JSON is rejected by the web framework before any handler runs, so it comes back
 as `400` with a plain-text explanation and no `code` to branch on.
 
-Set `APP_PRODUCTS_SEED` to fill the catalogue at startup from a JSON roster:
+### Derived from the project tree
 
-```json
-[
-  {
-    "id": "org/repo",
-    "repository": "https://github.com/org/repo",
-    "description": "one line",
-    "releases": true
-  },
-  { "id": "org/other", "repository": "https://github.com/org/other" }
-]
-```
+Set `APP_PROJECTS_DIR` and the catalogue stops being a roster anyone maintains:
+every start walks that directory two levels deep, reads `<org>/<repo>`, and
+reconciles the table against what is actually on disk. A hand-kept roster drifts
+— a clone is deleted and its product sits in the catalogue forever — and the
+filesystem already knows the answer.
 
-`description` defaults to empty and `releases` to `true`. Each entry is an
-upsert keyed on `id`, so restarting with the same file adds no duplicates and
-editing the file corrects the row in place. `created_at` survives either way;
-`updated_at` is stamped on every seed, including a re-run of an unchanged file.
-Nothing is ever removed by a seed. A missing file, JSON that does not parse, or
-an id that is not `org/repo` stops the startup with nothing written.
+A directory two levels down becomes a product when it is a git repository with an
+`origin` remote. "A git repository" is git's own test rather than "it has a
+config": the git directory has to carry a `HEAD` that reads as a ref (or a
+detached object name), an object store, and a `refs` directory. A stray
+`.git/config` with a remote in it is not a clone, and minting a product from one
+would give an id nobody can check out.
+
+Every field comes from a file the clone already has, and no `git` binary is ever
+run:
+
+| Field | Derived from |
+| --- | --- |
+| `id` | Where it sits locally, `<org>/<repo>`. Never the remote's owner: `sunny-side/5ch-viewer` keeps that id even though it pushes to `miyabisun`. |
+| `repository` | The `origin` URL in `.git/config`, normalised to its browsable `https://` form. |
+| `description` | The first non-empty line of `README.md`, without its leading `#`. Absent is empty. |
+| `releases` | A workflow under `.github/workflows` whose `.yml` or `.yaml` name contains `release`, **or** a tag in `.git/refs/tags` or `.git/packed-refs` whose whole name is a strict SemVer version, optionally `v`-prefixed. `v1.2.3` and `1.2.3-rc.1+build.5` count; `01.2.3`, `1.2.3-`, and `1.2.3-@@` do not, because `releases` switches the release control plane on and a scratch tag is not a release. |
+
+A worktree and a submodule keep `.git` as a file naming the real git directory,
+and that pointer is followed — including a worktree's `commondir` — because git
+keeps those directories inside the superproject, which is inside the tree.
+
+The tree is also the boundary: every path the walk opens is resolved through its
+symlinks and has to land under `APP_PROJECTS_DIR`. A `.git` that is a symlink out,
+a `gitdir:` pointer that is absolute or climbs out with `..`, and a `commondir`
+naming somewhere else are all skipped rather than followed; a `README.md`,
+`.github/workflows`, or `refs` that resolves out of the tree is read as absent, so
+a file the operator never placed can neither describe a product nor turn its
+release control on.
+
+Each entry that is not a product is named in the startup log with its reason, and
+the summary line counts them per reason: `not_a_repository`,
+`incomplete_repository`, `outside_root`, `no_origin`, `invalid_id`, `symlink`.
+
+### A product that left the disk is archived, never deleted
+
+Deleting the row would strand every task that named it: `tasks.product_id` has no
+foreign key, so a merged task would keep an id nothing answers for, and the
+history stops resolving. So the row stays and is marked. `GET /api/products`
+reports the mark as `"archived": true`, and the startup log names each product it
+archived together with how many tasks still point at it.
+
+What the mark changes is only the future. The tasks that already named the
+product read exactly as before, and promoting one to `ready` is refused with code
+`product_archived` — deliberately not `product_not_catalogued`, because the
+remedy is different: the product *is* catalogued, its working copy is not there.
+Restore the clone and the next walk clears the mark on its own; nobody re-enters
+the product by hand. `PUT /api/products/{id}` may still correct an archived
+product's description or remote, and leaves the mark alone: a correction is not a
+claim that the directory came back.
+
+Reconciling is not an upsert. A row matching the tree in all four fields is not
+written at all, so `updated_at` means "this product changed" rather than "the
+server restarted" — and a product that is already archived is not marked twice.
+A walk that comes back empty archives nothing and warns instead, because a
+missing mount looks exactly like every product having been deleted at once — and
+it warns whether or not the catalogue already had rows, since a first start
+pointed at the wrong path is the case nobody has a stale row to notice it by. A
+root that cannot be read stops the startup.
+
+One consequence of a derived catalogue is worth stating plainly: a row created
+with `PUT /api/products/{id}` is archived by the next walk unless the tree agrees
+with it. With a tree configured, the API is no longer where the catalogue is
+decided.
+
+Unset `APP_PROJECTS_DIR` and nothing is walked: the catalogue is whatever the API
+put there. The `APP_PRODUCTS_SEED` roster this replaces is retired, and a start
+that still sets it is refused rather than quietly ignoring the file.
 
 ## Merging and releasing
 
@@ -197,7 +265,7 @@ text content, so a client branches on the code rather than on the prose:
 {
   "isError": true,
   "structuredContent": {
-    "error": "product 'org/repo' is not in the product catalogue, so task t-1 cannot become ready; add it first with PUT /api/products/org/repo",
+    "error": "product 'org/repo' is not in the product catalogue, so task t-1 cannot become ready; the catalogue follows the project tree, so put a clone at org/repo or correct the product_id (with no project tree configured, add it with PUT /api/products/org/repo)",
     "code": "product_not_catalogued"
   }
 }
@@ -317,8 +385,9 @@ claim — and their `created_at` and `updated_at` record when the import ran.
 
 A product the imported rows name but the catalogue does not carry is a warning
 and never a refusal: the import registers no product it was not given. The
-catalogue gate is what asks for it later, so add the product with
-`PUT /api/products/{id}` before promoting an imported task to `ready`. A row
+catalogue gate is what asks for it later, so make sure the product is in the
+catalogue — a clone in the project tree, or `PUT /api/products/{id}` where no
+tree is configured — before promoting an imported task to `ready`. A row
 that kept a pre-convention product reference is counted on its own line and
 reaches the same gate, which refuses it with `product_required` until someone
 decides which product it belongs to:
@@ -440,7 +509,7 @@ cargo build --locked --release
 | `MCP_CAPABILITY` | `dev-mcp-capability` | Bearer secret for `/mcp`. Kept apart from the worker capability so a worker credential never opens task CRUD. |
 | `APP_CSRF_TOKEN` | `dev-csrf` | Required on human mutation as `X-CSRF-Token`. |
 | `APP_STATIC_DIR` | `client/dist` | Directory of the production frontend. |
-| `APP_PRODUCTS_SEED` | (unset) | Path to a JSON product roster upserted into the catalogue at startup. Unset means the catalogue is curated over the API alone. |
+| `APP_PROJECTS_DIR` | (unset) | Root of the `<org>/<repo>` project tree the catalogue is derived from at startup. Unset means nothing is walked and the catalogue is curated over the API alone; set and unreadable refuses the start. |
 | `TASK_SERVER_ENV` | (unset) | Set to `production` to require the three secrets listed below and drop the development identity. |
 | `RUST_LOG` | `info` | `tracing-subscriber` filter, for example `task_server=debug,tower_http=debug`. |
 

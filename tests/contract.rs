@@ -1257,6 +1257,10 @@ async fn products_are_listed_and_read_over_http() {
     let (status, one) = send(&state, read("/api/products/sunny-side/workers")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(one["releases"], false);
+    assert_eq!(
+        one["archived"], false,
+        "whether a product still has a working copy is on the API surface"
+    );
 
     let (status, _) = send(&state, read("/api/products/sunny-side/missing")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);

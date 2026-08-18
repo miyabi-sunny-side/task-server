@@ -174,7 +174,10 @@ impl Admin {
 impl Admin {
     #[tool(
         description = "List the product catalogue. A task is only promoted to `ready` when its \
-                       product_id is one of these, so read this before filing work."
+                       product_id is one of these and that product is not archived, so read this \
+                       before filing work. `archived: true` means the working copy left the \
+                       project tree: the product still answers for the tasks that named it, but \
+                       new work cannot be promoted against it."
     )]
     fn product_list(&self) -> CallToolResult {
         answer(product::list(&self.state.db).map(|products| json!({ "products": products })))
@@ -251,9 +254,13 @@ impl Admin {
         description = "Move a task to another status. A task cannot be promoted to `ready` while \
                        its product is not in the product catalogue: that refusal comes back with \
                        code `product_not_catalogued` (or `product_required` when the task names \
-                       no product at all), and the remedy is a human adding the product to the \
-                       catalogue. `merged` and `released` are granted by the merge and release \
-                       control plane and are refused here."
+                       no product at all). The catalogue follows the project tree on disk, so the \
+                       remedy is the tree, not the catalogue: no clone sits at that `org/repo`, so \
+                       either the id is wrong or the clone has to be placed there. Code \
+                       `product_archived` is a different refusal: the product is catalogued and \
+                       its clone left the tree, so the remedy is restoring that one clone. \
+                       `merged` and `released` are granted by the merge and release control plane \
+                       and are refused here."
     )]
     fn task_set_status(&self, Parameters(args): Parameters<TaskSetStatusArgs>) -> CallToolResult {
         let now = self.state.clock.now();
@@ -272,9 +279,12 @@ impl ServerHandler for Admin {
             .with_server_info(identity())
             .with_instructions(
             "Task control plane. File work with task_create, groom it with task_update, and move \
-             it with task_set_status. The product catalogue is curated by a human over HTTP; when \
-             a promotion is refused with code `product_not_catalogued`, ask for the product to be \
-             added instead of working around it.",
+             it with task_set_status. The product catalogue is derived from the project tree on \
+             disk rather than curated, so a refused promotion is answered in the tree, never by \
+             inventing a catalogue entry: code `product_not_catalogued` means no clone sits at \
+             that `org/repo`, so correct the `product_id` or ask for the clone to be placed there, \
+             and code `product_archived` means the clone left the tree, so ask for that clone to \
+             be restored.",
         )
     }
 }

@@ -35,13 +35,32 @@ JSON API, the MCP endpoints, and the compiled client.
 - The `products` table is the register of product identity. A task may be
   created with a `product_id` that is not in it, but it may not be promoted:
   `ready` is refused with 409 and code `product_not_catalogued` when the product
-  is uncatalogued, or `product_required` when the task has no `product_id`. The
+  is uncatalogued, or `product_required` when the task has no `product_id`. With a
+  project tree configured the remedy for `product_not_catalogued` is the tree (no
+  clone sits at that id) or a corrected `product_id`, never a hand-written row. The
   gate fires on the transition only, so a row that is already `ready` or beyond
   is never demoted, and `available_transitions` still offers `ready`.
-- `APP_PRODUCTS_SEED` upserts a JSON product roster at startup, in one
-  transaction. Unreadable, unparseable, or invalid seeds fail the startup with
-  nothing written. The roster itself is operational data and is not in the
-  repository.
+- `APP_PROJECTS_DIR` derives the catalogue from the `<org>/<repo>` tree on disk
+  at startup, in one transaction: a git repository with an `origin` remote is a
+  product, and its id is the local placement rather than the remote's owner. A row
+  matching the tree is not rewritten, so `updated_at` is not stamped by a restart.
+  An empty walk changes nothing and warns — including on an empty catalogue, since
+  the warning is about the walk; an unreadable root fails the startup. Unset means
+  nothing is walked. The retired `APP_PRODUCTS_SEED` refuses the start.
+- A git repository is git's own definition, not "it has a config": `HEAD` reading
+  as a ref or an object name, an object store, and `refs`. `releases` needs a
+  whole strict SemVer tag (`v` optional), so `01.2.3` or `1.2.3-` is not one.
+- The walk never reads outside `APP_PROJECTS_DIR`. Every path is canonicalised and
+  has to stay under the root: a `.git` symlink, a `gitdir:` pointer, or a
+  `commondir` leading out is skipped as `outside_root` and counted, and README,
+  workflow, and refs paths that resolve out are read as absent. Worktree and
+  submodule pointers are still followed while they stay inside.
+- A product whose working copy left the tree is **archived, never deleted**:
+  `products.archived_at` is set, the row stays so the tasks that named it keep
+  resolving, and `ready` is refused with code `product_archived` — distinct from
+  `product_not_catalogued`, because the remedy is restoring the clone. The next
+  walk that finds the directory again clears the mark. `PUT /api/products/{id}`
+  never sets or clears it.
 - `task-server import-markdown --live <DIR> [--archive <DIR>]` is the only
   subcommand; no arguments is the server. Either directory alone is valid, both
   omitted is a usage error, and each is read recursively for `*.md` into

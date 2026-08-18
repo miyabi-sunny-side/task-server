@@ -17,6 +17,7 @@ pub mod http;
 pub mod import;
 pub mod mcp;
 pub mod product;
+pub mod scan;
 pub mod state;
 pub mod task;
 

@@ -110,6 +110,21 @@ CREATE UNIQUE INDEX tasks_open_merge_target_idx ON tasks(merge_target_task_id)
   WHERE merge_target_task_id IS NOT NULL AND status NOT IN ('cancelled', 'dropped');
 ";
 
+/// Version 4 adds the archive column to `products`.
+///
+/// A product whose working copy left the disk may not be deleted: tasks that
+/// already named it — merged, released, part of the record — would be left
+/// pointing at nothing, and `product_id` carries no foreign key that would have
+/// stopped it. So the row stays and is marked instead. `NULL` is live; a
+/// timestamp is the moment the walk stopped finding it. Every row that predates
+/// the column is live, which is what `ALTER TABLE` fills in.
+const SCHEMA_V4: &str = "\
+BEGIN;
+ALTER TABLE products ADD COLUMN archived_at TEXT;
+PRAGMA user_version = 4;
+COMMIT;
+";
+
 /// How long a writer waits for a lock before giving up, in milliseconds.
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -260,6 +275,9 @@ fn migrate(conn: &Connection) -> Result<(), Error> {
     if version < 3 {
         rebuild_tasks_without_the_product_key(conn)?;
     }
+    if version < 4 {
+        conn.execute_batch(SCHEMA_V4)?;
+    }
     Ok(())
 }
 
@@ -401,11 +419,11 @@ mod tests {
         let named = Db::open(":memory:").unwrap();
         assert_eq!(pragma_string(&named, "journal_mode"), "memory");
         assert_eq!(pragma_int(&named, "busy_timeout"), 5000);
-        assert_eq!(user_version(&named), 3);
+        assert_eq!(user_version(&named), 4);
 
         let private = Db::open_in_memory().unwrap();
         assert_eq!(pragma_int(&private, "busy_timeout"), 5000);
-        assert_eq!(user_version(&private), 3);
+        assert_eq!(user_version(&private), 4);
 
         // A URI spelling is not one of them. Only the exact `:memory:` is
         // exempt, so a URI is an ordinary filename: it lands on disk in WAL,
@@ -445,6 +463,16 @@ mod tests {
             .collect()
     }
 
+    /// The columns a table has, as the database reports them. Read from the
+    /// schema rather than inferred, so a migration can be asked whether it ran.
+    fn column_names(conn: &Connection, table: &str) -> Vec<String> {
+        let mut statement = conn
+            .prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
+            .unwrap();
+        let rows = statement.query_map([table], |row| row.get(0)).unwrap();
+        rows.collect::<Result<Vec<String>, _>>().unwrap()
+    }
+
     fn index_names(conn: &Connection) -> Vec<String> {
         let mut statement = conn
             .prepare(
@@ -460,7 +488,7 @@ mod tests {
     #[test]
     fn migration_creates_the_current_schema() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(user_version(&db), 3);
+        assert_eq!(user_version(&db), 4);
         let tables: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row(
@@ -491,7 +519,7 @@ mod tests {
         drop(db);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 3);
+        assert_eq!(user_version(&db), 4);
         let products: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row("SELECT count(*) FROM products", [], |row| row.get(0))?)
@@ -526,7 +554,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 3);
+        assert_eq!(user_version(&db), 4);
 
         let (title, status, priority, merge_target, checks): (
             String,
@@ -625,7 +653,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 3);
+        assert_eq!(user_version(&db), 4);
 
         db.with_conn(|conn| {
             let rows_after: Vec<Vec<(String, String)>> = ["t-target", "merge:t-target", "t-plain"]
@@ -686,6 +714,85 @@ mod tests {
         assert!(
             dangling_merge.is_err(),
             "the self-referencing merge target key must stay enforced"
+        );
+    }
+
+    /// A product whose working copy is gone is archived, not deleted: the tasks
+    /// that named it still have to resolve. Version 4 is the column that holds
+    /// that, and every row a database already has is live — nothing was archived
+    /// before the column existed.
+    ///
+    /// The fixture is a real version 3 database — stamped 3 before the open, with
+    /// no `archived_at` on `products` — because that is the migration under test.
+    /// A version 2 fixture would reach version 4 through a different path and
+    /// prove nothing about the step from 3.
+    #[test]
+    fn a_version_three_database_gains_an_empty_archive_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sqlite.db");
+
+        let legacy = Connection::open(&path).unwrap();
+        legacy.execute_batch(SCHEMA_V1).unwrap();
+        legacy.execute_batch(SCHEMA_V2).unwrap();
+        legacy
+            .execute_batch(
+                "INSERT INTO products (id, repository, description, releases, created_at, updated_at)
+                 VALUES ('a/b', 'https://example.test/a/b.git', 'kept', 1, 'then', 'then');
+                 INSERT INTO tasks (id, title, status, product_id, created_at, updated_at)
+                 VALUES ('t-1', 'landed work', 'merged', 'a/b', 'then', 'then');",
+            )
+            .unwrap();
+        super::rebuild_tasks_without_the_product_key(&legacy).unwrap();
+        let before: i64 = legacy
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, 3, "the fixture must start at version 3");
+        assert!(
+            !column_names(&legacy, "products").contains(&"archived_at".to_owned()),
+            "a version 3 database has no archive column yet"
+        );
+        drop(legacy);
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(user_version(&db), 4);
+        let archived = |db: &Db| -> (usize, Option<String>) {
+            db.with_conn(|conn| {
+                let columns = column_names(conn, "products");
+                Ok((
+                    columns.iter().filter(|name| *name == "archived_at").count(),
+                    conn.query_row(
+                        "SELECT archived_at FROM products WHERE id = 'a/b'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            archived(&db),
+            (1, None),
+            "the column is added once, and a row that predates it is live"
+        );
+
+        // Reopening runs the migration step again, and must be a no-op: the
+        // column is not added twice and the row is not re-marked.
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(user_version(&db), 4);
+        assert_eq!(archived(&db), (1, None), "a second open changes nothing");
+        let tasks: i64 = db
+            .with_conn(|conn| {
+                Ok(conn.query_row(
+                    "SELECT count(*) FROM tasks t JOIN products p ON p.id = t.product_id",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(
+            tasks, 1,
+            "the history the column exists to keep still joins"
         );
     }
 
