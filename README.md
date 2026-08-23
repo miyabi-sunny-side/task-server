@@ -62,6 +62,162 @@ and nothing else grants them. The two MCP endpoints are opened by a bearer
 capability alone — see [MCP](#mcp). Tasks are never physically deleted; discard
 one by moving it to `cancelled` or `dropped`.
 
+## A worker in curl
+
+The worker side of this server is three routes and one header, so the whole
+protocol fits in a shell script. This is the reference for the wire, not a
+worker: it claims once, does one task, reports, and exits. Everything a real
+worker adds — the poll loop, the build, the git plumbing — is its own business,
+because this server starts no subprocess. It decides; the worker runs.
+
+Nothing below carries a literal value. The URL, the capability and the worker's
+name come from the environment, and the capability is a secret that belongs
+nowhere but there.
+
+```sh
+set -eu   # a refused call is the end of the run, never a step it walks past
+
+: "${TASK_SERVER_URL:?}"     # where this server is reached
+: "${WORKER_CAPABILITY:?}"   # the secret the server was started with
+: "${WORKER_NAME:?}"         # this loop's name, recorded on the lease
+: "${PROJECTS_ROOT:?}"       # where this worker keeps its clones
+
+auth="X-Worker-Capability: $WORKER_CAPABILITY"
+json='Content-Type: application/json'
+
+# Every field read out of a body below has to be a non-empty string, and
+# `jq -e` is not that test: it fails on null and on a missing key, but an empty
+# string is a value, so it exits 0 and hands back nothing — an empty product_id
+# would point step 4 at $PROJECTS_ROOT itself. The type test is what rejects
+# ""; `-e` is kept for the body that carries no JSON value at all.
+field() {   # field <json> <name> -> the value, or a non-zero exit
+  printf '%s' "$1" | jq -er --arg f "$2" '
+    .[$f] as $v
+    | if ($v | type) == "string" and $v != "" then $v
+      else "\($f) is not a non-empty string\n" | halt_error(1) end'
+}
+
+# 1. Claim. `normal` only: review tasks answer on /worker/review-report, so a
+# claim that took every kind would report a review to the wrong route.
+# `curl -f` turns a refusal — 401 on a bad capability — into a non-zero exit,
+# and because this is a plain assignment, `set -e` ends the run on it.
+card=$(curl -fsS "$TASK_SERVER_URL/worker/claim" -H "$auth" -H "$json" \
+  -d "$(jq -nc --arg worker "$WORKER_NAME" '{worker: $worker, kinds: ["normal"]}')")
+
+# 2. An empty queue is an answer, not an error. There is no long poll.
+card_status=$(printf '%s' "$card" | jq -r '.status // ""')
+if [ "$card_status" = "no-work" ]; then
+  echo "nothing ready"
+  exit 0
+fi
+
+# 3. Read the card. Each of these is a plain assignment, so a body that is not
+# a claim ends the run here instead of carrying an empty value forward.
+claim_id=$(field "$card" claim_id)
+product=$(field "$card" product_id)
+branch=$(field "$card" branch)
+task_id=$(field "$card" id)
+title=$(field "$card" title)
+echo "$task_id: $title"   # for the log, not the wire
+
+# 4. Do the work. The clone is this worker's to find: product_id is `org/repo`,
+# so the checkout is $PROJECTS_ROOT/$product on the branch the card names.
+repo="$PROJECTS_ROOT/$product"
+git -C "$repo" switch -c "$branch" 2>/dev/null || git -C "$repo" switch "$branch"
+# ... build, test and commit here ...
+commit_sha=$(git -C "$repo" rev-parse HEAD)
+
+# 5. Report against the lease. `outcome` may be omitted and defaults to "done";
+# it is spelled out here because "blocked" is the other answer this route takes.
+# The body is captured before it is read: behind a pipe into jq, curl's exit
+# status is discarded and a 409 `claim_mismatch` would read as a finished task.
+report=$(curl -fsS "$TASK_SERVER_URL/worker/report" -H "$auth" -H "$json" \
+  -d "$(jq -nc \
+        --arg claim_id "$claim_id" \
+        --arg commit_sha "$commit_sha" \
+        '{claim_id: $claim_id,
+          commit_sha: $commit_sha,
+          verification: "cargo test",
+          checks: [{name: "cargo test", exit_code: 0}],
+          outcome: "done"}')")
+
+# 6. A 200 is not the whole answer. The reply is the Task Card again, so read
+# it back through the same guard: that is what proves the report landed on a
+# task rather than on a body that merely answered 200.
+reported_id=$(field "$report" id)
+reported_status=$(field "$report" status)
+echo "$reported_id -> $reported_status"
+```
+
+A claim answers with the whole Task Card, and three of its fields are what it
+takes to start: `claim_id` is the lease every later call is made against, and
+`product_id` and `branch` say what to work on and where to put it — a task with
+no branch of its own is given `task/<id>` as the claim is granted. The script
+reads three more, and none of them decides how the work is done: `status`
+separates an empty queue from a card, and `id` and `title` go to the log so a
+human can see which task this run took. Going the other way, the report hands
+back `commit_sha`, the `verification` a human reads, and the `checks` that ran.
+The other kinds answer elsewhere and are deliberately not repeated here: a
+review is claimed with `{"kinds": ["review"]}` and answered with a verdict on
+`/worker/review-report`, and a merge with `{"kinds": ["instant:merge"]}`; both
+bodies are in
+[Reviewing, merging and releasing](#reviewing-merging-and-releasing).
+
+### Where the clone is, the worker decides
+
+A card names a `product_id` and a `branch` and says nothing else about any
+filesystem, and that is the boundary. `product_id` is `org/repo` — an identity
+that is portable between machines, and shaped like the tail of a path rather
+than a path — and the server keeps no path for it: the `products` table carries
+`id`, `repository`, `description`, `releases`, and the timestamps that record
+when the row changed and when it was archived. No path is among them.
+
+`APP_PROJECTS_DIR` is not the missing half of that path. It is where *this*
+process walks to derive product identity, and the server treats that tree as a
+read-only catalogue source: the scanner opens directories and reads `.git`
+metadata, and writes nothing back into it. It is also a path in the *server's*
+own filesystem namespace, resolved by the server against its own mounts, so
+another process on another machine can assume neither that the path exists there
+nor that it may be written to — and a worker has to create worktrees, rebase and
+commit. So the two sides share one convention, `<root>/<org>/<repo>`, and each
+applies it to the root it owns. A worker that took its checkout path from the
+server would be applying the server's namespace to its own filesystem.
+
+### What the protocol leaves to the worker
+
+- **There is no long poll.** A claim answers immediately, and an empty queue is
+  `200 {"status":"no-work"}`. A loop has to poll, and to poll with jitter so
+  that several workers do not wake in step.
+- **There is no heartbeat.** The deadline is on the card: a claim answers with
+  `claim_expires_at`, the instant the claim was granted plus `CLAIM_TTL_SECS`
+  (3600 seconds by default), written as UTC `YYYY-MM-DDThh:mm:ssZ`. It is
+  computed once, when the lease is granted, and no route extends it. Passing it
+  refuses nothing by itself: `/worker/report` finds the task by `claim_id` and
+  reads no deadline. What overrunning does is make the row claimable again, and
+  a claim compares no worker name — so *any* later claim of it, this same worker
+  included, mints a fresh `claim_id`, and from that moment the old lease matches
+  no task and its report is refused with code `claim_mismatch`. Size the TTL
+  against the longest task, or lose the report at the end of it. That is not the
+  only refusal a late report meets: a task moved out from under the lease by
+  hand — pressed `cancelled`, say — still matches its `claim_id`, and the report
+  is refused as `invalid` for the status it now sits in.
+- **There is no nack.** `outcome: "blocked"` is not one: it records a stop, with
+  the reason in `verification` and the evidence in `checks`. On the `normal`
+  task above it leaves the task in `blocked` for a person to press back to
+  `ready`. A blocked `instant:merge` does not come back that way — `ready` is
+  refused on it, and the attempt is called off and reissued instead; see
+  [Reviewing, merging and releasing](#reviewing-merging-and-releasing). Either
+  way, a worker that only wants to put the work back down has nothing but the
+  lease running out.
+- **A claim filters by kind, never by product.** `kinds` is the only filter the
+  queue offers, so a worker can be handed work for a product it has no clone
+  of — and there is no product-shaped refusal any more than there is a nack. Its
+  choices are the ones above: get itself a checkout and carry on, or report
+  `outcome: "blocked"` with the reason. Only for a worker that does neither is
+  expiry what takes the row back. Returning a path would not change any of that
+  — the clone is missing from that machine either way — so which worker is
+  offered which product is still an open question.
+
 ## The product catalogue
 
 The `products` table is the register of product identity. Anything that names a
