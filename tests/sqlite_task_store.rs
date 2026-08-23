@@ -1,7 +1,7 @@
 use task_server::db::Db;
 use task_server::error::Error;
 use task_server::product::{self, Product};
-use task_server::task::{self, NewTask, ReviewVerdict, TaskKind, TaskStatus};
+use task_server::task::{self, NewTask, ReportOutcome, ReviewVerdict, TaskKind, TaskStatus};
 use time::OffsetDateTime;
 use time::macros::datetime;
 
@@ -104,12 +104,14 @@ fn instant_merge_task_is_claimed_before_higher_priority_normal_task() {
         "abc1234",
         "cargo test",
         &[],
+        ReportOutcome::Done,
         now(),
     )
     .unwrap();
 
     // Only reviewed work is merged, and a reviewer takes review tasks alone.
-    let review = task::issue_review(&db, "t-target", now()).unwrap();
+    // The report issued the review; the reviewer only has to claim it.
+    let review = task::get(&db, "review:t-target").expect("the report issues a review");
     let leased = task::claim(&db, "reviewer", &[TaskKind::Review], now(), TTL)
         .unwrap()
         .unwrap();
@@ -128,7 +130,8 @@ fn instant_merge_task_is_claimed_before_higher_priority_normal_task() {
     task::create(&db, &normal, now()).unwrap();
     task::set_status(&db, &normal.id, TaskStatus::Ready, now()).unwrap();
 
-    let merge = task::issue_merge(&db, "t-target", now()).unwrap();
+    // The approval issued the merge, in the transaction that granted it.
+    let merge = task::get(&db, "merge:t-target").expect("the approval issues a merge");
     assert_eq!(merge.kind, TaskKind::InstantMerge);
     assert_eq!(merge.priority, 0);
     assert_eq!(merge.status, TaskStatus::Ready);

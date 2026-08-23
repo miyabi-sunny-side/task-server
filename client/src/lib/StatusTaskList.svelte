@@ -20,19 +20,29 @@
   let {
     fetchState,
     items = [],
+    drawnElsewhere = [],
     onretry,
   }: {
     fetchState: "loading" | "error" | "ready";
     items?: TaskSummary[];
+    // The ids the control panel is already drawing in its readouts: the
+    // pending reviews and everything stranded in reconciliation.
+    drawnElsewhere?: string[];
     onretry?: () => void;
   } = $props();
 
   // The list hides exactly one thing: work another region of this same page
-  // already draws. The control panel renders merges in flight, and one object
-  // drawn twice on one screen reads as two. Nothing else is filtered — a
-  // `review` task is drawn nowhere else, so hiding it would leave an
-  // unclaimed review with no surface anywhere in the UI.
-  let open = $derived(items.filter((item) => item.kind !== "instant:merge"));
+  // already draws, because one object drawn twice on one screen reads as two.
+  // The panel draws pending `review` tasks as its queue, `instant:merge` as
+  // the merge trains, and stranded work as reconciliation. A `review` task
+  // the panel has stopped drawing falls back into its status group like any
+  // other task — the rule decides that, not taste.
+  let elsewhere = $derived(new Set(drawnElsewhere));
+  let open = $derived(
+    items.filter(
+      (item) => item.kind !== "instant:merge" && !elsewhere.has(item.id),
+    ),
+  );
 
   let groups = $derived(
     STATUS_ORDER.map((status) => ({

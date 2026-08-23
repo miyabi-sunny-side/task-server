@@ -10,7 +10,7 @@ use crate::product::{self, check_product_id};
 const COLUMNS: &str = "id, title, body, status, kind, product_id, priority, branch, claimed_by, \
                        claim_id, claimed_at, claim_expires_at, commit_sha, verification, \
                        release_tag, created_at, updated_at, merge_target_task_id, checks_json, \
-                       review_target_task_id, review_verdict";
+                       review_target_task_id, review_verdict, merge_sequence";
 
 /// Every status, in vocabulary order. Used to enumerate legal transitions.
 pub(crate) const ALL_STATUSES: [TaskStatus; 10] = [
@@ -162,6 +162,50 @@ pub struct ReviewOutcome {
     pub reported_at: String,
 }
 
+/// How a worker's report ends the task it was leased for.
+///
+/// The default is [`Self::Done`], which is the report every worker written
+/// before this existed sends, so leaving the field out keeps the old contract
+/// exactly. [`Self::Blocked`] is the worker saying it could not finish — a
+/// rebase that conflicted, a check that failed — and it is a *successful*
+/// report of a failure: the reason and the checks are written down and kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportOutcome {
+    Done,
+    Blocked,
+}
+
+impl ReportOutcome {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Blocked => "blocked",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self, Error> {
+        match raw {
+            "done" => Ok(Self::Done),
+            "blocked" => Ok(Self::Blocked),
+            other => Err(Error::Invalid(format!("invalid outcome: {other}"))),
+        }
+    }
+
+    /// The outcome of a report whose `outcome` field is optional on the wire.
+    ///
+    /// Every worker surface takes it that way — HTTP `/worker/report` and the
+    /// MCP `task_report` tool — and both mean the same two things by it: an
+    /// omitted outcome is [`Self::Done`], the report a worker written before
+    /// outcomes existed sends, and anything that is not one of the two names is
+    /// refused rather than quietly read as success. That is one transport
+    /// contract, so it is owned here rather than restated at each surface,
+    /// where the two could drift into disagreeing about what silence means.
+    pub fn parse_optional(raw: Option<&str>) -> Result<Self, Error> {
+        raw.map_or(Ok(Self::Done), Self::parse)
+    }
+}
+
 /// One verification a worker ran before asking for a merge. `exit_code` is the
 /// process status, so `0` is the only pass.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,6 +252,12 @@ pub struct Task {
     /// Set on a `review` task once it answered.
     #[serde(default)]
     pub review_verdict: Option<ReviewVerdict>,
+    /// Set on an `instant:merge` task: its place in the merge train, in the
+    /// order merges were issued. Read only against other merges of the same
+    /// product, and never against `created_at` or the id — neither can order two
+    /// merges issued in the same second. See `SCHEMA_V6`.
+    #[serde(default)]
+    pub merge_sequence: Option<i64>,
     /// Decoded from `checks_json`; the column itself is never exposed.
     #[serde(default)]
     pub checks: Vec<Check>,
@@ -362,6 +412,12 @@ pub fn update(db: &Db, id: &str, patch: &TaskPatch, now: OffsetDateTime) -> Resu
 /// verdict, and every press off it would either reopen the answer or file the
 /// finished attempt as abandoned.
 ///
+/// A merge offers neither `done` nor `blocked`: how an attempt ended is the
+/// worker's report, which carries the checks and lands the target. A blocked
+/// merge offers no `ready` either: an attempt that could not be integrated is
+/// called off and reissued, never restarted. What is left on a merge is `wip`
+/// and the two presses that call the attempt off.
+///
 /// The list and the refusal are the same rule read two ways — see
 /// [`operator_refusal`] — so what a surface offers can never drift from what it
 /// accepts.
@@ -442,6 +498,81 @@ fn operator_refusal(task: &Task, to: TaskStatus) -> Option<Error> {
         return Some(Error::Invalid(format!(
             "task {} is a review: it is finished by a verdict \
              (POST /worker/review-report), not by a status change",
+            task.id
+        )));
+    }
+    // How a merge attempt *ended* is the worker's answer, never a human's. Both
+    // endings the table allows are outcomes carrying evidence that only
+    // `report` produces, so a press that names one is a claim about an attempt
+    // nobody ran:
+    //
+    //   * `done` is the landing, and the landing is a transaction, not a
+    //     status. `report` reaches it only through `check_gate` — which refuses
+    //     a merge that carries no checks or a red one — and then
+    //     `land_merge_target`, which moves the target from `approved` to
+    //     `merged` against the very commit the merge was issued for. A press
+    //     writes neither half. It marks the merge finished while its target
+    //     stays `approved`, and that target then falls out of *both*
+    //     reconciliation windows at once: `pending_merges` stops at `done`, and
+    //     `mergeable` still sees a merge row that is not `cancelled` or
+    //     `dropped` holding the target. Approved work, never landed, and
+    //     invisible on every screen that exists to notice exactly that.
+    //   * `blocked` is the jam, and a jam is a reason. `report_blocked` writes
+    //     the worker's account onto `verification` and the red checks onto
+    //     `checks_json`; a press writes neither, so it stops the whole
+    //     product's train — `claim` hands out nothing behind a blocked merge —
+    //     with no reason on the row and no checks under it. The screen shows a
+    //     stopped train that cannot say what stopped it.
+    //
+    // So both are refused here and left to `POST /worker/report`, which is
+    // where the evidence comes from.
+    //
+    // `wip` is deliberately *not* refused, and the line is that it is not an
+    // outcome. It says the attempt is running, which is the same thing a claim
+    // says; it invents no checks, moves no target, and files no verdict on
+    // work nobody did. A merge parked in `wip` by hand holds its train exactly
+    // as a claimed one does, and the same two presses — `cancelled` and
+    // `dropped` — still release it, so nothing is stranded. Refusing it would
+    // reach past the hazard.
+    if task.kind == TaskKind::InstantMerge && matches!(to, TaskStatus::Done | TaskStatus::Blocked) {
+        return Some(Error::Invalid(format!(
+            "merge task {} ends the way its worker reports it ended \
+             (POST /worker/report, outcome done or blocked), not by a status change: \
+             {} pressed by hand would record an attempt that ran with no checks \
+             behind it",
+            task.id,
+            to.as_str()
+        )));
+    }
+    // A merge that could not be integrated is a finished attempt, not a paused
+    // one, and the way out of it is to call it off and issue a new one — never
+    // to restart this row.
+    //
+    // `blocked -> ready` is the one press the table would still allow, and it
+    // is the whole release contract walked around. The row it would hand back
+    // to a worker still carries the reason and the checks of the attempt that
+    // failed, written by `report_blocked` onto `verification` and
+    // `checks_json`; a second attempt on the same row either overwrites that
+    // record or — when it blocks for the same reason — is swallowed as the
+    // idempotent repeat of a report that described something else entirely.
+    // Worse, the merge is pinned to the commit it was issued for, so restarting
+    // it re-runs a rebase whose main line has moved on underneath it, and the
+    // train it heads starts moving again on evidence that no longer describes
+    // anything.
+    //
+    // `cancelled` and `dropped` stay pressable, because they *are* the release:
+    // both are in `MERGE_IS_OVER`, so calling the attempt off frees the target
+    // for a new merge, which `mergeable` then offers and `issue_merge` files
+    // under a fresh id (`merge:{target}~2`). One human press, one new attempt,
+    // and the failed one stays on the record saying why.
+    if task.kind == TaskKind::InstantMerge
+        && task.status == TaskStatus::Blocked
+        && to == TaskStatus::Ready
+    {
+        return Some(Error::Invalid(format!(
+            "merge task {} is blocked: a merge attempt that could not be integrated is not \
+             restarted, it is called off (cancelled or dropped) and issued again against the \
+             target as a new attempt",
             task.id
         )));
     }
@@ -593,6 +724,36 @@ const CLAIMABLE: &str = "(status = 'ready'
                           OR (status = 'wip' AND claim_expires_at IS NOT NULL
                               AND claim_expires_at <= {now}))";
 
+/// The merges a claim may take: the one at the head of its product's train, and
+/// any task that is not a merge at all.
+///
+/// A merge rebases its branch onto the main line, so the merges of one product
+/// are strictly serial — the second would otherwise rebase onto a main line the
+/// first has not written. So a merge is only claimable while no merge of the
+/// same product that was issued *earlier* is still live, where live is `ready`,
+/// `wip` or `blocked`: work that has not started, work in flight, and work that
+/// stopped and is waiting for a human. `done`, `cancelled` and `dropped` are
+/// over and release the ones behind them.
+///
+/// A merge whose lease expired is `wip` and still live, so it blocks the train —
+/// but it does not block *itself*: nothing was issued before it, so the head of a
+/// stalled train is retaken by the next worker rather than overtaken by the
+/// merge behind it.
+///
+/// `IS` rather than `=` on the product, because two merges that carry no product
+/// are still each other's train, and `NULL = NULL` would say otherwise. A merge
+/// with no `merge_sequence` — one written by hand, or by something other than
+/// [`issue_merge`] — holds no place in any train: every comparison against it is
+/// `NULL`, so it neither waits nor blocks.
+const MERGE_TRAIN_HEAD: &str = "(kind != 'instant:merge'
+                                 OR NOT EXISTS (
+                                   SELECT 1 FROM tasks ahead
+                                   WHERE ahead.kind = 'instant:merge'
+                                     AND ahead.status IN ('ready', 'wip', 'blocked')
+                                     AND ahead.product_id IS tasks.product_id
+                                     AND ahead.merge_sequence < tasks.merge_sequence
+                                 ))";
+
 /// Hand the next claimable task to `worker`. The row is only taken while it is
 /// still claimable, so no two live leases ever cover the same task. Taking over
 /// an expired lease issues a new `claim_id`, which is what invalidates the
@@ -611,7 +772,7 @@ pub fn claim(
     let claimed_at = format_z(now);
     let claim_expires_at = format_z(now + time::Duration::seconds(ttl));
     let select_sql = format!(
-        "SELECT {COLUMNS} FROM tasks WHERE {}{}
+        "SELECT {COLUMNS} FROM tasks WHERE {} AND {MERGE_TRAIN_HEAD}{}
          ORDER BY CASE kind WHEN 'instant:merge' THEN 0 ELSE 1 END,
                   priority DESC, created_at ASC, id ASC
          LIMIT 1",
@@ -623,7 +784,7 @@ pub fn claim(
     let update_sql = format!(
         "UPDATE tasks SET status = 'wip', claimed_by = ?2, claim_id = ?3, claimed_at = ?4,
                 claim_expires_at = ?5, updated_at = ?4
-         WHERE id = ?1 AND {}",
+         WHERE id = ?1 AND {} AND {MERGE_TRAIN_HEAD}",
         CLAIMABLE.replace("{now}", "?4")
     );
     db.with_tx(|tx| {
@@ -669,12 +830,22 @@ fn kind_filter(kinds: &[TaskKind]) -> String {
 /// For an `instant:merge` task this is the gate onto the main line: the report
 /// is only accepted when every check passed, and accepting it lands the target
 /// task in the same transaction. A refused report leaves both rows untouched.
+///
+/// Finishing ordinary work also issues the review that reads it, in this same
+/// transaction, because work that is `done` and unread is not a state this
+/// control plane has a way out of: the human judgement it asks for is the
+/// release, and every step up to it is earned by a report or a verdict. A
+/// review that cannot be issued therefore takes the report down with it rather
+/// than leaving the work finished and invisible to reviewers.
+///
+/// `outcome` is how the worker says it could not finish; see [`ReportOutcome`].
 pub fn report(
     db: &Db,
     claim_id: &str,
     commit_sha: &str,
     verification: &str,
     checks: &[Check],
+    outcome: ReportOutcome,
     now: OffsetDateTime,
 ) -> Result<Task, Error> {
     if commit_sha.trim().is_empty() || verification.trim().is_empty() {
@@ -703,10 +874,15 @@ pub fn report(
                 task.id
             )));
         }
+        if outcome == ReportOutcome::Blocked {
+            return report_blocked(tx, &task, verification, checks_json.as_deref(), &stamp);
+        }
         // The gate belongs to the report, not to one status: a merge that
         // already landed must still be told the checks passed, or a repeat
         // without evidence would read as "the merge went through with no
-        // checks" on the idempotent path.
+        // checks" on the idempotent path. It guards success only — a worker
+        // that says it was blocked is *reporting* the red check, not claiming
+        // it as a pass.
         if task.kind == TaskKind::InstantMerge {
             check_gate(&task, checks)?;
         }
@@ -718,11 +894,16 @@ pub fn report(
                      WHERE id = ?1",
                     rusqlite::params![task.id, commit_sha, verification, checks_json, stamp],
                 )?;
-                if task.kind == TaskKind::InstantMerge {
-                    land_merge_target(tx, &task, &stamp)?;
+                match task.kind {
+                    TaskKind::InstantMerge => land_merge_target(tx, &task, &stamp)?,
+                    TaskKind::Normal => ensure_review(tx, &task.id, &stamp)?,
+                    TaskKind::Review => unreachable!("a review is refused above"),
                 }
                 read(tx, &task.id)
             }
+            // The repeat of a report already on the record finishes nothing a
+            // second time, so it issues nothing either: the review the first
+            // one filed is still the review of this commit.
             TaskStatus::Done if task.commit_sha.as_deref() == Some(commit_sha) => Ok(task),
             TaskStatus::Done => Err(Error::Invalid(format!(
                 "task {} was already reported with a different commit",
@@ -735,6 +916,126 @@ pub fn report(
             ))),
         }
     })
+}
+
+/// Write down that a worker could not finish, and stop there.
+///
+/// This is the one report that commits a failure instead of rolling it back.
+/// A merge that hit a rebase conflict, or a check that came back red, has to
+/// leave a record a human can read — the alternative is the merge sitting in
+/// `wip` until its lease expires, handed straight back to the next worker to
+/// fail the same way, with nothing anywhere saying why.
+///
+/// The target of a blocked merge is deliberately left where it was: nothing
+/// landed, so nothing moves. `commit_sha` is not overwritten either — on a merge
+/// it is the subject the merge was issued for, and a later attempt is checked
+/// against it.
+fn report_blocked(
+    tx: &Connection,
+    task: &Task,
+    reason: &str,
+    checks_json: Option<&str>,
+    stamp: &str,
+) -> Result<Task, Error> {
+    match task.status {
+        TaskStatus::Wip => {
+            tx.execute(
+                "UPDATE tasks SET status = 'blocked', verification = ?2, checks_json = ?3,
+                        updated_at = ?4
+                 WHERE id = ?1",
+                rusqlite::params![task.id, reason, checks_json, stamp],
+            )?;
+            read(tx, &task.id)
+        }
+        // A worker that did not hear the answer sends the same report again.
+        TaskStatus::Blocked if task.verification.as_deref() == Some(reason) => Ok(task.clone()),
+        TaskStatus::Blocked => Err(Error::Invalid(format!(
+            "task {} is already blocked for another reason: {}",
+            task.id,
+            task.verification.as_deref().unwrap_or("<none>")
+        ))),
+        other => Err(Error::Invalid(format!(
+            "task {} cannot be blocked from {}",
+            task.id,
+            other.as_str()
+        ))),
+    }
+}
+
+/// See to it that `target_id` has a review reading it, issuing one if it has
+/// none.
+///
+/// A review that is already open is already the answer to "who is reading this",
+/// even when the work has moved on to another commit since — that review either
+/// hands the work back or is refused as stale by `review_subject_changed`, and
+/// either way the reader exists. Issuing a second one is impossible anyway: the
+/// single-open-review index would refuse it, and refusing it here would take the
+/// worker's report down with it for no gain.
+fn ensure_review(tx: &Connection, target_id: &str, stamp: &str) -> Result<(), Error> {
+    if has_open_attempt(tx, "review_target_task_id", REVIEW_IS_OVER, target_id)? {
+        return Ok(());
+    }
+    issue_review_in_tx(tx, target_id, stamp)?;
+    Ok(())
+}
+
+/// See to it that `target_id` has a merge landing it, issuing one if it has
+/// none. The counterpart of [`ensure_review`], on the other side of a verdict.
+fn ensure_merge(tx: &Connection, target_id: &str, stamp: &str) -> Result<(), Error> {
+    if has_open_attempt(tx, "merge_target_task_id", MERGE_IS_OVER, target_id)? {
+        return Ok(());
+    }
+    issue_merge_in_tx(tx, target_id, stamp)?;
+    Ok(())
+}
+
+/// The statuses that end a review's hold on its target, spelled as the partial
+/// unique index spells it. A review is over the moment it answers.
+///
+/// One phrase, three readers: [`ensure_review`] asks it before issuing,
+/// [`pending_reviews`] lists the attempts it excludes, and [`unreviewed`]
+/// reports the targets no attempt holds. They have to agree — a target is
+/// listed as unreviewed exactly when a new review could be issued for it — so
+/// they read it from here instead of each spelling it out.
+///
+/// The migration that creates the index spells it again in its own SQL, and
+/// stays there on purpose: a migration is the record of what a past schema was
+/// made of, and it must not change under a later edit to this line.
+const REVIEW_IS_OVER: &str = "('done', 'cancelled', 'dropped')";
+
+/// The statuses that end a merge's hold on its target. A landed merge keeps its
+/// target for ever — `done` is not on this list — because a task that merged is
+/// not an invitation to merge it again.
+///
+/// Read by [`ensure_merge`] before issuing and by [`mergeable`] when it offers
+/// a target to a human, for the same reason [`REVIEW_IS_OVER`] is shared: what
+/// a screen offers to merge is exactly what `issue_merge` would accept.
+///
+/// Not to be confused with the end of [`pending_merges`], which also stops at
+/// `done`. That list is "attempts still in flight", and a landed merge is no
+/// longer in flight even though it still holds its target for ever. Two
+/// different questions, and this constant answers only the second.
+const MERGE_IS_OVER: &str = "('cancelled', 'dropped')";
+
+/// Whether some attempt still holds `target_id` through `column`.
+///
+/// Asked with the predicate of the index that forbids a second one, so this
+/// answers `true` exactly when an issue would be refused as a conflict.
+fn has_open_attempt(
+    conn: &Connection,
+    column: &str,
+    is_over: &str,
+    target_id: &str,
+) -> Result<bool, Error> {
+    Ok(conn.query_row(
+        &format!(
+            "SELECT EXISTS(
+               SELECT 1 FROM tasks WHERE {column} = ?1 AND status NOT IN {is_over}
+             )"
+        ),
+        [target_id],
+        |row| row.get(0),
+    )?)
 }
 
 /// Nothing reaches the main line without evidence: a merge report must carry
@@ -825,7 +1126,7 @@ pub fn mergeable(db: &Db) -> Result<Vec<Task>, Error> {
                    AND NOT EXISTS (
                      SELECT 1 FROM tasks live
                      WHERE live.merge_target_task_id = tasks.id
-                       AND live.status NOT IN ('cancelled', 'dropped')
+                       AND live.status NOT IN {MERGE_IS_OVER}
                    )
                  ORDER BY created_at ASC, id ASC"
             ),
@@ -834,7 +1135,11 @@ pub fn mergeable(db: &Db) -> Result<Vec<Task>, Error> {
     })
 }
 
-/// Merge tasks that have been issued and not finished yet.
+/// Merge tasks that have been issued and not finished yet, in train order.
+///
+/// The order is the order they will actually be handed out in — the same
+/// `merge_sequence` the claim reads — so a screen showing this list is showing
+/// the queue rather than an alphabetical rearrangement of it.
 pub fn pending_merges(db: &Db) -> Result<Vec<Task>, Error> {
     db.with_conn(|conn| {
         query_all(
@@ -843,6 +1148,54 @@ pub fn pending_merges(db: &Db) -> Result<Vec<Task>, Error> {
                 "SELECT {COLUMNS} FROM tasks
                  WHERE kind = 'instant:merge'
                    AND status NOT IN ('done', 'cancelled', 'dropped')
+                 ORDER BY merge_sequence ASC, created_at ASC, id ASC"
+            ),
+            &[],
+        )
+    })
+}
+
+/// Review tasks that have been issued and not answered yet. The mirror of
+/// [`pending_merges`], and what a screen shows as "waiting to be read".
+pub fn pending_reviews(db: &Db) -> Result<Vec<Task>, Error> {
+    db.with_conn(|conn| {
+        query_all(
+            conn,
+            &format!(
+                "SELECT {COLUMNS} FROM tasks
+                 WHERE kind = 'review'
+                   AND status NOT IN {REVIEW_IS_OVER}
+                 ORDER BY created_at ASC, id ASC"
+            ),
+            &[],
+        )
+    })
+}
+
+/// Work that is `done` with no live review reading it.
+///
+/// This is an alarm, not a queue. A `done` report issues its own review in the
+/// same transaction, so in a healthy control plane this list is empty and stays
+/// empty; anything in it is work that finished and then lost its reader — an
+/// attempt somebody cancelled, or a row from before the issuing was automatic —
+/// and it will sit there for ever, because `done` has no way forward except a
+/// verdict. Nobody is meant to act on it as a matter of course. Its job is to
+/// make that silence visible instead of leaving the work quietly stranded.
+///
+/// "Live" is spelled exactly as the single-open-review index spells it, so a
+/// task is listed here precisely when a new review could be issued for it.
+pub fn unreviewed(db: &Db) -> Result<Vec<Task>, Error> {
+    db.with_conn(|conn| {
+        query_all(
+            conn,
+            &format!(
+                "SELECT {COLUMNS} FROM tasks
+                 WHERE kind = 'normal' AND status = 'done'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM tasks live
+                     WHERE live.review_target_task_id = tasks.id
+                       AND live.status NOT IN {REVIEW_IS_OVER}
+                   )
                  ORDER BY created_at ASC, id ASC"
             ),
             &[],
@@ -908,50 +1261,75 @@ fn free_attempt_id(conn: &Connection, base: &str) -> Result<(String, u32), Error
 /// reads one task and knows exactly which branch to rebase onto main.
 pub fn issue_merge(db: &Db, target_id: &str, now: OffsetDateTime) -> Result<Task, Error> {
     let stamp = format_z(now);
-    db.with_tx(|tx| {
-        let target = read(tx, target_id)?;
-        if target.kind != TaskKind::Normal {
-            return Err(Error::Invalid(format!(
-                "task {target_id} is {}, and only normal work is merged",
-                target.kind.as_str()
-            )));
-        }
-        if target.status != TaskStatus::Approved {
-            return Err(Error::Invalid(format!(
-                "task {target_id} is {}, so it is not ready to merge: only work a review \
-                 approved is merged",
-                target.status.as_str()
-            )));
-        }
-        let (Some(branch), Some(commit_sha)) = (&target.branch, &target.commit_sha) else {
-            return Err(Error::Invalid(format!(
-                "task {target_id} has no branch and commit to merge"
-            )));
-        };
-        let (id, _attempt) = free_attempt_id(tx, &merge_task_id(target_id))?;
-        tx.execute(
-            "INSERT INTO tasks (id, title, body, status, kind, product_id, priority, branch,
-                                commit_sha, merge_target_task_id, created_at, updated_at)
-             VALUES (?1, ?2, '', 'ready', 'instant:merge', ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
-            rusqlite::params![
-                id,
-                format!("merge {target_id}: {}", target.title),
-                target.product_id,
-                target.priority,
-                branch,
-                commit_sha,
-                target_id,
-                stamp,
-            ],
+    db.with_tx(|tx| issue_merge_in_tx(tx, target_id, &stamp))
+}
+
+/// Issue the merge inside a transaction the caller already owns.
+///
+/// The manual route opens its own transaction around this; an approving verdict
+/// calls it inside the transaction that granted the approval, so the promotion
+/// and the merge it earns are one write. One body, so the two ways in cannot
+/// drift apart on what a merge inherits or on what it refuses.
+fn issue_merge_in_tx(tx: &Connection, target_id: &str, stamp: &str) -> Result<Task, Error> {
+    let target = read(tx, target_id)?;
+    if target.kind != TaskKind::Normal {
+        return Err(Error::Invalid(format!(
+            "task {target_id} is {}, and only normal work is merged",
+            target.kind.as_str()
+        )));
+    }
+    if target.status != TaskStatus::Approved {
+        return Err(Error::Invalid(format!(
+            "task {target_id} is {}, so it is not ready to merge: only work a review \
+             approved is merged",
+            target.status.as_str()
+        )));
+    }
+    let (Some(branch), Some(commit_sha)) = (&target.branch, &target.commit_sha) else {
+        return Err(Error::Invalid(format!(
+            "task {target_id} has no branch and commit to merge"
+        )));
+    };
+    let (id, _attempt) = free_attempt_id(tx, &merge_task_id(target_id))?;
+    tx.execute(
+        "INSERT INTO tasks (id, title, body, status, kind, product_id, priority, branch,
+                            commit_sha, merge_target_task_id, merge_sequence,
+                            created_at, updated_at)
+         VALUES (?1, ?2, '', 'ready', 'instant:merge', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+        rusqlite::params![
+            id,
+            format!("merge {target_id}: {}", target.title),
+            target.product_id,
+            target.priority,
+            branch,
+            commit_sha,
+            target_id,
+            next_merge_sequence(tx)?,
+            stamp,
+        ],
+    )
+    .map_err(|err| {
+        attempt_conflict(
+            err,
+            format!("task {target_id} already has a merge in flight"),
         )
-        .map_err(|err| {
-            attempt_conflict(
-                err,
-                format!("task {target_id} already has a merge in flight"),
-            )
-        })?;
-        read(tx, &id)
-    })
+    })?;
+    read(tx, &id)
+}
+
+/// The place at the back of the merge train for the merge being issued now.
+///
+/// One counter for the whole table rather than one per product: a train only
+/// needs its own merges strictly ordered against each other, and taking the
+/// highest number ever issued gives every product that at once. It is read
+/// inside the issuing transaction, and writers serialize at `BEGIN IMMEDIATE`,
+/// so two merges can never be handed the same place.
+fn next_merge_sequence(conn: &Connection) -> Result<i64, Error> {
+    Ok(conn.query_row(
+        "SELECT coalesce(max(merge_sequence), 0) + 1 FROM tasks",
+        [],
+        |row| row.get(0),
+    )?)
 }
 
 /// The partial unique index (and the primary key) is what actually forbids a
@@ -975,51 +1353,61 @@ fn attempt_conflict(err: rusqlite::Error, message: String) -> Error {
 /// review's own completion never rewrites it.
 pub fn issue_review(db: &Db, target_id: &str, now: OffsetDateTime) -> Result<Task, Error> {
     let stamp = format_z(now);
-    db.with_tx(|tx| {
-        let target = read(tx, target_id)?;
-        if target.kind != TaskKind::Normal {
-            return Err(Error::Invalid(format!(
-                "task {target_id} is {}, and only normal work is reviewed",
-                target.kind.as_str()
-            )));
-        }
-        if target.status != TaskStatus::Done {
-            return Err(Error::Invalid(format!(
-                "task {target_id} is {}, so there is nothing to review yet",
-                target.status.as_str()
-            )));
-        }
-        let (Some(branch), Some(commit_sha)) = (&target.branch, &target.commit_sha) else {
-            return Err(Error::Invalid(format!(
-                "task {target_id} has no branch and commit to review"
-            )));
-        };
-        let (id, attempt) = free_attempt_id(tx, &review_task_id(target_id))?;
-        tx.execute(
-            "INSERT INTO tasks (id, title, body, status, kind, product_id, priority, branch,
-                                commit_sha, review_target_task_id, review_attempt,
-                                created_at, updated_at)
-             VALUES (?1, ?2, '', 'ready', 'review', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
-            rusqlite::params![
-                id,
-                format!("review {target_id}: {}", target.title),
-                target.product_id,
-                target.priority,
-                branch,
-                commit_sha,
-                target_id,
-                attempt,
-                stamp,
-            ],
+    db.with_tx(|tx| issue_review_in_tx(tx, target_id, &stamp))
+}
+
+/// Issue the review inside a transaction the caller already owns.
+///
+/// The manual route opens its own transaction around this; a `done` report calls
+/// it inside the transaction that finished the work, so finishing and being read
+/// are one write. One body, so neither way in can drift from the other.
+fn issue_review_in_tx(tx: &Connection, target_id: &str, stamp: &str) -> Result<Task, Error> {
+    let target = read(tx, target_id)?;
+    if target.kind != TaskKind::Normal {
+        return Err(Error::Invalid(format!(
+            "task {target_id} is {}, and only normal work is reviewed",
+            target.kind.as_str()
+        )));
+    }
+    if target.status != TaskStatus::Done {
+        return Err(Error::Invalid(format!(
+            "task {target_id} is {}, so there is nothing to review yet",
+            target.status.as_str()
+        )));
+    }
+    let (Some(branch), Some(commit_sha)) = (&target.branch, &target.commit_sha) else {
+        return Err(Error::Invalid(format!(
+            "task {target_id} has no branch and commit to review"
+        )));
+    };
+    let (id, attempt) = free_attempt_id(tx, &review_task_id(target_id))?;
+    tx.execute(
+        "INSERT INTO tasks (id, title, body, status, kind, product_id, priority, branch,
+                            commit_sha, review_target_task_id, review_attempt,
+                            created_at, updated_at)
+         VALUES (?1, ?2, '', 'ready', 'review', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+        rusqlite::params![
+            id,
+            format!("review {target_id}: {}", target.title),
+            target.product_id,
+            target.priority,
+            branch,
+            commit_sha,
+            target_id,
+            attempt,
+            stamp,
+        ],
+    )
+    .map_err(|err| {
+        attempt_conflict(
+            err,
+            format!(
+                "task {target_id} already has a review in flight; cancel it before the work \
+                 is finished again"
+            ),
         )
-        .map_err(|err| {
-            attempt_conflict(
-                err,
-                format!("task {target_id} already has a review in flight"),
-            )
-        })?;
-        read(tx, &id)
-    })
+    })?;
+    read(tx, &id)
 }
 
 /// Accept a reviewer's verdict for the lease `claim_id`.
@@ -1079,6 +1467,13 @@ pub fn review_report(
                     "UPDATE tasks SET status = ?2, updated_at = ?3 WHERE id = ?1",
                     rusqlite::params![target_id, verdict_moves_target_to(verdict), stamp],
                 )?;
+                // An approval is the last judgement before the main line, so
+                // the merge it earns is issued here rather than waited for: a
+                // human pressing "merge" afterwards would be pressing a button
+                // whose answer the review already gave.
+                if verdict == ReviewVerdict::Approve {
+                    ensure_merge(tx, &target_id, &stamp)?;
+                }
                 read(tx, &review.id)
             }
             // A repeat of the answer already on the record is accepted and
@@ -1340,6 +1735,7 @@ fn from_row(row: &Row<'_>) -> Result<Task, Error> {
         checks: decode_checks(row.get::<_, Option<String>>(18)?.as_deref())?,
         review_target_task_id: row.get(19)?,
         review_verdict: decode_verdict(row.get::<_, Option<String>>(20)?.as_deref())?,
+        merge_sequence: row.get(21)?,
     })
 }
 
@@ -1359,11 +1755,11 @@ mod tests {
     use time::macros::datetime;
 
     use super::{
-        ALL_STATUSES, Check, NewTask, Releasable, ReviewVerdict, TaskKind, TaskPatch, TaskStatus,
-        available_transitions, can_transition, claim, create, get, issue_merge, issue_review,
-        latest_review, list, list_active, list_by_status, merge_task_id, mergeable, pending_merges,
-        releasable, release_product, report, review_report, review_task_id, set_status,
-        set_status_by_operator, update,
+        ALL_STATUSES, Check, NewTask, Releasable, ReportOutcome, ReviewVerdict, Task, TaskKind,
+        TaskPatch, TaskStatus, available_transitions, can_transition, claim, create, get,
+        issue_merge, issue_review, latest_review, list, list_active, list_by_status, merge_task_id,
+        mergeable, pending_merges, pending_reviews, releasable, release_product, report,
+        review_report, review_task_id, set_status, set_status_by_operator, unreviewed, update,
     };
     use crate::clock::format_z;
     use crate::db::Db;
@@ -1522,23 +1918,65 @@ mod tests {
         let leased = claim(&db, "worker", &[], now(), 60).unwrap().unwrap();
         let claim_id = leased.claim_id.clone().unwrap();
 
-        let done = report(&db, &claim_id, "abc1234", "cargo test", &[], now()).unwrap();
+        let done = report(
+            &db,
+            &claim_id,
+            "abc1234",
+            "cargo test",
+            &[],
+            ReportOutcome::Done,
+            now(),
+        )
+        .unwrap();
         assert_eq!(done.status, TaskStatus::Done);
         assert_eq!(done.commit_sha.as_deref(), Some("abc1234"));
 
-        let again = report(&db, &claim_id, "abc1234", "cargo test", &[], now()).unwrap();
+        let again = report(
+            &db,
+            &claim_id,
+            "abc1234",
+            "cargo test",
+            &[],
+            ReportOutcome::Done,
+            now(),
+        )
+        .unwrap();
         assert_eq!(again, done);
 
         assert!(matches!(
-            report(&db, &claim_id, "def5678", "cargo test", &[], now()),
+            report(
+                &db,
+                &claim_id,
+                "def5678",
+                "cargo test",
+                &[],
+                ReportOutcome::Done,
+                now()
+            ),
             Err(Error::Invalid(_))
         ));
         assert!(matches!(
-            report(&db, "not-a-claim", "abc1234", "cargo test", &[], now()),
+            report(
+                &db,
+                "not-a-claim",
+                "abc1234",
+                "cargo test",
+                &[],
+                ReportOutcome::Done,
+                now()
+            ),
             Err(Error::ClaimMismatch)
         ));
         assert!(matches!(
-            report(&db, &claim_id, " ", "cargo test", &[], now()),
+            report(
+                &db,
+                &claim_id,
+                " ",
+                "cargo test",
+                &[],
+                ReportOutcome::Done,
+                now()
+            ),
             Err(Error::Invalid(_))
         ));
     }
@@ -1931,22 +2369,40 @@ mod tests {
 
         assert!(
             matches!(
-                report(&db, &abandoned, "abc1234", "cargo test", &[], expired),
+                report(
+                    &db,
+                    &abandoned,
+                    "abc1234",
+                    "cargo test",
+                    &[],
+                    ReportOutcome::Done,
+                    expired
+                ),
                 Err(Error::ClaimMismatch)
             ),
             "the abandoned lease must no longer report"
         );
         assert_eq!(
-            report(&db, &fresh, "abc1234", "cargo test", &[], expired)
-                .unwrap()
-                .status,
+            report(
+                &db,
+                &fresh,
+                "abc1234",
+                "cargo test",
+                &[],
+                ReportOutcome::Done,
+                expired
+            )
+            .unwrap()
+            .status,
             TaskStatus::Done
         );
 
-        // A task that left `wip` is never handed out again by expiry.
+        // A task that left `wip` is never handed out again by expiry. The
+        // filter is what keeps this about `t-1`: finishing it issued the review
+        // that reads it, and that review is waiting for a reviewer.
         let far_future = now() + time::Duration::seconds(100_000);
         assert!(
-            claim(&db, "worker-c", &[], far_future, 60)
+            claim(&db, "worker-c", &[TaskKind::Normal], far_future, 60)
                 .unwrap()
                 .is_none()
         );
@@ -2004,23 +2460,44 @@ mod tests {
         }]
     }
 
-    /// Take `id` from draft to done the way a worker does.
+    /// Take `id` from draft to done the way a worker does. The filter is what
+    /// keeps a worker loop off the reviews earlier work has already queued.
     fn work_to_done(db: &Db, id: &str) {
         set_status(db, id, TaskStatus::Ready, now()).unwrap();
-        let leased = claim(db, "worker", &[], now(), 60).unwrap().unwrap();
-        assert_eq!(leased.id, id);
-        let claim_id = leased.claim_id.expect("claim_id");
-        report(db, &claim_id, "abc1234", "cargo test", &[], now()).unwrap();
-    }
-
-    /// Issue a review for `target_id` and claim it the way a reviewer does.
-    fn claim_review(db: &Db, target_id: &str) -> (String, String) {
-        let review = issue_review(db, target_id, later()).unwrap();
-        let leased = claim(db, "reviewer", &[TaskKind::Review], later(), 60)
+        let leased = claim(db, "worker", &[TaskKind::Normal], now(), 60)
             .unwrap()
             .unwrap();
-        assert_eq!(leased.id, review.id, "the reviewer must get the review");
-        (review.id, leased.claim_id.expect("claim_id"))
+        assert_eq!(leased.id, id);
+        let claim_id = leased.claim_id.expect("claim_id");
+        report(
+            db,
+            &claim_id,
+            "abc1234",
+            "cargo test",
+            &[],
+            ReportOutcome::Done,
+            now(),
+        )
+        .unwrap();
+    }
+
+    /// Claim the review the report of `target_id` issued, the way a reviewer
+    /// does. The review is already waiting: finishing the work is what filed it.
+    fn claim_review(db: &Db, target_id: &str) -> (String, String) {
+        let leased = claim(db, "reviewer", &[TaskKind::Review], later(), 60)
+            .unwrap()
+            .expect("the report must have issued a review to claim");
+        assert_eq!(
+            leased.review_target_task_id.as_deref(),
+            Some(target_id),
+            "the reviewer must get the review of {target_id}"
+        );
+        (leased.id.clone(), leased.claim_id.expect("claim_id"))
+    }
+
+    /// The merge the approval of `target_id` issued.
+    fn issued_merge(db: &Db, target_id: &str) -> Task {
+        get(db, &merge_task_id(target_id)).expect("the approval must have issued a merge")
     }
 
     /// Take `id` all the way to `approved`: work, then a review that approves
@@ -2049,11 +2526,14 @@ mod tests {
         set_status(&db, "t-ready", TaskStatus::Ready, now()).unwrap();
         work_to_approved(&db, "t-done");
 
-        let ids: Vec<String> = mergeable(&db).unwrap().into_iter().map(|t| t.id).collect();
-        assert_eq!(ids, ["t-done"]);
-        assert!(pending_merges(&db).unwrap().is_empty());
+        // The approval issued the merge, so the candidate list is empty and the
+        // work is already in flight rather than waiting for a press.
+        assert!(
+            mergeable(&db).unwrap().is_empty(),
+            "approved work with a live merge is not a candidate"
+        );
 
-        let merge = issue_merge(&db, "t-done", later()).unwrap();
+        let merge = issued_merge(&db, "t-done");
         assert_eq!(merge.id, merge_task_id("t-done"));
         assert_eq!(merge.kind, TaskKind::InstantMerge);
         assert_eq!(merge.status, TaskStatus::Ready);
@@ -2063,10 +2543,6 @@ mod tests {
         assert_eq!(merge.commit_sha.as_deref(), Some("abc1234"));
         assert!(merge.title.contains("t-done"));
 
-        assert!(
-            mergeable(&db).unwrap().is_empty(),
-            "a live merge takes its target out of the candidate list"
-        );
         let pending: Vec<String> = pending_merges(&db)
             .unwrap()
             .into_iter()
@@ -2102,7 +2578,7 @@ mod tests {
         let db = db_with_product();
         create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
         work_to_approved(&db, "t-1");
-        let merge = issue_merge(&db, "t-1", later()).unwrap();
+        let merge = issued_merge(&db, "t-1");
         let leased = claim(&db, "worker", &[], later(), 60).unwrap().unwrap();
         assert_eq!(leased.id, merge.id);
         let claim_id = leased.claim_id.expect("claim_id");
@@ -2116,7 +2592,15 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    report(&db, &claim_id, "abc1234", "cargo test", &checks, later()),
+                    report(
+                        &db,
+                        &claim_id,
+                        "abc1234",
+                        "cargo test",
+                        &checks,
+                        ReportOutcome::Done,
+                        later()
+                    ),
                     Err(Error::Invalid(_))
                 ),
                 "{checks:?} must not land"
@@ -2125,13 +2609,31 @@ mod tests {
             assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Approved);
         }
 
-        let landed = report(&db, &claim_id, "abc1234", "cargo test", &green(), later()).unwrap();
+        let landed = report(
+            &db,
+            &claim_id,
+            "abc1234",
+            "cargo test",
+            &green(),
+            ReportOutcome::Done,
+            later(),
+        )
+        .unwrap();
         assert_eq!(landed.status, TaskStatus::Done);
         assert_eq!(landed.checks, green(), "the evidence is kept on the task");
         assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Merged);
 
         // Idempotent: the same commit reported twice is still accepted.
-        let again = report(&db, &claim_id, "abc1234", "cargo test", &green(), later()).unwrap();
+        let again = report(
+            &db,
+            &claim_id,
+            "abc1234",
+            "cargo test",
+            &green(),
+            ReportOutcome::Done,
+            later(),
+        )
+        .unwrap();
         assert_eq!(again, landed);
     }
 
@@ -2143,13 +2645,22 @@ mod tests {
         let db = db_with_product();
         create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
         work_to_approved(&db, "t-1");
-        let merge = issue_merge(&db, "t-1", later()).unwrap();
+        let merge = issued_merge(&db, "t-1");
         let claim_id = claim(&db, "worker", &[], later(), 60)
             .unwrap()
             .unwrap()
             .claim_id
             .expect("claim_id");
-        let landed = report(&db, &claim_id, "abc1234", "cargo test", &green(), later()).unwrap();
+        let landed = report(
+            &db,
+            &claim_id,
+            "abc1234",
+            "cargo test",
+            &green(),
+            ReportOutcome::Done,
+            later(),
+        )
+        .unwrap();
         assert_eq!(landed.status, TaskStatus::Done);
         assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Merged);
 
@@ -2162,7 +2673,15 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    report(&db, &claim_id, "abc1234", "cargo test", &checks, later()),
+                    report(
+                        &db,
+                        &claim_id,
+                        "abc1234",
+                        "cargo test",
+                        &checks,
+                        ReportOutcome::Done,
+                        later()
+                    ),
                     Err(Error::Invalid(_))
                 ),
                 "{checks:?} must not pass the gate on a landed merge"
@@ -2179,7 +2698,16 @@ mod tests {
             );
         }
 
-        let again = report(&db, &claim_id, "abc1234", "cargo test", &green(), later()).unwrap();
+        let again = report(
+            &db,
+            &claim_id,
+            "abc1234",
+            "cargo test",
+            &green(),
+            ReportOutcome::Done,
+            later(),
+        )
+        .unwrap();
         assert_eq!(again, landed, "a green repeat is still idempotent");
         assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Merged);
     }
@@ -2192,7 +2720,7 @@ mod tests {
         create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
         work_to_approved(&db, "t-1");
 
-        let first = issue_merge(&db, "t-1", later()).unwrap();
+        let first = issued_merge(&db, "t-1");
         assert_eq!(first.id, merge_task_id("t-1"));
         assert!(
             matches!(issue_merge(&db, "t-1", later()), Err(Error::Conflict(_))),
@@ -2230,13 +2758,21 @@ mod tests {
         let db = db_with_product();
         create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
         work_to_approved(&db, "t-1");
-        let merge = issue_merge(&db, "t-1", later()).unwrap();
+        let merge = issued_merge(&db, "t-1");
         let leased = claim(&db, "worker", &[], later(), 60).unwrap().unwrap();
         let claim_id = leased.claim_id.expect("claim_id");
 
         set_status(&db, "t-1", TaskStatus::Merged, later()).unwrap();
         assert!(matches!(
-            report(&db, &claim_id, "abc1234", "cargo test", &green(), later()),
+            report(
+                &db,
+                &claim_id,
+                "abc1234",
+                "cargo test",
+                &green(),
+                ReportOutcome::Done,
+                later()
+            ),
             Err(Error::Invalid(_))
         ));
         assert_eq!(
@@ -2257,7 +2793,16 @@ mod tests {
             .claim_id
             .unwrap();
 
-        let done = report(&db, &claim_id, "abc1234", "cargo test", &green(), now()).unwrap();
+        let done = report(
+            &db,
+            &claim_id,
+            "abc1234",
+            "cargo test",
+            &green(),
+            ReportOutcome::Done,
+            now(),
+        )
+        .unwrap();
         assert_eq!(done.status, TaskStatus::Done);
         assert_eq!(done.checks, green());
         assert_eq!(get(&db, "t-1").unwrap().checks, green());
@@ -2379,10 +2924,11 @@ mod tests {
             "a refused creation writes no row"
         );
 
-        // The internal path is untouched: a merge still comes from a target.
+        // The internal path is untouched: a merge still comes from a target,
+        // issued by the approval that earned it.
         create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
         work_to_approved(&db, "t-1");
-        let merge = issue_merge(&db, "t-1", later()).unwrap();
+        let merge = issued_merge(&db, "t-1");
         assert_eq!(merge.kind, TaskKind::InstantMerge);
         assert_eq!(merge.merge_target_task_id.as_deref(), Some("t-1"));
     }
@@ -2407,8 +2953,16 @@ mod tests {
         assert_eq!(leased.id, "t-orphan");
         let claim_id = leased.claim_id.expect("claim_id");
 
-        let refused = report(&db, &claim_id, "abc1234", "cargo test", &green(), later())
-            .expect_err("a merge with no target lands nothing");
+        let refused = report(
+            &db,
+            &claim_id,
+            "abc1234",
+            "cargo test",
+            &green(),
+            ReportOutcome::Done,
+            later(),
+        )
+        .expect_err("a merge with no target lands nothing");
         assert!(
             matches!(&refused, Error::Invalid(message) if message.contains("no target")),
             "unexpected error: {refused:?}"
@@ -2470,7 +3024,7 @@ mod tests {
         let db = db_with_product();
         create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
         work_to_done(&db, "t-1");
-        let review = issue_review(&db, "t-1", later()).unwrap();
+        let review = get(&db, &review_task_id("t-1")).expect("the report issues a review");
 
         // Refused while the review is still queued, and refused again while a
         // reviewer holds it — which is the only place the transition table
@@ -2663,6 +3217,7 @@ mod tests {
             "def5678",
             "cargo test",
             &[],
+            ReportOutcome::Done,
             later(),
         )
         .unwrap();
@@ -2715,7 +3270,7 @@ mod tests {
         let db = db_with_product();
         create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
         work_to_approved(&db, "t-1");
-        let merge = issue_merge(&db, "t-1", later()).unwrap();
+        let merge = issued_merge(&db, "t-1");
         assert_eq!(
             merge.commit_sha.as_deref(),
             Some("abc1234"),
@@ -2737,6 +3292,7 @@ mod tests {
             "def5678",
             "cargo test",
             &[],
+            ReportOutcome::Done,
             later(),
         )
         .unwrap();
@@ -2766,6 +3322,7 @@ mod tests {
             "merge999",
             "cargo test",
             &green(),
+            ReportOutcome::Done,
             later(),
         )
         .expect_err("a merge of a commit the parent left behind must be refused");
@@ -2800,6 +3357,7 @@ mod tests {
             "merge999",
             "cargo test",
             &green(),
+            ReportOutcome::Done,
             later(),
         )
         .unwrap();
@@ -2838,6 +3396,7 @@ mod tests {
                 "abc1234",
                 "cargo test",
                 &[],
+                ReportOutcome::Done,
                 later(),
             )
             .unwrap();
@@ -2890,8 +3449,7 @@ mod tests {
         create(&db, &new_task("t-2", TaskKind::Normal, 0), now()).unwrap();
         work_to_done(&db, "t-1");
 
-        let review = issue_review(&db, "t-1", later()).unwrap();
-        assert_eq!(review.id, review_task_id("t-1"));
+        let review = get(&db, &review_task_id("t-1")).expect("the report issues a review");
         assert_eq!(review.kind, TaskKind::Review);
         assert_eq!(review.status, TaskStatus::Ready);
         assert_eq!(review.review_target_task_id.as_deref(), Some("t-1"));
@@ -2965,12 +3523,12 @@ mod tests {
             "def5678",
             "cargo test",
             &[],
+            ReportOutcome::Done,
             later(),
         )
         .unwrap();
 
-        let second = issue_review(&db, "t-1", later()).unwrap();
-        assert_eq!(second.id, format!("{first_id}~2"));
+        let second = get(&db, &format!("{first_id}~2")).expect("the report issues the next one");
         assert!(
             !second.id.contains('/'),
             "a task id is one path segment: {}",
@@ -3078,6 +3636,7 @@ mod tests {
             "def5678",
             "cargo test",
             &[],
+            ReportOutcome::Done,
             later(),
         )
         .unwrap();
@@ -3259,18 +3818,22 @@ mod tests {
         work_to_done(&db, "t-done");
         work_to_approved(&db, "t-approved");
 
-        let ids: Vec<String> = mergeable(&db).unwrap().into_iter().map(|t| t.id).collect();
+        let pending: Vec<String> = pending_merges(&db)
+            .unwrap()
+            .into_iter()
+            .filter_map(|task| task.merge_target_task_id)
+            .collect();
         assert_eq!(
-            ids,
+            pending,
             ["t-approved"],
-            "a task nobody reviewed is not a merge candidate"
+            "a task nobody reviewed has no merge in flight"
         );
         assert!(
             matches!(issue_merge(&db, "t-done", later()), Err(Error::Invalid(_))),
             "a merge is issued against approved work only"
         );
 
-        let merge = issue_merge(&db, "t-approved", later()).unwrap();
+        let merge = issued_merge(&db, "t-approved");
         let leased = claim(&db, "merger", &[TaskKind::InstantMerge], later(), 60)
             .unwrap()
             .unwrap();
@@ -3281,6 +3844,7 @@ mod tests {
             "abc1234",
             "cargo test",
             &green(),
+            ReportOutcome::Done,
             later(),
         )
         .unwrap();
@@ -3303,6 +3867,7 @@ mod tests {
             "abc1234",
             "cargo test",
             &green(),
+            ReportOutcome::Done,
             later(),
         )
         .expect_err("a review is not finished by a work report");
@@ -3364,7 +3929,7 @@ mod tests {
         create(&db, &new_task("t-work", TaskKind::Normal, 0), now()).unwrap();
         create(&db, &new_task("t-reviewed", TaskKind::Normal, 0), now()).unwrap();
         work_to_done(&db, "t-reviewed");
-        let review = issue_review(&db, "t-reviewed", later()).unwrap();
+        let review = get(&db, &review_task_id("t-reviewed")).expect("the report issues a review");
         set_status(&db, "t-work", TaskStatus::Ready, later()).unwrap();
 
         assert!(
@@ -3392,6 +3957,1082 @@ mod tests {
             claim(&db, "grok", &[], later(), 60).unwrap().unwrap().id,
             "t-any"
         );
+    }
+
+    /// The review a `done` report needs is issued by that report, in the same
+    /// transaction. Nobody has to press anything: the human judgement in this
+    /// workflow is the release, and a queue that waited for a person to file the
+    /// review would stall behind them instead.
+    #[test]
+    fn a_finished_report_issues_the_review_that_reads_it() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        work_to_done(&db, "t-1");
+
+        let review = get(&db, &review_task_id("t-1")).expect("the report issues the review");
+        assert_eq!(review.kind, TaskKind::Review);
+        assert_eq!(
+            review.status,
+            TaskStatus::Ready,
+            "and it is claimable at once"
+        );
+        assert_eq!(review.review_target_task_id.as_deref(), Some("t-1"));
+        assert_eq!(
+            review.commit_sha.as_deref(),
+            Some("abc1234"),
+            "the review is issued for the commit the report carried"
+        );
+        assert_eq!(review.branch.as_deref(), Some("task/t-1"));
+        assert_eq!(review.product_id.as_deref(), Some("a/b"));
+        assert!(review.review_verdict.is_none());
+
+        // The idempotent repeat of a report is not a second finishing, so it
+        // issues nothing: the review is already there.
+        let claim_id = get(&db, "t-1").unwrap().claim_id.expect("claim_id");
+        report(
+            &db,
+            &claim_id,
+            "abc1234",
+            "cargo test",
+            &[],
+            ReportOutcome::Done,
+            later(),
+        )
+        .unwrap();
+        assert_eq!(reviews_of(&db, "t-1"), [review.id], "one review, not two");
+    }
+
+    /// Every id of a review that reads `target_id`, oldest attempt first.
+    fn reviews_of(db: &Db, target_id: &str) -> Vec<String> {
+        list(db)
+            .unwrap()
+            .into_iter()
+            .filter(|task| task.review_target_task_id.as_deref() == Some(target_id))
+            .map(|task| task.id)
+            .collect()
+    }
+
+    /// Every id of a merge that lands `target_id`, oldest attempt first.
+    fn merges_of(db: &Db, target_id: &str) -> Vec<String> {
+        list(db)
+            .unwrap()
+            .into_iter()
+            .filter(|task| task.merge_target_task_id.as_deref() == Some(target_id))
+            .map(|task| task.id)
+            .collect()
+    }
+
+    /// The round trip has to keep issuing: a task handed back, reworked and
+    /// reported again is in front of a reviewer once more, without anyone
+    /// filing the next attempt by hand.
+    #[test]
+    fn a_reworked_task_is_reviewed_again_by_the_report_that_finished_it() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        work_to_done(&db, "t-1");
+
+        let (first_id, claim_id) = claim_review(&db, "t-1");
+        review_report(
+            &db,
+            &claim_id,
+            "abc1234",
+            ReviewVerdict::RequestChanges,
+            "the guard is missing on the empty case",
+            later(),
+        )
+        .unwrap();
+        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Ready);
+
+        let leased = claim(&db, "worker", &[TaskKind::Normal], later(), 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(leased.id, "t-1");
+        report(
+            &db,
+            &leased.claim_id.expect("claim_id"),
+            "def5678",
+            "cargo test",
+            &[],
+            ReportOutcome::Done,
+            later(),
+        )
+        .unwrap();
+
+        let second = get(&db, "review:t-1~2").expect("the next attempt is issued too");
+        assert_eq!(second.status, TaskStatus::Ready);
+        assert_eq!(
+            second.commit_sha.as_deref(),
+            Some("def5678"),
+            "and it reads the reworked commit"
+        );
+        assert_eq!(reviews_of(&db, "t-1"), [first_id, second.id]);
+    }
+
+    /// Work that is finished again while its review is still open keeps that
+    /// review, and the report goes through.
+    ///
+    /// The reader already exists: that review either hands the work back or is
+    /// refused as stale when it tries to approve a commit the work has left
+    /// behind. Refusing the report instead would throw away a worker's finished
+    /// commit over a review nobody had cancelled yet.
+    #[test]
+    fn work_finished_again_under_an_open_review_keeps_that_one() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        work_to_done(&db, "t-1");
+        let open_review = get(&db, &review_task_id("t-1")).unwrap();
+
+        set_status_by_operator(&db, "t-1", TaskStatus::Blocked, later()).unwrap();
+        set_status_by_operator(&db, "t-1", TaskStatus::Ready, later()).unwrap();
+        let leased = claim(&db, "worker", &[TaskKind::Normal], later(), 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(leased.id, "t-1");
+        let redone = report(
+            &db,
+            &leased.claim_id.expect("claim_id"),
+            "def5678",
+            "cargo test",
+            &[],
+            ReportOutcome::Done,
+            later(),
+        )
+        .expect("an open review must not cost the worker its report");
+        assert_eq!(redone.status, TaskStatus::Done);
+        assert_eq!(redone.commit_sha.as_deref(), Some("def5678"));
+        assert_eq!(
+            reviews_of(&db, "t-1"),
+            std::slice::from_ref(&open_review.id),
+            "the review that was already open is still the only one"
+        );
+        assert_eq!(
+            get(&db, &open_review.id).unwrap().commit_sha.as_deref(),
+            Some("abc1234"),
+            "and it still reads the commit it was issued for"
+        );
+    }
+
+    /// Finishing work and putting it in front of a reviewer is one act, so a
+    /// review that cannot be issued at all takes the report down with it: the
+    /// alternative is work that is `done`, unread, and with no way forward.
+    ///
+    /// The fixture is a row nothing in production writes — leased with no branch
+    /// — because that is what it takes to make the issue fail for a reason other
+    /// than "a review is already open", which is not a failure at all.
+    #[test]
+    fn a_report_that_cannot_issue_its_review_writes_nothing_at_all() {
+        let db = db_with_product();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, kind, product_id, priority,
+                                    claim_id, claimed_by, created_at, updated_at)
+                 VALUES ('t-branchless', 'no branch', 'wip', 'normal', 'a/b', 0,
+                         'claim-1', 'worker', ?1, ?1)",
+                [format_z(now())],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let refused = report(
+            &db,
+            "claim-1",
+            "abc1234",
+            "cargo test",
+            &[],
+            ReportOutcome::Done,
+            later(),
+        )
+        .expect_err("work that cannot be reviewed cannot be finished");
+        assert!(
+            matches!(&refused, Error::Invalid(message) if message.contains("branch")),
+            "unexpected error: {refused:?}"
+        );
+
+        let task = get(&db, "t-branchless").unwrap();
+        assert_eq!(
+            task.status,
+            TaskStatus::Wip,
+            "the refusal must not leave the work finished"
+        );
+        assert!(
+            task.commit_sha.is_none(),
+            "and must not have taken the commit it refused"
+        );
+        assert!(reviews_of(&db, "t-branchless").is_empty());
+    }
+
+    /// An approval and the merge it earns are one write. The reviewer's verdict
+    /// is the last judgement before the main line, so nothing waits for a human
+    /// to press "merge" afterwards.
+    #[test]
+    fn an_approving_verdict_issues_the_merge_in_the_same_transaction() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        work_to_done(&db, "t-1");
+        let (_, claim_id) = claim_review(&db, "t-1");
+
+        review_report(
+            &db,
+            &claim_id,
+            "abc1234",
+            ReviewVerdict::Approve,
+            "read the diff, ran the tests",
+            later(),
+        )
+        .unwrap();
+
+        let merge = get(&db, &merge_task_id("t-1")).expect("the approval issues the merge");
+        assert_eq!(merge.kind, TaskKind::InstantMerge);
+        assert_eq!(merge.status, TaskStatus::Ready);
+        assert_eq!(merge.merge_target_task_id.as_deref(), Some("t-1"));
+        assert_eq!(merge.commit_sha.as_deref(), Some("abc1234"));
+        assert_eq!(merge.branch.as_deref(), Some("task/t-1"));
+        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Approved);
+        assert!(
+            mergeable(&db).unwrap().is_empty(),
+            "the work is already spoken for by its merge"
+        );
+    }
+
+    /// A verdict that asks for changes earns no merge: the work is going back
+    /// to the queue, not onto the main line.
+    #[test]
+    fn a_verdict_that_asks_for_changes_issues_no_merge() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        work_to_done(&db, "t-1");
+        let (_, claim_id) = claim_review(&db, "t-1");
+
+        review_report(
+            &db,
+            &claim_id,
+            "abc1234",
+            ReviewVerdict::RequestChanges,
+            "the guard is missing on the empty case",
+            later(),
+        )
+        .unwrap();
+
+        assert!(
+            merges_of(&db, "t-1").is_empty(),
+            "work sent back has nothing to land"
+        );
+        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Ready);
+    }
+
+    /// Register a product so tasks of a second product have somewhere to belong.
+    fn add_product(db: &Db, id: &str) {
+        product::upsert(
+            db,
+            &Product {
+                id: id.into(),
+                repository: format!("https://example.test/{id}.git"),
+                description: String::new(),
+                releases: true,
+                archived: false,
+            },
+            now(),
+        )
+        .unwrap();
+    }
+
+    /// Take `id` of `product_id` all the way to its issued merge, and answer
+    /// with that merge.
+    fn merge_waiting_for(db: &Db, id: &str, product_id: &str) -> Task {
+        create(
+            db,
+            &NewTask {
+                product_id: Some(product_id.into()),
+                ..new_task(id, TaskKind::Normal, 0)
+            },
+            now(),
+        )
+        .unwrap();
+        work_to_approved(db, id);
+        issued_merge(db, id)
+    }
+
+    fn claim_merge(db: &Db, worker: &str, at: time::OffsetDateTime) -> Option<String> {
+        claim(db, worker, &[TaskKind::InstantMerge], at, 60)
+            .unwrap()
+            .map(|task| task.id)
+    }
+
+    /// Two merges of one product cannot run at once: the second would rebase
+    /// onto a main line the first has not written yet. So the queue hands out
+    /// the older one and holds the younger back until the older is out of the
+    /// way.
+    #[test]
+    fn a_merge_waits_for_the_one_issued_before_it_in_its_product() {
+        let db = db_with_product();
+        let first = merge_waiting_for(&db, "t-1", "a/b");
+        let second = merge_waiting_for(&db, "t-2", "a/b");
+        assert!(
+            first.merge_sequence < second.merge_sequence,
+            "the fixture must issue {} before {}",
+            first.id,
+            second.id
+        );
+
+        assert_eq!(claim_merge(&db, "luna", later()), Some(first.id.clone()));
+        assert_eq!(
+            claim_merge(&db, "sol", later()),
+            None,
+            "the second merge waits behind the first"
+        );
+
+        // Landing the first releases the one behind it.
+        let leased = get(&db, &first.id).unwrap();
+        report(
+            &db,
+            &leased.claim_id.expect("claim_id"),
+            "merge111",
+            "cargo test",
+            &green(),
+            ReportOutcome::Done,
+            later(),
+        )
+        .unwrap();
+        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Merged);
+        assert_eq!(claim_merge(&db, "sol", later()), Some(second.id));
+    }
+
+    /// Block the head of a train the way a worker does, and answer with the row
+    /// as the report left it.
+    fn block_merge(db: &Db, id: &str, commit_sha: &str, reason: &str) -> Task {
+        let claim_id = get(db, id).unwrap().claim_id.expect("claim_id");
+        let blocked = report(
+            db,
+            &claim_id,
+            commit_sha,
+            reason,
+            &[Check {
+                name: "git rebase".into(),
+                exit_code: 1,
+            }],
+            ReportOutcome::Blocked,
+            later(),
+        )
+        .unwrap();
+        assert_eq!(blocked.status, TaskStatus::Blocked);
+        blocked
+    }
+
+    /// A merge that could not be integrated stops its train, and `ready` is not
+    /// the way out of it.
+    ///
+    /// The next merge would be rebasing onto a main line that is still waiting
+    /// for this one, so nothing overtakes it. Restarting the failed attempt is
+    /// refused as well: the row still carries the reason and the checks of the
+    /// attempt that failed, and it is pinned to a commit whose main line has
+    /// moved. Calling it off is the one press that moves the queue.
+    #[test]
+    fn a_blocked_merge_stops_its_train_and_ready_does_not_release_it() {
+        let db = db_with_product();
+        let first = merge_waiting_for(&db, "t-1", "a/b");
+        let second = merge_waiting_for(&db, "t-2", "a/b");
+
+        assert_eq!(claim_merge(&db, "luna", later()), Some(first.id.clone()));
+        block_merge(&db, &first.id, "abc1234", "rebase onto main conflicts");
+
+        assert_eq!(
+            claim_merge(&db, "sol", later()),
+            None,
+            "a blocked merge is still in the way of the one behind it"
+        );
+
+        // Pressing `ready` would hand this very attempt back to a worker. The
+        // domain refuses it, so no surface can offer it as a way past the jam.
+        let refused = set_status_by_operator(&db, &first.id, TaskStatus::Ready, later());
+        assert!(
+            matches!(&refused, Err(Error::Invalid(message)) if message.contains("called off")),
+            "restarting a blocked merge has to be refused: {refused:?}"
+        );
+        assert_eq!(
+            get(&db, &first.id).unwrap().status,
+            TaskStatus::Blocked,
+            "and the refusal writes nothing"
+        );
+        assert_eq!(
+            claim_merge(&db, "sol", later()),
+            None,
+            "the train is still stopped after the refused press"
+        );
+
+        set_status_by_operator(&db, &first.id, TaskStatus::Cancelled, later()).unwrap();
+        assert_eq!(
+            claim_merge(&db, "sol", later()),
+            Some(second.id),
+            "calling the blocked attempt off is what moves the train"
+        );
+    }
+
+    /// The release contract read off the card a human is actually looking at:
+    /// a blocked merge offers the two presses that call it off and nothing that
+    /// restarts it. The list and the refusal are one rule, so an operator
+    /// surface cannot offer a press the domain would then reject.
+    #[test]
+    fn a_blocked_merge_offers_only_the_presses_that_call_it_off() {
+        let db = db_with_product();
+        let merge = merge_waiting_for(&db, "t-1", "a/b");
+        assert_eq!(claim_merge(&db, "luna", later()), Some(merge.id.clone()));
+        let blocked = block_merge(&db, &merge.id, "abc1234", "rebase onto main conflicts");
+
+        assert_eq!(
+            available_transitions(&blocked),
+            [TaskStatus::Cancelled, TaskStatus::Dropped],
+            "a blocked merge is called off or nothing"
+        );
+        // The table still allows the edge; it is the operator rule that closes
+        // it, so the control plane keeps the transition it needs.
+        assert!(can_transition(TaskStatus::Blocked, TaskStatus::Ready));
+
+        // The rule is about merge attempts and nothing else. Ordinary work that
+        // stopped is picked back up by hand, exactly as before.
+        create(&db, &new_task("t-stalled", TaskKind::Normal, 0), now()).unwrap();
+        let stalled =
+            set_status_by_operator(&db, "t-stalled", TaskStatus::Blocked, later()).unwrap();
+        assert!(
+            available_transitions(&stalled).contains(&TaskStatus::Ready),
+            "blocked ordinary work is still restarted by hand: {:?}",
+            available_transitions(&stalled)
+        );
+        set_status_by_operator(&db, "t-stalled", TaskStatus::Ready, later()).unwrap();
+    }
+
+    /// `dropped` is the other release, and it releases exactly as much as
+    /// `cancelled`: the train moves and the target may be merged again, under a
+    /// new attempt id rather than by reopening the old one.
+    #[test]
+    fn dropping_a_blocked_merge_frees_the_target_for_a_new_attempt() {
+        let db = db_with_product();
+        let first = merge_waiting_for(&db, "t-1", "a/b");
+        let second = merge_waiting_for(&db, "t-2", "a/b");
+
+        assert_eq!(claim_merge(&db, "luna", later()), Some(first.id.clone()));
+        block_merge(&db, &first.id, "abc1234", "cargo test failed");
+
+        set_status_by_operator(&db, &first.id, TaskStatus::Dropped, later()).unwrap();
+        assert_eq!(
+            claim_merge(&db, "sol", later()),
+            Some(second.id),
+            "dropping the blocked attempt moves the train too"
+        );
+
+        assert_eq!(
+            mergeable(&db)
+                .unwrap()
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>(),
+            ["t-1"],
+            "the work the dropped merge would have landed is a candidate again"
+        );
+        let reissued = issue_merge(&db, "t-1", later()).unwrap();
+        assert_eq!(
+            reissued.id, "merge:t-1~2",
+            "and the new attempt is a new row, not the dropped one reopened"
+        );
+        assert_eq!(reissued.status, TaskStatus::Ready);
+        assert!(
+            reissued.verification.is_none(),
+            "the new attempt starts with no failure written on it"
+        );
+        assert_eq!(
+            get(&db, &first.id).unwrap().verification.as_deref(),
+            Some("cargo test failed"),
+            "and the attempt that failed keeps saying why, on its own row"
+        );
+    }
+
+    /// Land the merge of `target_id` the way a worker does: claim it, then
+    /// report it green.
+    fn land_merge(db: &Db, merge_id: &str, commit_sha: &str) -> Task {
+        let claim_id = get(db, merge_id).unwrap().claim_id.expect("claim_id");
+        report(
+            db,
+            &claim_id,
+            commit_sha,
+            "merged onto main",
+            &[Check {
+                name: "cargo test".into(),
+                exit_code: 0,
+            }],
+            ReportOutcome::Done,
+            later(),
+        )
+        .unwrap()
+    }
+
+    /// Put the merge of `t-1` into `status`, each by the route that actually
+    /// gets it there rather than by writing the column.
+    fn merge_into(db: &Db, merge_id: &str, status: TaskStatus) {
+        match status {
+            TaskStatus::Ready => {}
+            TaskStatus::Wip => {
+                assert_eq!(claim_merge(db, "luna", later()).as_deref(), Some(merge_id));
+            }
+            TaskStatus::Blocked => {
+                assert_eq!(claim_merge(db, "luna", later()).as_deref(), Some(merge_id));
+                block_merge(db, merge_id, "abc1234", "rebase onto main conflicts");
+            }
+            TaskStatus::Done => {
+                assert_eq!(claim_merge(db, "luna", later()).as_deref(), Some(merge_id));
+                land_merge(db, merge_id, "abc1234");
+            }
+            other => {
+                set_status_by_operator(db, merge_id, other, later()).unwrap();
+            }
+        }
+        assert_eq!(get(db, merge_id).unwrap().status, status);
+    }
+
+    /// The same for the review of `target_id`. `done` is reached by a verdict,
+    /// which is the only thing that finishes a review.
+    fn review_into(db: &Db, target_id: &str, review_id: &str, status: TaskStatus) {
+        match status {
+            TaskStatus::Ready => {}
+            TaskStatus::Wip => {
+                claim_review(db, target_id);
+            }
+            TaskStatus::Done => {
+                let (_, claim_id) = claim_review(db, target_id);
+                review_report(
+                    db,
+                    &claim_id,
+                    "abc1234",
+                    ReviewVerdict::RequestChanges,
+                    "the empty case is unguarded",
+                    later(),
+                )
+                .unwrap();
+            }
+            other => {
+                set_status_by_operator(db, review_id, other, later()).unwrap();
+            }
+        }
+        assert_eq!(get(db, review_id).unwrap().status, status);
+    }
+
+    /// A reconciliation window and the index that refuses a second attempt are
+    /// one predicate read twice, and they have to answer together.
+    ///
+    /// `mergeable` offers a target exactly when `issue_merge` would accept an
+    /// attempt for it, and `unreviewed` reports one exactly when `issue_review`
+    /// would. Let the two spell "still holding its target" differently and the
+    /// board either offers a press the control plane answers with a conflict,
+    /// or hides work that really has lost its attempt and will now sit there
+    /// for ever.
+    ///
+    /// So this asks the questions of the same row in every status an attempt
+    /// can be sitting in, and pins two things at once: *which* statuses release
+    /// the target — `MERGE_IS_OVER` and `REVIEW_IS_OVER`, which the windows now
+    /// read rather than respell — and that the window and the index behind it
+    /// never disagree about a row.
+    #[test]
+    fn every_reconciliation_window_agrees_with_the_index_behind_it() {
+        let statuses = [
+            TaskStatus::Ready,
+            TaskStatus::Wip,
+            TaskStatus::Blocked,
+            TaskStatus::Done,
+            TaskStatus::Cancelled,
+            TaskStatus::Dropped,
+        ];
+
+        for status in statuses {
+            let db = db_with_product();
+            let merge = merge_waiting_for(&db, "t-1", "a/b");
+            merge_into(&db, &merge.id, status);
+
+            // A merge is over when it was called off, and only then: a landed
+            // one keeps its target for ever, which is why `done` is not on the
+            // list. `MERGE_IS_OVER` spelled as a claim about behaviour.
+            let over = matches!(status, TaskStatus::Cancelled | TaskStatus::Dropped);
+            let offered = mergeable(&db).unwrap().iter().any(|task| task.id == "t-1");
+            assert_eq!(
+                offered,
+                over,
+                "mergeable offers t-1 = {offered} while {} is {}",
+                merge.id,
+                status.as_str()
+            );
+            let accepted = issue_merge(&db, "t-1", later()).is_ok();
+            assert_eq!(
+                offered,
+                accepted,
+                "mergeable says {offered} and issue_merge says {accepted} \
+                 while {} is {}",
+                merge.id,
+                status.as_str()
+            );
+        }
+
+        for status in statuses {
+            let db = db_with_product();
+            create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+            work_to_done(&db, "t-1");
+            let review_id = review_task_id("t-1");
+            review_into(&db, "t-1", &review_id, status);
+
+            // A review is over the moment it answers, and when it is called
+            // off — `REVIEW_IS_OVER`. `pending_reviews` is the attempt side of
+            // that one sentence.
+            let over = matches!(
+                status,
+                TaskStatus::Done | TaskStatus::Cancelled | TaskStatus::Dropped
+            );
+            let listed = pending_reviews(&db)
+                .unwrap()
+                .iter()
+                .any(|task| task.id == review_id);
+            assert_eq!(
+                listed,
+                !over,
+                "pending_reviews lists {review_id} = {listed} while it is {}",
+                status.as_str()
+            );
+
+            let reported = unreviewed(&db).unwrap().iter().any(|task| task.id == "t-1");
+            let accepted = issue_review(&db, "t-1", later()).is_ok();
+            assert_eq!(
+                reported,
+                accepted,
+                "unreviewed says {reported} and issue_review says {accepted} \
+                 while {review_id} is {}",
+                status.as_str()
+            );
+
+            // The two windows are one sentence read from both ends: while the
+            // work is still sitting in `done`, exactly one of them mentions the
+            // pair — either an attempt is in flight, or the work is reported as
+            // having lost its reader. Both at once, or neither, is the drift.
+            //
+            // Once a verdict moved the work off `done` there is no pair to
+            // place, so the question is asked only while it is there.
+            if get(&db, "t-1").unwrap().status == TaskStatus::Done {
+                assert_eq!(
+                    listed,
+                    !reported,
+                    "pending_reviews says {listed} and unreviewed says {reported} \
+                     with {review_id} in {}",
+                    status.as_str()
+                );
+            }
+        }
+    }
+
+    /// How a merge attempt ended is the worker's answer, and no press writes
+    /// one.
+    ///
+    /// `done` and `blocked` are the two endings, and each carries evidence only
+    /// `report` produces. Pressing `blocked` would stop the product's train
+    /// with no reason on the row and no checks under it — a jam that cannot say
+    /// what jammed it. Pressing `done` would skip `check_gate` and
+    /// `land_merge_target` in one go: the attempt reads as finished while its
+    /// target sits in `approved`, and it then falls out of *both* windows built
+    /// to notice that — `pending_merges` stops at `done`, and `mergeable` still
+    /// sees a merge row that is neither `cancelled` nor `dropped` holding the
+    /// target. Approved work, never landed, on no screen at all.
+    ///
+    /// `wip` stays open on purpose: it is not an outcome. It says the attempt
+    /// is running, invents no checks and moves no target, and the same two
+    /// presses still release it.
+    #[test]
+    fn a_press_cannot_write_the_outcome_of_a_merge() {
+        let db = db_with_product();
+        let issued = merge_waiting_for(&db, "t-1", "a/b");
+
+        assert_eq!(
+            available_transitions(&issued),
+            [TaskStatus::Wip, TaskStatus::Cancelled, TaskStatus::Dropped],
+            "a merge waiting to be claimed offers no outcome, and keeps `wip`"
+        );
+        for to in [TaskStatus::Done, TaskStatus::Blocked] {
+            let refused = set_status_by_operator(&db, &issued.id, to, later());
+            assert!(
+                matches!(&refused, Err(Error::Invalid(message))
+                    if message.contains("POST /worker/report")),
+                "pressing {} on an issued merge has to be refused: {refused:?}",
+                to.as_str()
+            );
+        }
+        assert_eq!(
+            get(&db, &issued.id).unwrap(),
+            issued,
+            "and the refusals write nothing at all"
+        );
+
+        // Running, which is where `done` would have been the damaging press.
+        assert_eq!(claim_merge(&db, "luna", later()), Some(issued.id.clone()));
+        let running = get(&db, &issued.id).unwrap();
+        assert_eq!(running.status, TaskStatus::Wip);
+        assert_eq!(
+            available_transitions(&running),
+            [
+                TaskStatus::Ready,
+                TaskStatus::Cancelled,
+                TaskStatus::Dropped
+            ],
+            "a running merge offers no outcome either"
+        );
+        for to in [TaskStatus::Done, TaskStatus::Blocked] {
+            let refused = set_status_by_operator(&db, &issued.id, to, later());
+            assert!(
+                matches!(&refused, Err(Error::Invalid(message))
+                    if message.contains("POST /worker/report")),
+                "pressing {} on a running merge has to be refused: {refused:?}",
+                to.as_str()
+            );
+        }
+        assert_eq!(
+            get(&db, &issued.id).unwrap(),
+            running,
+            "the merge row is untouched by the refused presses"
+        );
+        assert_eq!(
+            get(&db, "t-1").unwrap().status,
+            TaskStatus::Approved,
+            "and so is the target the merge was issued for"
+        );
+        // The two windows that would have gone silent together.
+        assert_eq!(
+            pending_merges(&db)
+                .unwrap()
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&issued.id),
+            "the attempt is still in flight"
+        );
+        assert!(
+            mergeable(&db).unwrap().is_empty(),
+            "and its target is not offered a second attempt while it runs"
+        );
+
+        // The worker's own `done` still lands, gate and target together.
+        let landed = land_merge(&db, &issued.id, "abc1234");
+        assert_eq!(landed.status, TaskStatus::Done);
+        assert_eq!(
+            get(&db, "t-1").unwrap().status,
+            TaskStatus::Merged,
+            "the report is what moves the target"
+        );
+
+        // A landed merge is not pressed back into a jam either: `blocked` is
+        // the one edge the table still allows off `done`.
+        assert!(can_transition(TaskStatus::Done, TaskStatus::Blocked));
+        let refused = set_status_by_operator(&db, &issued.id, TaskStatus::Blocked, later());
+        assert!(
+            matches!(&refused, Err(Error::Invalid(message))
+                if message.contains("POST /worker/report")),
+            "pressing blocked on a landed merge: {refused:?}"
+        );
+        assert_eq!(get(&db, &issued.id).unwrap(), landed);
+        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Merged);
+    }
+
+    /// The refusal is scoped to merge attempts, and ordinary work still moves
+    /// by hand exactly as it did.
+    ///
+    /// `done` and `blocked` are outcomes only where a report owns them. On a
+    /// normal task a human is the one who says the work stopped, or finished,
+    /// and `blocked -> ready` is how it is picked back up.
+    #[test]
+    fn ordinary_work_still_takes_done_and_blocked_by_hand() {
+        let db = db_with_product();
+        create(&db, &new_task("t-hand", TaskKind::Normal, 0), now()).unwrap();
+        set_status_by_operator(&db, "t-hand", TaskStatus::Ready, later()).unwrap();
+        set_status_by_operator(&db, "t-hand", TaskStatus::Wip, later()).unwrap();
+
+        let running = get(&db, "t-hand").unwrap();
+        for to in [TaskStatus::Done, TaskStatus::Blocked] {
+            assert!(
+                available_transitions(&running).contains(&to),
+                "ordinary work still offers {}: {:?}",
+                to.as_str(),
+                available_transitions(&running)
+            );
+        }
+
+        let stopped = set_status_by_operator(&db, "t-hand", TaskStatus::Blocked, later()).unwrap();
+        assert_eq!(stopped.status, TaskStatus::Blocked);
+        let restarted = set_status_by_operator(&db, "t-hand", TaskStatus::Ready, later()).unwrap();
+        assert_eq!(
+            restarted.status,
+            TaskStatus::Ready,
+            "blocked ordinary work is restarted by hand"
+        );
+        set_status_by_operator(&db, "t-hand", TaskStatus::Wip, later()).unwrap();
+        let finished = set_status_by_operator(&db, "t-hand", TaskStatus::Done, later()).unwrap();
+        assert_eq!(finished.status, TaskStatus::Done);
+    }
+
+    /// A train is one product's. Another product's merges are rebasing onto
+    /// another main line, and run beside it.
+    #[test]
+    fn a_stalled_train_does_not_hold_up_another_product() {
+        let db = db_with_product();
+        add_product(&db, "c/d");
+        let held = merge_waiting_for(&db, "t-1", "a/b");
+        merge_waiting_for(&db, "t-2", "a/b");
+        let elsewhere = merge_waiting_for(&db, "t-3", "c/d");
+
+        assert_eq!(claim_merge(&db, "luna", later()), Some(held.id.clone()));
+        let claim_id = get(&db, &held.id).unwrap().claim_id.expect("claim_id");
+        report(
+            &db,
+            &claim_id,
+            "abc1234",
+            "rebase onto main conflicts",
+            &[],
+            ReportOutcome::Blocked,
+            later(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            claim_merge(&db, "sol", later()),
+            Some(elsewhere.id),
+            "another product's train runs while this one is stopped"
+        );
+    }
+
+    /// An expired lease is the head of the train being handed to somebody else,
+    /// never the merge behind it moving up: nothing was issued before the head,
+    /// so the head is the only merge that predicate lets through.
+    #[test]
+    fn an_expired_merge_lease_goes_back_to_the_head_of_the_train() {
+        let db = db_with_product();
+        let first = merge_waiting_for(&db, "t-b", "a/b");
+        let behind = merge_waiting_for(&db, "t-a", "a/b");
+        assert!(
+            behind.id < first.id,
+            "the follower has to be the one the queue would otherwise prefer: {} vs {}",
+            behind.id,
+            first.id
+        );
+
+        assert_eq!(claim_merge(&db, "luna", later()), Some(first.id.clone()));
+        let expired = later() + time::Duration::seconds(61);
+        assert_eq!(
+            claim_merge(&db, "sol", expired),
+            Some(first.id),
+            "the stalled head is retaken, not overtaken"
+        );
+    }
+
+    /// The order is the sequence and nothing else. Merge ids are derived from
+    /// the target's name, so they sort alphabetically, and `format_z` writes
+    /// whole seconds, so two merges issued in the same second tie on time. The
+    /// fixture is built so both of those would answer the wrong way round.
+    #[test]
+    fn the_merge_train_follows_the_issue_order_not_the_id_text() {
+        let db = db_with_product();
+        let first = merge_waiting_for(&db, "t-b", "a/b");
+        let second = merge_waiting_for(&db, "t-a", "a/b");
+        assert_eq!(
+            first.created_at, second.created_at,
+            "the fixture has to be the tie this test is about: same second"
+        );
+        assert!(
+            second.id < first.id,
+            "and the younger merge has to sort first as text, or the hazard is gone: \
+             {} vs {}",
+            second.id,
+            first.id
+        );
+
+        assert_eq!(
+            claim_merge(&db, "luna", later()),
+            Some(first.id),
+            "the merge issued first goes first"
+        );
+        assert_eq!(claim_merge(&db, "sol", later()), None);
+    }
+
+    /// A merge that could not be integrated has to leave a record. Rolling the
+    /// report back would put the merge straight back in the queue with nothing
+    /// anywhere saying why it failed, and the next worker would walk into the
+    /// same conflict.
+    #[test]
+    fn a_blocked_merge_report_keeps_the_reason_and_the_checks() {
+        let db = db_with_product();
+        let merge = merge_waiting_for(&db, "t-1", "a/b");
+        assert_eq!(claim_merge(&db, "luna", later()), Some(merge.id.clone()));
+        let claim_id = get(&db, &merge.id).unwrap().claim_id.expect("claim_id");
+        let red = vec![Check {
+            name: "cargo test".into(),
+            exit_code: 101,
+        }];
+
+        let blocked = report(
+            &db,
+            &claim_id,
+            "abc1234",
+            "cargo test failed on the rebased branch",
+            &red,
+            ReportOutcome::Blocked,
+            later(),
+        )
+        .expect("a worker reporting a red check is not itself an error");
+        assert_eq!(blocked.status, TaskStatus::Blocked);
+        assert_eq!(
+            blocked.verification.as_deref(),
+            Some("cargo test failed on the rebased branch"),
+            "the reason is what a human reads off the merge"
+        );
+        assert_eq!(blocked.checks, red, "and the evidence is kept with it");
+        assert_eq!(
+            blocked.commit_sha.as_deref(),
+            Some("abc1234"),
+            "a blocked merge keeps the subject it was issued for"
+        );
+        assert_eq!(
+            get(&db, "t-1").unwrap().status,
+            TaskStatus::Approved,
+            "nothing landed, so the target does not move"
+        );
+
+        // A worker that did not hear the answer says the same thing again.
+        let again = report(
+            &db,
+            &claim_id,
+            "abc1234",
+            "cargo test failed on the rebased branch",
+            &red,
+            ReportOutcome::Blocked,
+            later(),
+        )
+        .unwrap();
+        assert_eq!(again, blocked);
+
+        // A different reason on a merge that is already blocked is a second
+        // answer, not a repeat, and the first one stands.
+        assert!(matches!(
+            report(
+                &db,
+                &claim_id,
+                "abc1234",
+                "actually it was a rebase conflict",
+                &red,
+                ReportOutcome::Blocked,
+                later(),
+            ),
+            Err(Error::Invalid(_))
+        ));
+        // And a blocked merge cannot be turned into a landed one by reporting
+        // success over it: a human calls it off and the approval issues another.
+        assert!(matches!(
+            report(
+                &db,
+                &claim_id,
+                "abc1234",
+                "cargo test",
+                &green(),
+                ReportOutcome::Done,
+                later(),
+            ),
+            Err(Error::Invalid(_))
+        ));
+        assert_eq!(get(&db, &merge.id).unwrap(), blocked);
+        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Approved);
+    }
+
+    /// The evidence rule guards success only. A worker saying "this went red" is
+    /// reporting the failure, not claiming it as a pass, so the checks that would
+    /// refuse a landing are exactly what a blocked report is there to carry —
+    /// and a report with no checks at all is still a report of a conflict.
+    #[test]
+    fn the_check_gate_guards_landing_and_not_the_report_of_a_failure() {
+        let db = db_with_product();
+        let merge = merge_waiting_for(&db, "t-1", "a/b");
+        assert_eq!(claim_merge(&db, "luna", later()), Some(merge.id.clone()));
+        let claim_id = get(&db, &merge.id).unwrap().claim_id.expect("claim_id");
+
+        assert!(
+            matches!(
+                report(
+                    &db,
+                    &claim_id,
+                    "abc1234",
+                    "cargo test",
+                    &[],
+                    ReportOutcome::Done,
+                    later(),
+                ),
+                Err(Error::Invalid(_))
+            ),
+            "landing still needs evidence"
+        );
+        let blocked = report(
+            &db,
+            &claim_id,
+            "abc1234",
+            "rebase onto main conflicts in src/task.rs",
+            &[],
+            ReportOutcome::Blocked,
+            later(),
+        )
+        .expect("a conflict is reported without checks");
+        assert_eq!(blocked.status, TaskStatus::Blocked);
+        assert!(blocked.checks.is_empty());
+        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Approved);
+    }
+
+    /// What the admin screen reads. `pending_reviews` and `pending_merges` are
+    /// what is in flight; `unreviewed` is the alarm — work that finished and
+    /// lost its reader, which the automatic issuing means should never happen.
+    #[test]
+    fn the_control_plane_lists_open_reviews_and_work_that_lost_its_reader() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        create(&db, &new_task("t-2", TaskKind::Normal, 0), now()).unwrap();
+        work_to_done(&db, "t-1");
+
+        let ids =
+            |tasks: Vec<Task>| -> Vec<String> { tasks.into_iter().map(|task| task.id).collect() };
+        assert_eq!(ids(pending_reviews(&db).unwrap()), ["review:t-1"]);
+        assert!(
+            unreviewed(&db).unwrap().is_empty(),
+            "work that finished is already being read"
+        );
+
+        // A cancelled attempt is the way that reader is lost, and the window is
+        // what makes the silence visible: `done` goes nowhere without a verdict.
+        set_status_by_operator(&db, "review:t-1", TaskStatus::Cancelled, later()).unwrap();
+        assert!(pending_reviews(&db).unwrap().is_empty());
+        assert_eq!(ids(unreviewed(&db).unwrap()), ["t-1"]);
+
+        // Issuing one by hand is the remedy, and closes the window again.
+        let second = issue_review(&db, "t-1", later()).unwrap();
+        assert_eq!(
+            ids(pending_reviews(&db).unwrap()),
+            std::slice::from_ref(&second.id)
+        );
+        assert!(unreviewed(&db).unwrap().is_empty());
+
+        // Work still in flight is in neither list, and neither is a merge.
+        set_status(&db, "t-2", TaskStatus::Ready, later()).unwrap();
+        assert!(unreviewed(&db).unwrap().is_empty());
+
+        let (_, claim_id) = claim_review(&db, "t-1");
+        review_report(
+            &db,
+            &claim_id,
+            "abc1234",
+            ReviewVerdict::Approve,
+            "read the diff",
+            later(),
+        )
+        .unwrap();
+        assert!(
+            pending_reviews(&db).unwrap().is_empty(),
+            "an answered review is not pending"
+        );
+        assert!(unreviewed(&db).unwrap().is_empty());
+        assert_eq!(ids(pending_merges(&db).unwrap()), ["merge:t-1"]);
     }
 
     /// A worker whose change was sent back has to be able to read why, and the
@@ -3440,6 +5081,7 @@ mod tests {
             "def5678",
             "cargo test",
             &[],
+            ReportOutcome::Done,
             later(),
         )
         .unwrap();

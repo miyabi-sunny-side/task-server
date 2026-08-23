@@ -25,13 +25,13 @@ pub use clock::{Clock, SharedClock, SystemClock, format_z};
 pub use db::Db;
 pub use error::Error;
 pub use frontmatter::{Document, join_document, split_document};
-pub use http::{ControlPlane, ReleaseResult, TaskCard, TaskSummary};
+pub use http::{ControlPlane, PendingMerge, ReleaseResult, TaskCard, TaskSummary};
 pub use import::{ImportError, ImportSources, ImportSummary, import_markdown};
 pub use product::Product;
 pub use state::AppState;
 pub use task::{
-    Check, NewTask, Releasable, ReviewOutcome, ReviewVerdict, Task, TaskKind, TaskPatch,
-    TaskStatus, can_transition,
+    Check, NewTask, Releasable, ReportOutcome, ReviewOutcome, ReviewVerdict, Task, TaskKind,
+    TaskPatch, TaskStatus, can_transition,
 };
 
 pub fn app(state: AppState) -> Router {

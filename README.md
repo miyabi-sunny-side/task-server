@@ -3,7 +3,8 @@
 Task control plane. One Axum process serves the JSON API, two MCP endpoints, and
 the compiled Svelte Task Card UI. A single sqlite database is the source of
 truth: the transaction boundary is a sqlite transaction. Workers claim and
-report over HTTP or MCP; humans review a card and move it to the next status.
+report over HTTP or MCP; the server issues the review and the merge each report
+earns, so the one step left to a person is the release.
 
 [`DESIGN.md`](DESIGN.md) is the styling authority (Sumi dark, Kinari light, teal
 accent). [`AGENTS.md`](AGENTS.md) lists runtime invariants.
@@ -39,15 +40,15 @@ creates the database (and its parent directory) on first start.
 | GET | `/api/tasks/{id}` | Task Card: the task plus `available_transitions` and `latest_review` |
 | PATCH | `/api/tasks/{id}` | edit `title`, `body`, `product_id`, `priority`, `branch` |
 | POST | `/api/tasks/{id}/status` | move the task to `{"status": "..."}`; `approved`, `merged`, and `released` are refused |
-| GET | `/api/control` | `{ mergeable, pending_merges, releasable }` |
-| POST | `/api/reviews` | `{"task_id": "..."}` issues the review task, returns 201 |
-| POST | `/api/merges` | `{"task_id": "..."}` issues the merge task, returns 201 |
+| GET | `/api/control` | `{ mergeable, pending_merges, pending_reviews, unreviewed, releasable }`; each `pending_merges` row adds `verification`, the reason a blocked merge stopped |
+| POST | `/api/reviews` | reconciliation: `{"task_id": "..."}` issues a review task by hand, returns 201 |
+| POST | `/api/merges` | reconciliation: `{"task_id": "..."}` issues a merge task by hand, returns 201 |
 | POST | `/api/releases` | `{"product_id": "...", "tag": "..."}` releases everything merged |
 | GET | `/api/products` | product list |
 | GET | `/api/products/{id}` | one product |
 | PUT | `/api/products/{id}` | create or replace a product |
 | POST | `/worker/claim` | lease the next ready task; optional `kinds` takes only that work |
-| POST | `/worker/report` | report a commit, and `checks`, against a lease |
+| POST | `/worker/report` | report a commit, and `checks`, against a lease; `"outcome": "blocked"` records why the work could not be finished |
 | POST | `/worker/review-report` | answer a claimed review with a verdict and findings |
 | POST | `/mcp` | MCP over Streamable HTTP: the catalogue and the task lifecycle |
 | POST | `/worker/mcp` | MCP over Streamable HTTP: claim and report |
@@ -186,14 +187,26 @@ that still sets it is refused rather than quietly ignoring the file.
 ## Reviewing, merging and releasing
 
 The last three steps of a task are not buttons a human presses on the status
-API; they are earned.
+API; they are earned. Two of them are not pressed at all: **the server issues
+the review and the merge itself**, so the one judgement left to a person is the
+release.
 
-`POST /api/reviews` issues one `review` task against work that is `done`. It
-inherits the target's product, branch and priority, and takes a snapshot of the
-commit the work reported: that commit is the subject of the review, and it is
-what an approval is later checked against. Only one open review may target a
-task, so a second issue answers 409; a review that answered is over, so the next
-round is issued as `review:<id>~2`, `~3`, and so on.
+When a worker reports a `normal` task `done`, the same transaction issues that
+task's `review` task. Nobody files it, and there is no window in which finished
+work sits unread and unnoticed: if the review cannot be issued, the report is
+refused whole rather than leaving the work stranded. The review inherits the
+target's product, branch and priority, and takes a snapshot of the commit the
+work reported: that commit is the subject of the review, and it is what an
+approval is later checked against. Only one open review may target a task, so a
+second issue answers 409; a review that answered is over, so the next round is
+issued as `review:<id>~2`, `~3`, and so on. A report that repeats one already on
+the record issues nothing — the first one's review is still the review of that
+commit.
+
+`POST /api/reviews` still exists, but it is a **reconciliation** handle rather
+than the normal path: use it for work that lost its reader, which
+`GET /api/control` lists under `unreviewed`. That list is empty whenever the
+automatic issuing is working.
 
 The reviewer claims it — `POST /worker/claim` with `{"kinds": ["review"]}` takes
 review tasks alone — and answers on the review's own route:
@@ -218,6 +231,11 @@ approval that arrives after the work moved on is refused with code
 `review_subject_changed`, `review_target_moved`, or `review_subject_mismatch`,
 and writes nothing.
 
+**That same transaction issues the merge.** An approval is the last judgement
+before the main line, so the `instant:merge` task the work has earned is written
+alongside the promotion rather than waited for: approval and merge issue land
+together or not at all. Nothing is left for a person to press in between.
+
 That route is the *only* way a review finishes. `POST /api/tasks/{id}/status`
 and the MCP `task_set_status` tool both refuse `done` on a review task with 400
 and code `invalid`, and `available_transitions` never offers it: a pressed
@@ -235,22 +253,37 @@ issued, and from `blocked` it could be handed back to the queue, claimed, and
 answered a second time over the verdict already given. A finished attempt never
 stands in the way: the next review of the reworked commit is issued as usual.
 
-`POST /api/merges` is the only issuer of an `instant:merge` task, and that is an
-invariant of the domain rather than a rule of one transport: task registration
-files ordinary work only, so `POST /api/tasks` refuses `"kind": "instant:merge"`
-with 400 and code `invalid`, and the MCP `task_create` tool has no `kind`
-argument at all. A hand-made merge would be a merge with no target — claimed
-ahead of every other task, impossible to report, and so a standing block on the
-queue.
+Only the control plane writes an `instant:merge` task, and that is an invariant
+of the domain rather than a rule of one transport: task registration files
+ordinary work only, so `POST /api/tasks` refuses `"kind": "instant:merge"` with
+400 and code `invalid`, and the MCP `task_create` tool has no `kind` argument at
+all. A hand-made merge would be a merge with no target — claimed ahead of every
+other task, impossible to report, and so a standing block on the queue.
 
 A task becomes **mergeable** once a review approved it, with a branch and a
 commit, and no live merge already targets it. `done` is not enough: nothing
-reaches the main line unread. `POST /api/merges` then issues
-one `instant:merge` task that inherits the target's product, branch, and commit,
-starts in `ready`, and is claimed ahead of ordinary work. Only one live merge may
-target a task, so a second issue answers 409. Cancelling or dropping the attempt
-frees the target again, and the retry is issued under its own id: `merge:<id>`
-first, then `merge:<id>~2`, `~3`, and so on.
+reaches the main line unread. The merge task inherits the target's product,
+branch, and commit, starts in `ready`, and is claimed ahead of ordinary work.
+Only one live merge may target a task, so a second issue answers 409. Cancelling
+or dropping the attempt frees the target again, and the retry is issued under
+its own id: `merge:<id>` first, then `merge:<id>~2`, `~3`, and so on.
+
+`POST /api/merges` is the reconciliation handle here, the counterpart of
+`POST /api/reviews`: `GET /api/control` lists approved work with no merge under
+`mergeable`, and that list is empty while the automatic issuing works.
+
+### One merge at a time, per product
+
+A merge rebases its branch onto the main line, so two merges of the same product
+cannot run at once — the second would be rebasing onto a line the first has not
+written yet. Merges are therefore handed out **one product at a time, in the
+order they were issued**, tracked by each merge task's `merge_sequence`. A merge
+waits while any earlier merge of the same product is still `ready`, `wip`, or
+`blocked`; `done`, `cancelled`, and `dropped` release the ones behind it.
+Different products run side by side: one product's queue never holds another's.
+
+`GET /api/control` reports the outstanding merges under `pending_merges`, in
+that same order, so what you read is the order they will actually go out in.
 
 The worker that claims it rebases the branch onto the main line and reports back
 with the checks it ran:
@@ -264,10 +297,65 @@ with the checks it ran:
 }
 ```
 
-A merge report with no checks, or with any non-zero `exit_code`, is refused and
-changes nothing — including a repeat report against a merge that already landed.
-When every check passed, the merge finishes and its target moves to `merged` in
-the same transaction.
+A merge report that claims success is refused when it carries no checks, or any
+non-zero `exit_code`, and changes nothing — including a repeat report against a
+merge that already landed. When every check passed, the merge finishes and its
+target moves to `merged` in the same transaction.
+
+### When a merge cannot be integrated
+
+A rebase that conflicts, or a check that came back red, is not an error to throw
+away — it is a result to keep. The worker says so on the same route, with
+`outcome`:
+
+```jsonc
+{
+  "claim_id": "...",
+  "commit_sha": "abc1234",
+  "verification": "rebase onto main conflicts in src/task.rs",
+  "checks": [{ "name": "git rebase", "exit_code": 1 }],
+  "outcome": "blocked"
+}
+```
+
+That is a **successful report of a failure**: it answers 200. The merge task
+moves to `blocked`, `verification` keeps the reason and `checks` keeps the
+evidence, and the target does not move — nothing landed, so nothing advances to
+`merged`. The check gate above applies to success only; a worker saying it was
+blocked is reporting the red check, not claiming it as a pass. `outcome` defaults
+to `"done"`, so a worker written before this field existed keeps working
+unchanged. Re-sending the identical report is idempotent and writes nothing new;
+sending a *different* reason for a task that is already blocked answers 400.
+
+A blocked merge stops its product's train, and that is the intended behaviour:
+everything behind it would be rebasing onto a main line that is still waiting.
+`GET /api/control` carries the reason on the blocked merge's row in
+`pending_merges`, under `verification`, so a screen can name the jam from that
+one payload.
+
+**How a merge ended is its worker's report, not a press.** `done` and `blocked`
+are outcomes, and both are refused on an `instant:merge` task with 400 and code
+`invalid`, on `POST /api/tasks/{id}/status` and the MCP `task_set_status` tool
+alike; neither appears in `available_transitions`. A pressed `blocked` would
+stop the product's train with no reason and no checks written on the row. A
+pressed `done` would skip the check gate and the target landing in one go,
+leaving approved work that never merged and that neither reconciliation window
+shows — `pending_merges` stops at `done`, and `mergeable` still sees a live
+merge holding the target. `wip` stays pressable, because it is not an outcome:
+it says the attempt is running, exactly as a claim does, and `cancelled` and
+`dropped` still release it. Ordinary `normal` work is unaffected and still takes
+`done` and `blocked` by hand.
+
+**A blocked merge is called off and reissued, never restarted.** Press
+`cancelled` or `dropped` on it — that releases the train and frees the target —
+and the merge for that work is issued again as a fresh attempt,
+`merge:<id>~2`. Pressing `ready` on it is refused with 400 and code `invalid`,
+on `POST /api/tasks/{id}/status` and the MCP `task_set_status` tool alike, and
+`available_transitions` on a blocked merge is exactly `["cancelled", "dropped"]`.
+Handing that row back to a worker would restart an attempt that still carries
+the last run's reason and checks, pinned to a commit whose main line has since
+moved. (Ordinary `normal` work that is `blocked` is unaffected: it still returns
+to `ready` by hand.)
 
 Green checks are not the whole gate. The merge carries the commit it was issued
 for, and landing it is confirmed against the task in that same transaction: the
@@ -275,8 +363,8 @@ task has to be still `approved` *and* still standing on that commit. Work that
 was taken back, redone on another commit, and approved again is refused with 409
 and code `merge_subject_changed`, and neither the merge nor the task moves —
 `approved` on its own never says which commit was approved, and the old merge
-read one nobody signed off. Cancel it and issue a merge for the commit the
-review actually approved.
+read one nobody signed off. Cancel it, and the work becomes a merge candidate
+again for the commit the review actually approved.
 
 Merged work then piles up per product. For a product with `releases` set,
 `GET /api/control` reports how much is waiting, and `POST /api/releases` stamps

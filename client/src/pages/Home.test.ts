@@ -19,6 +19,18 @@ type Summary = {
   updated_at: string;
 };
 
+// A pending merge is a summary plus the reason it stopped, which is how
+// /api/control sends it: the queue and the jam arrive together.
+type PendingMerge = Summary & { verification: string | null };
+
+type Plane = {
+  mergeable: Summary[];
+  pending_merges: PendingMerge[];
+  pending_reviews: Summary[];
+  unreviewed: Summary[];
+  releasable: { product_id: string; task_count: number }[];
+};
+
 const PRODUCT = "sunny-side/task-server";
 
 function summary(
@@ -26,15 +38,28 @@ function summary(
   status: string,
   kind = "normal",
   title = `task ${id}`,
+  productId = PRODUCT,
 ): Summary {
   return {
     id,
     title,
     status,
     kind,
-    product_id: PRODUCT,
+    product_id: productId,
     priority: 0,
     updated_at: "2026-08-15T12:00:00Z",
+  };
+}
+
+function pendingMerge(
+  id: string,
+  status = "ready",
+  verification: string | null = null,
+  productId = PRODUCT,
+): PendingMerge {
+  return {
+    ...summary(id, status, "instant:merge", `merge ${id}`, productId),
+    verification,
   };
 }
 
@@ -52,7 +77,17 @@ const TASKS: Summary[] = [
   summary("t-done", "done"),
 ];
 
-const EMPTY_PLANE = { mergeable: [], pending_merges: [], releasable: [] };
+const EMPTY_PLANE: Plane = {
+  mergeable: [],
+  pending_merges: [],
+  pending_reviews: [],
+  unreviewed: [],
+  releasable: [],
+};
+
+function plane(over: Partial<Plane> = {}): Plane {
+  return { ...EMPTY_PLANE, ...over };
+}
 
 function jsonResponse(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
@@ -64,7 +99,6 @@ function jsonResponse(payload: unknown, status = 200): Response {
 interface Scenario {
   control?: () => Response | Promise<Response>;
   tasks?: () => Response | Promise<Response>;
-  merge?: (taskId: string) => Response | Promise<Response>;
   release?: (body: { product_id: string; tag: string }) => Response;
 }
 
@@ -75,13 +109,14 @@ function stubFetch(scenario: Scenario) {
     if (url === "/api/control" && method === "GET") {
       return (scenario.control ?? (() => jsonResponse(EMPTY_PLANE)))();
     }
-    if (url.startsWith("/api/tasks") && method === "GET") {
+    if (url === "/api/tasks" && method === "GET") {
       return (scenario.tasks ?? (() => jsonResponse(TASKS)))();
     }
-    if (url === "/api/merges" && method === "POST") {
-      const body = JSON.parse(String(init?.body)) as { task_id: string };
-      return (scenario.merge ?? ((id: string) => jsonResponse({ id }, 201)))(
-        body.task_id,
+    // The top page reads the queue and the list, and nothing card by card.
+    // A per-card request here is the extra round trip this page must not make.
+    if (url.startsWith("/api/tasks/") && method === "GET") {
+      throw new Error(
+        `unexpected task card request: ${decodeURIComponent(url.slice("/api/tasks/".length))}`,
       );
     }
     if (url === "/api/releases" && method === "POST") {
@@ -109,6 +144,12 @@ function callsTo(
   return fetchMock.mock.calls.filter(
     ([input, init]) =>
       String(input) === url && (init?.method ?? "GET") === method,
+  );
+}
+
+function writes(fetchMock: ReturnType<typeof stubFetch>) {
+  return fetchMock.mock.calls.filter(
+    ([, init]) => (init?.method ?? "GET") !== "GET",
   );
 }
 
@@ -146,13 +187,11 @@ describe("Home", () => {
 
   it("the two regions load and fail independently", async () => {
     // The list request fails; the control panel must still work.
-    const listDown = stubFetch({
+    stubFetch({
       control: () =>
-        jsonResponse({
-          mergeable: [summary("t-done", "done")],
-          pending_merges: [],
-          releasable: [],
-        }),
+        jsonResponse(
+          plane({ releasable: [{ product_id: PRODUCT, task_count: 1 }] }),
+        ),
       tasks: () => Promise.reject(new Error("offline")),
     });
 
@@ -165,12 +204,10 @@ describe("Home", () => {
     );
     await waitFor(() => expect(region("tasks").dataset.state).toBe("error"));
 
-    const merge = screen.getByRole("button", { name: "merge" });
-    expect(merge.getAttribute("aria-disabled")).toBeNull();
-    await fireEvent.click(merge);
-    await waitFor(() =>
-      expect(callsTo(listDown, "/api/merges", "POST")).toHaveLength(1),
-    );
+    const release = screen.getByRole("button", { name: "release" });
+    expect(release.getAttribute("aria-disabled")).toBeNull();
+    await fireEvent.click(release);
+    expect(screen.getByRole("dialog")).toBeTruthy();
 
     cleanup();
     vi.unstubAllGlobals();
@@ -207,41 +244,17 @@ describe("Home", () => {
     ).toBe("/tasks/t-ready-1");
   });
 
-  it("merge issues one request per candidate and reports partial failure", async () => {
-    const mergeable = [
-      summary("t-a", "done"),
-      summary("t-b", "done"),
-      summary("t-c", "done"),
-    ];
-    let controlCalls = 0;
+  it("sends nothing but GETs, however much is mergeable", async () => {
     const fetchMock = stubFetch({
-      control: () => {
-        controlCalls += 1;
-        return controlCalls === 1
-          ? jsonResponse({
-              mergeable,
-              pending_merges: [],
-              releasable: [],
-            })
-          : jsonResponse({
-              mergeable: [summary("t-b", "done")],
-              pending_merges: [
-                summary("m-a", "ready", "instant:merge"),
-                summary("m-c", "ready", "instant:merge"),
-              ],
-              releasable: [],
-            });
-      },
-      merge: (taskId) =>
-        taskId === "t-b"
-          ? jsonResponse(
-              {
-                error: "task t-b already has a merge in flight",
-                code: "conflict",
-              },
-              409,
-            )
-          : jsonResponse({ id: `m-${taskId}` }, 201),
+      control: () =>
+        jsonResponse(
+          plane({
+            mergeable: [summary("t-a", "approved"), summary("t-b", "approved")],
+            pending_merges: [pendingMerge("m-1")],
+            pending_reviews: [summary("r-1", "ready", "review")],
+            releasable: [{ product_id: PRODUCT, task_count: 1 }],
+          }),
+        ),
     });
 
     render(Home);
@@ -249,63 +262,129 @@ describe("Home", () => {
       expect(region("control").dataset.state).toBe("success"),
     );
 
-    await fireEvent.click(screen.getByRole("button", { name: "merge" }));
+    // Every enabled button on the page, pressed. Mergeable work is drawn, and
+    // there is nothing on the page that would act on it.
+    const buttons = screen
+      .getAllByRole("button")
+      .filter((button) => button.getAttribute("aria-disabled") !== "true");
+    expect(buttons.map((button) => button.textContent?.trim())).toEqual([
+      "release",
+    ]);
+    for (const button of buttons) {
+      await fireEvent.click(button);
+    }
 
-    await waitFor(() =>
-      expect(callsTo(fetchMock, "/api/merges", "POST")).toHaveLength(3),
-    );
-    const sent = callsTo(fetchMock, "/api/merges", "POST").map(
-      ([, init]) =>
-        (JSON.parse(String(init?.body)) as { task_id: string }).task_id,
-    );
-    expect(sent.sort()).toEqual(["t-a", "t-b", "t-c"]);
+    expect(writes(fetchMock)).toHaveLength(0);
+    // Not on the page, and not in the modal the one button opened either.
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    for (const button of screen.getAllByRole("button")) {
+      expect(button.textContent?.toLowerCase()).not.toContain("merge");
+    }
+  });
 
-    await waitFor(() => {
-      const alert = screen.getByRole("alert");
-      expect(alert.textContent).toContain("2");
-      expect(alert.textContent).toContain("already has a merge in flight");
+  it("leaves the tasks the panel draws out of the status groups", async () => {
+    stubFetch({
+      control: () =>
+        jsonResponse(
+          plane({
+            pending_reviews: [
+              summary("r-1", "ready", "review", "レビュー: t-done"),
+            ],
+            unreviewed: [summary("t-done", "done")],
+            mergeable: [summary("t-approved", "approved")],
+          }),
+        ),
+      tasks: () =>
+        jsonResponse([
+          ...TASKS,
+          summary("r-1", "ready", "review", "レビュー: t-done"),
+          summary("t-approved", "approved"),
+        ]),
     });
 
-    // Both regions reload once the batch settles, whatever the outcome.
+    render(Home);
+    await waitFor(() =>
+      expect(region("control").dataset.state).toBe("success"),
+    );
+    await waitFor(() => expect(region("tasks").dataset.state).toBe("success"));
+
+    const list = region("tasks");
+    for (const id of ["r-1", "t-done", "t-approved", "m-1"]) {
+      expect(list.querySelector(`a[href="/tasks/${id}"]`)).toBeNull();
+    }
+    // Each of them has exactly one home, and it is on the panel.
+    const panel = region("control");
+    for (const id of ["r-1", "t-done", "t-approved"]) {
+      expect(panel.querySelectorAll(`a[href="/tasks/${id}"]`)).toHaveLength(1);
+    }
+    // Untouched work still stands in its group.
+    expect(list.querySelector('a[href="/tasks/t-ready-2"]')).not.toBeNull();
+  });
+
+  it("shows a blocked head's cause off the control payload, asking nothing else", async () => {
+    let jammed = true;
+    const fetchMock = stubFetch({
+      control: () =>
+        jsonResponse(
+          plane({
+            pending_merges: [
+              jammed
+                ? pendingMerge(
+                    "m-1",
+                    "blocked",
+                    "rebase conflict:\n  src/task.rs",
+                  )
+                : pendingMerge("m-1"),
+              pendingMerge("m-2"),
+              pendingMerge("m-9", "ready", null, "sunny-side/other"),
+            ],
+          }),
+        ),
+    });
+
+    render(Home);
+    await waitFor(() =>
+      expect(region("control").dataset.state).toBe("success"),
+    );
+
+    const reason = document.querySelector("[data-reason]");
+    expect(reason?.textContent).toContain("src/task.rs");
+    expect(region("control").textContent).toContain("後続 1 件が待機中");
+    // The reason rides along with the queue, so nothing is fetched per card:
+    // there is no second request to fail on its own, and none to land out of
+    // order over a newer one.
+    for (const id of ["m-1", "m-2", "m-9"]) {
+      expect(callsTo(fetchMock, `/api/tasks/${id}`)).toHaveLength(0);
+    }
+    expect(callsTo(fetchMock, "/api/control")).toHaveLength(1);
+    expect(writes(fetchMock)).toHaveLength(0);
+
+    // A jam that clears takes its reason with it: the panel holds no cause of
+    // its own that a later payload would have to remember to overwrite.
+    jammed = false;
+    setVisibility("hidden");
+    setVisibility("visible");
     await waitFor(() =>
       expect(callsTo(fetchMock, "/api/control")).toHaveLength(2),
     );
     await waitFor(() =>
-      expect(callsTo(fetchMock, "/api/tasks")).toHaveLength(2),
+      expect(document.querySelector("[data-reason]")).toBeNull(),
     );
-
-    cleanup();
-    vi.unstubAllGlobals();
-
-    const idle = stubFetch({ control: () => jsonResponse(EMPTY_PLANE) });
-    render(Home);
-    await waitFor(() => expect(region("control").dataset.state).toBe("empty"));
-
-    const disabled = screen.getByRole("button", { name: "merge" });
-    expect(disabled.getAttribute("aria-disabled")).toBe("true");
-    expect(disabled.hasAttribute("disabled")).toBe(false);
-    const describedBy = disabled.getAttribute("aria-describedby");
-    expect(describedBy).toBeTruthy();
-    expect(
-      document.getElementById(String(describedBy))?.textContent?.trim(),
-    ).toBeTruthy();
-
-    await fireEvent.click(disabled);
-    expect(callsTo(idle, "/api/merges", "POST")).toHaveLength(0);
+    expect(region("control").textContent).not.toContain("src/task.rs");
   });
 
   it("release posts product and tag, and keeps the modal open on refusal", async () => {
     let refuse = true;
     const fetchMock = stubFetch({
       control: () =>
-        jsonResponse({
-          mergeable: [],
-          pending_merges: [],
-          releasable: [
-            { product_id: "sunny-side/one", task_count: 2 },
-            { product_id: "sunny-side/two", task_count: 3 },
-          ],
-        }),
+        jsonResponse(
+          plane({
+            releasable: [
+              { product_id: "sunny-side/one", task_count: 2 },
+              { product_id: "sunny-side/two", task_count: 3 },
+            ],
+          }),
+        ),
       release: (body) =>
         refuse
           ? jsonResponse(

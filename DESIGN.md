@@ -161,10 +161,11 @@ Task Server is the household **task control plane**. It ships the Sumi
 app shell — header, menu, theme system, an operator top page and a Task
 Card detail page — so a human can read a card (body, verification,
 commit) and press an action, while workers claim and report over HTTP.
-The top page is where the two screen-level moves live: **merge** (issue
-the instant tasks that land finished work) and **release** (ship the
-landed work of one product under a tag), over the open work grouped by
-status.
+The top page is where the one screen-level move lives: **release** (ship
+the landed work of one product under a tag), over the stretch of pipeline
+the server carries by itself — review, then merge — and the open work
+grouped by status. Review and merge are issued automatically, so
+**release is the only decision this UI asks a human to make**.
 
 The personality is **calm, quiet, and tool-like**: content first, chrome
 recedes into neutral ink tones, color only where it means something. The
@@ -282,7 +283,7 @@ The shell stacks three rows:
 3. **Main content**, the only scrolling region.
 
 **Screen-level controls are content, not chrome.** A screen that offers
-actions on the whole screen's subject — the top page's merge and release
+actions on the whole screen's subject — the top page's release
 — places them as the **first block inside the content column**. It is
 never a third band, never sticky, and never full-width: the two bands
 above stay the only bands, and main content stays the only scrolling
@@ -425,7 +426,7 @@ launchers.
 
 - **`name` is `Task Server`** — the same string as `<title>`.
 - **`short_name` is `Task`**, the launcher label. `task` is the noun this
-  Japanese UI already uses untranslated ("merge 可能な task はありません"),
+  Japanese UI already uses untranslated ("review が発行されていない task"),
   so the label speaks the UI's register without inventing a katakana
   translation, and four characters never truncate or wrap where
   `Task Server` sits at the 12-character ceiling. The full name still
@@ -481,58 +482,131 @@ counterpart to carry, so it earns no token pair.
   theme change live. Close via ×, Esc, or scrim; focus returns to the
   hamburger.
 - **Top page — control panel over the task list.** The operator's
-  screen: one panel of screen-level controls, then the open work grouped
-  by status. It reads two sources — the control plane (what is
-  mergeable, what merges are already in flight, what is releasable) and
-  the task list — and **each region carries its own
-  `data-state`**, so a failure or an emptiness on one side never masks
-  the other.
+  screen: one panel over the open work grouped by status. It reads two
+  sources — the control plane and the task list — and **each region
+  carries its own `data-state`**, so a failure or an emptiness on one
+  side never masks the other.
 
-  **Control panel.** The first block of the content column, built from
-  the card recipe (surface-raised, 1px hairline, md radius, 10px
-  padding), `--sp-3` between its rows. It holds two control rows, each a
-  button beside a note that explains the button's current standing:
+  **What the panel is.** Review and merge are issued by the server, so
+  the panel is no longer "the screen's controls". It is **the automated
+  stretch of the pipeline plus the one human decision that ends it**: the
+  release control, then what the machine is carrying — reviews waiting,
+  the merge trains, and anything the automation failed to carry. The task
+  list below it is the work still waiting for a human or a worker to pick
+  up.
 
-  - **merge** — issues a merge task for every currently mergeable task,
-    one request per task, with **no confirmation step**: nothing is
-    chosen, so nothing is asked. It is the top page's **single primary
-    (accent-filled) button, and only while it is enabled**; with nothing
-    to merge it wears the default treatment plus the disabled one.
-  - **release** — a **default button, never accent-filled**, that opens
-    the release modal. Merge is the routine daily move and release is
-    the occasional one, so merge takes the page's one accent fill and
-    release takes its own inside the modal it opens.
+  The panel is the first block of the content column, built from the card
+  recipe (surface-raised, 1px hairline, md radius, 10px padding), `--sp-3`
+  between its blocks, and it is read top-down: **what you can do**, then
+  **what is being carried for you**.
 
-  Each note takes one of exactly two shapes: the **count pill** (badge
-  recipe, full radius) of what the button would act on when that count
-  is above zero, or the **muted caption naming the reason** when it is
-  zero — "merge 可能な task はありません" / "release 可能な product は
-  ありません". A disabled control always says why in text beside it and
-  points at that text with `aria-describedby`; opacity alone never
-  carries the reason.
+  **Control row — release.** One row: a button beside a note that
+  explains the button's current standing. It opens the release modal and
+  it is the top page's **single primary (accent-filled) button, and only
+  while it is enabled**; with nothing releasable it wears the default
+  treatment plus the disabled one.
 
-  When merges are in flight, the panel carries them below the rows: a
-  muted caption ("merge 進行中") over the ordinary card list of those
-  merge tasks. **A merge in flight is the state of the control, not open
-  work** — it appears here and nowhere in the status groups.
+  **The page's one accent marks the human decision point, not the
+  frequent move.** The earlier reading — merge is the routine daily move,
+  so merge takes the accent — died with the merge button: the server
+  issues merges now, and a control the operator never presses cannot be a
+  page's primary. Release is the only place the pipeline stops and asks a
+  person, so the accent sits there, and it stays there however routine
+  release later becomes. A move the machine makes never takes the accent
+  back.
 
-  The panel exposes `data-state="loading|empty|error|success"` on the
-  same discipline as the list: _loading_ is the centered spinner line
-  with no control rows rendered (never a button that might be showing
-  the wrong standing); _error_ is the danger body-sm line plus a default
-  retry button; _empty_ — nothing mergeable, nothing pending, nothing
-  releasable — still renders **both buttons, both disabled, both with
-  their reason**, because a control that vanishes when idle teaches
-  nothing about what would bring it back; _success_ is the panel above.
+  The note takes one of exactly two shapes: the **count pill** (badge
+  recipe, full radius) of what the button would act on when that count is
+  above zero, or the **muted caption naming the reason** when it is zero
+  — "release 可能な product はありません". A disabled control always says
+  why in text beside it and points at that text with `aria-describedby`;
+  opacity alone never carries the reason.
 
   **Result line.** One live region (`aria-live="polite"`) directly under
-  the control rows reports the outcome of the last control action: the
-  spinner line while an action is in flight, a muted caption on success
-  ("merge task を 3 件発行しました"), and the error-banner recipe with
-  `role="alert"` on failure. It persists until the next action —
-  **there is no toast, no timer, and no auto-dismissing message
-  anywhere in this product**. Every successful action reloads both
-  regions, so the changed counts and lists are the real receipt.
+  the control row reports the outcome of the last control action: the
+  spinner line while an action is in flight, a muted caption on success,
+  and the error-banner recipe with `role="alert"` on failure. It persists
+  until the next action — **there is no toast, no timer, and no
+  auto-dismissing message anywhere in this product**. Every successful
+  action reloads both regions, so the changed counts and lists are the
+  real receipt.
+
+  **Readouts, and when they exist.** Below the result line the panel
+  draws what the server is carrying, in pipeline order: the review queue,
+  the merge trains, then reconciliation. Each is a muted caption with its
+  count pill beside it over the ordinary card list, exactly like a
+  status-group heading, and **a readout holding nothing is not rendered
+  at all**, caption included — the status-group rule, for the same
+  reason. A **control** is the opposite: it renders even when it can do
+  nothing, because a control that vanishes when idle teaches nothing
+  about what would bring it back. That difference is the whole rule for
+  what the panel shows when it is quiet.
+
+  A readout has no status heading over it, so **its cards wear the
+  neutral outline status badge** beside the product id; a status-group
+  card does not, because its heading already says it.
+
+  **Review queue.** The pending `review` tasks, under the caption "review
+  待ち". This is normal running: in a healthy pipeline the queue is
+  usually non-empty and it means nothing is wrong. It is drawn here
+  because a review waiting for a reviewer is the machine's stretch of the
+  pipeline, not the operator's work.
+
+  **Merge trains.** The outstanding merge tasks, **grouped by product**,
+  because the train is per product — one product's jam never holds
+  another's, and a single flat list would say the opposite. Each group is
+  captioned by its product id with its count pill, and its cards sit in
+  issue order, so the first card is the head: the merge that is or will
+  be claimed. **The panel writes no caption that duplicates a status** —
+  the head wears its status badge like every other readout card — so the
+  old "merge 進行中" caption is gone. It was true only while nothing was
+  blocked.
+
+  A head in `blocked` is the one thing that must not read as mere
+  slowness. Its card carries, under the title, **the reason as body-sm
+  text** with `white-space: pre-line`, and the group adds **one muted
+  caption naming how many tasks wait behind it** ("後続 2 件が待機中"),
+  rendered only when at least one card follows the head. A named cause
+  and a named cost are what separate a stuck train from a quiet one. It
+  stays **neutral**: a rebase conflict or a failing check is an ordinary
+  outcome of landing work, not a failure of the app — exactly as a
+  review's `request_changes` is — so the danger tokens do not enter here.
+
+  **Reconciliation.** The work the automation should be carrying and is
+  not: tasks that are `done` with no live review, and tasks that are
+  `approved` with no live merge. Both sets are empty in a healthy
+  pipeline, which is what makes them a different kind of thing from the
+  queues above and forbids giving them the same look. This is the panel's
+  **one danger-framed block**: the error-banner recipe (danger text on
+  `danger-subtle`, sm radius, 8px padding, body-sm) carrying
+  `role="status"` — a standing state the operator has to notice, not the
+  outcome of a request they just made, so never `role="alert"`. It holds
+  one captioned line with its count pill per non-empty set — "review が
+  発行されていない task" / "merge が発行されていない task" — and under
+  each the ordinary card list, whose cards keep the neutral card recipe:
+  **the danger tint frames the fact that the pipeline is holding work,
+  and never tints the tasks themselves**, which are ordinary work. This
+  is the single extension of the danger tokens past "a request failed",
+  and it is earned: the automation dropping work silently is the only
+  other thing in this product that must never go unread.
+
+  Reconciliation is also where the **cancelled blocked merge** surfaces.
+  Cancelling a blocked merge frees the rest of that product's train, but
+  its target is not re-issued — it falls back to `approved` with no merge
+  and appears here until a human moves it. **The panel states that as
+  state, never as instruction**: no sentence on this screen tells the
+  operator what to do next. Procedure belongs to the README; the screen's
+  only duty is that the stranded task cannot be missed.
+
+  **Panel states.** The panel exposes
+  `data-state="loading|empty|error|success"` on the same discipline as
+  the list: _loading_ is the centered spinner line with no control row
+  rendered (never a button that might be showing the wrong standing);
+  _error_ is the danger body-sm line plus a default retry button; _empty_
+  — nothing releasable, nothing pending, nothing stranded — still renders
+  **the release button, disabled, with its reason**, because a control
+  that vanishes when idle teaches nothing about what would bring it back;
+  _success_ is the panel above.
 
   **Task list.** Below the panel, the open tasks grouped by status.
   Groups follow the status vocabulary order — the main line `draft`,
@@ -546,16 +620,16 @@ counterpart to carry, so it earns no token pair.
 
   **What the list hides, and why.** The list shows every task that is
   waiting for someone to pick it up, and hides exactly one thing: work
-  another region of this same page already renders. `instant:merge`
-  tasks are hidden because the control panel draws them as merges in
-  flight, and one object drawn twice on one screen reads as two.
-  Nothing else is hidden. In particular a **`review` task appears in
-  its status group like any other open work**: it is a job waiting for
-  a reviewer to claim, no region of this page draws it, and hiding it
-  would leave an unclaimed review with no surface anywhere in the UI.
-  If a later delivery gives the panel a region that renders reviews,
-  this same rule moves them out of the groups — the question is
-  settled by that rule, not re-opened as a matter of taste.
+  another region of this same page already renders. That rule was written
+  to settle this question once, and it now settles it the other way than
+  it first did — the panel draws pending `review` tasks as the review
+  queue, `instant:merge` tasks as the merge trains, and stranded tasks in
+  reconciliation, so **none of those appear in a status group**. One
+  object drawn twice on one screen reads as two. Nothing else is hidden.
+  A `review` task the panel no longer draws, because it is no longer
+  pending, falls back into its status group like any other task and
+  carries its kind badge there. The rule decides this; taste does not
+  re-open it.
 
   Each group is a section carrying its status as a data attribute,
   headed by a label-type heading naming the status with its count pill
@@ -566,10 +640,11 @@ counterpart to carry, so it earns no token pair.
   heading already carries the status, so the card does not repeat it. A
   task whose kind is not `normal` adds the **outline kind badge** (the
   Task Card's recipe — caption type, 1px border, muted text) beside the
-  product id, so open implementation work and open review work are told
-  apart without parsing titles; a `normal` task carries no badge, and
-  the badge never adds a second focus stop inside the card link. The
-  list container keeps `data-state="loading|empty|error|success"`:
+  product id, so a task the panel is not drawing is still told apart
+  from ordinary implementation work without parsing titles; a `normal`
+  task carries no badge, and the badge never adds a second focus stop
+  inside the card link. The list container keeps
+  `data-state="loading|empty|error|success"`:
   - _loading:_ centered muted body-sm text with the accent spinner
     (1.5px-stroke circle, 1.1rem);
   - _empty:_ centered muted body-sm message;
@@ -594,7 +669,8 @@ counterpart to carry, so it earns no token pair.
   - The action row is キャンセル (default) and the confirm
     (accent-filled). **An open modal is its own primary region**, so
     this confirm is the modal's single accent fill and does not compete
-    with the merge button behind the scrim.
+    with the release button that opened it, still accent-filled behind
+    the scrim in the page's own region.
   - A refused release keeps the modal open **with the typed tag
     intact** and shows the server's message in the error-banner recipe
     inside the modal — a rejected tag is corrected where it was typed.
@@ -722,24 +798,26 @@ counterpart to carry, so it earns no token pair.
   10. On the top page the content column's first element child is the
       control panel and the task list follows it. Each carries its own
       `data-state`; forcing the list request to fail leaves the panel at
-      `success` with working buttons, and forcing the control request to
+      `success` with a working control row, and forcing the control request to
       fail leaves the list rendering its groups.
-  11. With at least one mergeable task, the page region contains exactly
-      one accent-filled control and it is the merge button: its computed
-      background equals the accent (`rgb(94, 184, 199)` in Sumi,
-      `rgb(47, 111, 126)` in Kinari). Its note is a pill whose text is
-      the mergeable count and whose computed `border-radius` is 9999px.
-  12. With nothing mergeable, the merge button's computed background
+  11. With at least one releasable product, the page region contains
+      exactly one accent-filled control and it is the release button: its
+      computed background equals the accent (`rgb(94, 184, 199)` in Sumi,
+      `rgb(47, 111, 126)` in Kinari). Its note is a pill whose text is the
+      releasable count and whose computed `border-radius` is 9999px.
+  12. With nothing releasable, the release button's computed background
       equals surface-raised rather than the accent, `aria-disabled` is
-      `"true"`, `opacity` computes to 0.5, `cursor` is `not-allowed`,
-      Tab still lands on it and shows the 2px accent focus ring, the
-      element its `aria-describedby` names is visible with non-empty
-      text, and pressing it fires no request and changes no count.
-  13. Pressing an enabled merge sends exactly one POST per mergeable
-      task; afterwards the mergeable count has dropped to zero, the
-      pending-merge card list has grown by that same number, and the
-      result line (`aria-live="polite"`) is non-empty. At no point does
-      a card for an `instant:merge` task appear inside any status group.
+      `"true"`, `opacity` computes to 0.5, `cursor` is `not-allowed`, Tab
+      still lands on it and shows the 2px accent focus ring, the element
+      its `aria-describedby` names is visible with non-empty text, and
+      activating it by click and by Enter opens no modal and fires no
+      request.
+  13. The top page issues no merge. The panel's control rows hold exactly
+      one button, its accessible name is `release`, and no `<button>` on
+      the page or in an open modal is named for merge. With the control
+      plane reporting mergeable tasks, loading the page and activating
+      every enabled button outside the release modal sends no request
+      with a method other than GET.
   14. The release modal opens centered per the modal geometry with the
       tag input holding focus; its confirm button is `aria-disabled`
       while the tag is blank or whitespace and drops the attribute once
@@ -761,13 +839,14 @@ counterpart to carry, so it earns no token pair.
       heading's count pill number equals the number of cards under it;
       `9999px` radius is computed only on count pills and outline
       badges.
-  17. At 375px the panel's buttons and notes wrap without
+  17. At 375px the panel's button, notes, and readouts wrap without
       `document.documentElement.scrollWidth` exceeding the viewport,
-      every control's hit box is at least 36px tall, and no control row
-      overlaps another (bounding boxes disjoint). At 900px the content
-      column computes to 720px wide with 12px left and right padding and
-      equal left/right margins (±1px), and the panel — its child —
-      computes to 696px.
+      every control's hit box is at least 36px tall, and no two blocks of
+      the panel — control row, result line, review queue, merge trains,
+      reconciliation — overlap (bounding boxes disjoint). At 900px the
+      content column computes to 720px wide with 12px left and right
+      padding and equal left/right margins (±1px), and the panel — its
+      child — computes to 696px.
   18. Every install asset is really served, not swallowed by the SPA
       fallback: the static server answers unknown paths with
       `index.html`, so a missing file still returns 200. `GET
@@ -801,12 +880,15 @@ counterpart to carry, so it earns no token pair.
       clip (no ink lost) and the ink bounding box is at least 28px wide
       of the 48, so what remains is the whole check rather than a
       fragment.
-  22. Open review is visible work: with a `review` task in `ready`, the
-      `ready` group contains a card linking to it, and that card carries
-      an outline badge reading `review` beside the product id while a
+  22. Non-`normal` work has exactly one home on the top page. While a
+      `review` task is pending, a card for it exists in the review queue
+      and in no status group; once it is no longer pending it appears in
+      its status group carrying the outline kind badge `review`, while a
       `normal` task's card carries no kind badge. No status group ever
-      contains a card for an `instant:merge` task. Tabbing through a
-      card reaches exactly one focusable element — the card link itself.
+      contains a card for an `instant:merge` task. Tabbing through any
+      card — in a status group, the review queue, a merge train, or the
+      reconciliation block — reaches exactly one focusable element, the
+      card link itself.
   23. `approved` is a status the UI reads and never writes: on a `done`
       task's Task Card no transition button's text is `approved`, and
       across the top page and any open modal no control's text is
@@ -824,6 +906,37 @@ counterpart to carry, so it earns no token pair.
       leave `document.documentElement.scrollWidth` within the viewport.
       A `review` task's card shows its subject commit as a muted
       caption.
+  25. Readouts exist only when they hold something, controls always.
+      With at least one pending `review` task the panel renders the
+      review queue: a muted caption whose count pill number equals the
+      number of cards under it, each card linking to its review task and
+      wearing the neutral outline status badge that a status-group card
+      does not. With no pending review the queue is absent from the DOM
+      entirely — no caption, no empty message — while the release button
+      is still rendered with its reason.
+  26. Merge trains are per product and a jam is legible. With merges
+      outstanding on two products the panel renders one group per
+      product, each captioned by its product id with a count pill equal
+      to its cards, cards in issue order. A head in `blocked` carries the
+      neutral outline status badge, its reason as body-sm text preserving
+      newlines (`white-space` is `pre-line`), and — when at least one
+      card follows it — a muted caption naming how many wait behind;
+      with no follower that caption is absent. Blocking one product's
+      head leaves the other product's group unchanged. No text color or
+      background inside a train computes to the danger pair, and no
+      caption in a train has a status name as its text. At 375px a reason
+      holding a 40-character unbroken token still leaves
+      `document.documentElement.scrollWidth` within the viewport.
+  27. Reconciliation is framed as the anomaly it is. With nothing
+      stranded the block is absent from the DOM. With a `done` task
+      holding no live review, or an `approved` task holding no live
+      merge, it renders once, computes danger text on a `danger-subtle`
+      background, carries `role="status"` and never `role="alert"`, and
+      holds one captioned line per non-empty set whose count pill equals
+      the cards under it; those cards compute the ordinary card recipe
+      (surface-raised background, 1px border, 8px radius) and appear in
+      no status group. Cancelling a `blocked` merge and reloading leaves
+      that merge out of every train and its target inside this block.
 
 ## Do's and Don'ts
 
@@ -834,6 +947,21 @@ counterpart to carry, so it earns no token pair.
 - Do keep exactly one accent-filled primary action per region — one on
   the page, one inside an open modal; don't dim an accent fill to say
   "disabled", drop it to the default treatment instead.
+- Do let the page's one accent mark the point where the pipeline stops and
+  asks a human; don't hand it to whichever move happens most often, and
+  don't leave it on a control the operator no longer presses.
+- Do render a readout only while it holds something, and a control always,
+  with its reason when it can do nothing; don't ship an empty readout with
+  a zero pill, and don't let a control disappear when it is idle.
+- Do reserve the danger tokens for a request that failed and for the
+  pipeline holding work the automation should have carried; don't tint a
+  `blocked` merge or a `request_changes` review — those are ordinary
+  outcomes of the work.
+- Do show a stalled merge train's cause and what it is holding — the
+  reason text and the count waiting behind the head; don't let a jam read
+  as ordinary slowness.
+- Do let the panel say what is true; don't put procedure on the screen —
+  what an operator should do about a stranded task belongs in the README.
 - Do name in text, beside the control, why a disabled control is
   disabled, and point at that text with `aria-describedby`; don't ship a
   control whose only signal is 50% opacity, and don't put an

@@ -32,7 +32,9 @@ use crate::error::Error;
 use crate::http::TaskSummary;
 use crate::product;
 use crate::state::AppState;
-use crate::task::{self, Check, NewTask, ReviewVerdict, Task, TaskKind, TaskPatch, TaskStatus};
+use crate::task::{
+    self, Check, NewTask, ReportOutcome, ReviewVerdict, Task, TaskKind, TaskPatch, TaskStatus,
+};
 
 /// What a client shows in its server list. `Implementation::from_build_env`
 /// reads the SDK's own manifest, so it would answer `rmcp` instead of us.
@@ -120,6 +122,10 @@ pub struct TaskReportArgs {
     /// only accepted when every one of them exited 0.
     #[serde(default)]
     pub checks: Vec<CheckArgs>,
+    /// `done` (the default) or `blocked`: the work could not be finished, and
+    /// `verification` is the reason. A blocked report is kept, not refused.
+    #[serde(default)]
+    pub outcome: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -343,7 +349,10 @@ impl Worker {
                        not a failure. A claimed task carries the `claim_id` task_report needs \
                        and the branch the work belongs on. Pass `kinds` to take only the work \
                        this loop handles, such as [\"review\"] for a reviewer; left out, \
-                       anything claimable."
+                       anything claimable. A merge is only handed out at the head of its \
+                       product's queue: merges of one product run one at a time, in the order \
+                       they were issued, because each rebases onto what the one before it \
+                       landed."
     )]
     fn task_claim(&self, Parameters(args): Parameters<TaskClaimArgs>) -> CallToolResult {
         let kinds = match args.kinds.as_deref() {
@@ -372,20 +381,30 @@ impl Worker {
     #[tool(
         description = "Report the finished work of a claim, moving the task to `done`. Reporting \
                        the same commit twice is accepted. A merge task is only accepted when \
-                       every check exited 0."
+                       every check exited 0. Finishing ordinary work issues the review that \
+                       reads it, in the same transaction. Pass outcome=\"blocked\" instead when \
+                       the work could not be finished — a rebase that conflicted, a check that \
+                       failed — and `verification` becomes the reason: the task is moved to \
+                       `blocked` with that reason and those checks kept, and whatever a merge \
+                       would have landed stays where it is."
     )]
     fn task_report(&self, Parameters(args): Parameters<TaskReportArgs>) -> CallToolResult {
         let checks: Vec<Check> = args.checks.into_iter().map(Check::from).collect();
+        let outcome = ReportOutcome::parse_optional(args.outcome.as_deref());
         answer(
-            task::report(
-                &self.state.db,
-                &args.claim_id,
-                &args.commit_sha,
-                &args.verification,
-                &checks,
-                self.state.clock.now(),
-            )
-            .and_then(|task| card(&self.state.db, &task)),
+            outcome
+                .and_then(|outcome| {
+                    task::report(
+                        &self.state.db,
+                        &args.claim_id,
+                        &args.commit_sha,
+                        &args.verification,
+                        &checks,
+                        outcome,
+                        self.state.clock.now(),
+                    )
+                })
+                .and_then(|task| card(&self.state.db, &task)),
         )
     }
 
@@ -398,8 +417,10 @@ impl Worker {
                        `review_subject_changed` when that task has moved on to another commit, \
                        `review_target_moved` when it is no longer waiting in `done`, and \
                        `review_subject_mismatch` when the commit named is not the one under \
-                       review. `request_changes` hands the task back to `ready` with the \
-                       findings on the record."
+                       review. An approval also issues the merge that lands the work, in that \
+                       same transaction, so nothing waits for a human afterwards. \
+                       `request_changes` hands the task back to `ready` with the findings on \
+                       the record."
     )]
     fn task_review_report(
         &self,

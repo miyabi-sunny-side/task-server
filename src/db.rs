@@ -158,6 +158,38 @@ PRAGMA user_version = 5;
 COMMIT;
 ";
 
+/// Version 6 adds the merge train: the order merges were issued in, per product.
+///
+/// A merge rebases its branch onto the main line, so two merges of one product
+/// cannot run at once and cannot run out of order — the second would be rebasing
+/// onto a main line the first has not written yet. The queue therefore hands out
+/// one merge per product at a time, in issue order, and that order needs a
+/// column of its own.
+///
+/// Neither of the two orders already on the row can carry it. `created_at` is
+/// written to the second, so two merges issued in the same second tie; the id is
+/// derived from the target's name, so it sorts alphabetically and puts `~10`
+/// before `~9`. `merge_sequence` is a single counter over the whole table rather
+/// than one per product: what a train needs is a strict order among *its own*
+/// merges, and a global counter gives every product that for free.
+///
+/// The backfill numbers the merges a database already holds by `created_at` and
+/// then by id — the only evidence history left — so an upgraded database comes
+/// out with a complete, distinct order instead of a column of `NULL`s that no
+/// comparison could rank. `NULL` survives only on rows that are not merges.
+const SCHEMA_V6: &str = "\
+BEGIN;
+ALTER TABLE tasks ADD COLUMN merge_sequence INTEGER;
+UPDATE tasks SET merge_sequence = (
+  SELECT count(*) FROM tasks AS earlier
+  WHERE earlier.kind = 'instant:merge'
+    AND (earlier.created_at < tasks.created_at
+         OR (earlier.created_at = tasks.created_at AND earlier.id <= tasks.id))
+) WHERE kind = 'instant:merge';
+PRAGMA user_version = 6;
+COMMIT;
+";
+
 /// How long a writer waits for a lock before giving up, in milliseconds.
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -314,6 +346,9 @@ fn migrate(conn: &Connection) -> Result<(), Error> {
     if version < 5 {
         conn.execute_batch(SCHEMA_V5)?;
     }
+    if version < 6 {
+        conn.execute_batch(SCHEMA_V6)?;
+    }
     Ok(())
 }
 
@@ -363,8 +398,9 @@ fn check_references(conn: &Connection) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use rusqlite::Connection;
+    use time::macros::datetime;
 
-    use super::{Db, SCHEMA_V1, SCHEMA_V2, SCHEMA_V4};
+    use super::{Db, SCHEMA_V1, SCHEMA_V2, SCHEMA_V4, SCHEMA_V5};
 
     fn pragma_string(db: &Db, pragma: &str) -> String {
         db.with_conn(|conn| Ok(conn.query_row(&format!("PRAGMA {pragma}"), [], |row| row.get(0))?))
@@ -455,11 +491,11 @@ mod tests {
         let named = Db::open(":memory:").unwrap();
         assert_eq!(pragma_string(&named, "journal_mode"), "memory");
         assert_eq!(pragma_int(&named, "busy_timeout"), 5000);
-        assert_eq!(user_version(&named), 5);
+        assert_eq!(user_version(&named), 6);
 
         let private = Db::open_in_memory().unwrap();
         assert_eq!(pragma_int(&private, "busy_timeout"), 5000);
-        assert_eq!(user_version(&private), 5);
+        assert_eq!(user_version(&private), 6);
 
         // A URI spelling is not one of them. Only the exact `:memory:` is
         // exempt, so a URI is an ordinary filename: it lands on disk in WAL,
@@ -499,16 +535,21 @@ mod tests {
             .collect()
     }
 
+    /// One task row without the columns a version later than the one under test
+    /// added. A migration test asks whether the step it names carried the row
+    /// across, and every step after it would otherwise show up as a difference.
+    fn row_before_later_versions(conn: &Connection, id: &str) -> Vec<(String, String)> {
+        task_row(conn, id)
+            .into_iter()
+            .filter(|(name, _)| !name.starts_with("review_") && name != "merge_sequence")
+            .collect()
+    }
+
     /// The rows of several tasks, without the columns a later version added:
     /// the version 3 rebuild is what is under test, not what came after it.
     fn rebuilt_rows(conn: &Connection, ids: [&str; 3]) -> Vec<Vec<(String, String)>> {
         ids.into_iter()
-            .map(|id| {
-                task_row(conn, id)
-                    .into_iter()
-                    .filter(|(name, _)| !name.starts_with("review_"))
-                    .collect()
-            })
+            .map(|id| row_before_later_versions(conn, id))
             .collect()
     }
 
@@ -537,7 +578,7 @@ mod tests {
     #[test]
     fn migration_creates_the_current_schema() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(user_version(&db), 5);
+        assert_eq!(user_version(&db), 6);
         let tables: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row(
@@ -568,7 +609,7 @@ mod tests {
         drop(db);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 5);
+        assert_eq!(user_version(&db), 6);
         let products: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row("SELECT count(*) FROM products", [], |row| row.get(0))?)
@@ -603,7 +644,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 5);
+        assert_eq!(user_version(&db), 6);
 
         let (title, status, priority, merge_target, checks): (
             String,
@@ -699,7 +740,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 5);
+        assert_eq!(user_version(&db), 6);
 
         db.with_conn(|conn| {
             let rows_after = rebuilt_rows(conn, ["t-target", "merge:t-target", "t-plain"]);
@@ -803,7 +844,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 5);
+        assert_eq!(user_version(&db), 6);
         let archived = |db: &Db| -> (usize, Option<String>) {
             db.with_conn(|conn| {
                 let columns = column_names(conn, "products");
@@ -828,7 +869,7 @@ mod tests {
         // column is not added twice and the row is not re-marked.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 5);
+        assert_eq!(user_version(&db), 6);
         assert_eq!(archived(&db), (1, None), "a second open changes nothing");
         let tasks: i64 = db
             .with_conn(|conn| {
@@ -1027,11 +1068,11 @@ mod tests {
                 && !columns.contains(&"review_verdict".to_owned()),
             "a version 4 database has no review columns yet"
         );
-        let row_before = task_row(&legacy, "t-old");
+        let row_before = row_before_later_versions(&legacy, "t-old");
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 5);
+        assert_eq!(user_version(&db), 6);
         db.with_conn(|conn| {
             let columns = column_names(conn, "tasks");
             for added in ["review_target_task_id", "review_verdict"] {
@@ -1050,10 +1091,7 @@ mod tests {
                 target.is_none() && verdict.is_none(),
                 "a row that predates the columns is unreviewed"
             );
-            let kept: Vec<(String, String)> = task_row(conn, "t-old")
-                .into_iter()
-                .filter(|(name, _)| !name.starts_with("review_"))
-                .collect();
+            let kept = row_before_later_versions(conn, "t-old");
             assert_eq!(kept, row_before, "no existing column may change");
             Ok(())
         })
@@ -1062,13 +1100,109 @@ mod tests {
         // Reopening runs the step again and must change nothing.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 5);
+        assert_eq!(user_version(&db), 6);
         let tasks: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?)
             })
             .unwrap();
         assert_eq!(tasks, 1, "a second open changes nothing");
+    }
+
+    /// Version 6 gives every merge task the position it holds in its product's
+    /// merge train. A database that already carries merges has to come out of the
+    /// migration with all of them numbered, or the first claim after an upgrade
+    /// would read a `NULL` order and let the train run in any sequence.
+    ///
+    /// History has only `created_at` and the id to go on, and both are known to
+    /// tie or to sort the wrong way — which is exactly why the column exists — so
+    /// the backfill is defined as "that order, made explicit and never consulted
+    /// again". What matters afterwards is that the numbers are distinct, dense,
+    /// and that the next issue continues past the highest of them.
+    #[test]
+    fn a_version_five_database_numbers_the_merges_it_already_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sqlite.db");
+
+        let legacy = Connection::open(&path).unwrap();
+        legacy.execute_batch(SCHEMA_V1).unwrap();
+        legacy.execute_batch(SCHEMA_V2).unwrap();
+        super::rebuild_tasks_without_the_product_key(&legacy).unwrap();
+        legacy.execute_batch(SCHEMA_V4).unwrap();
+        legacy.execute_batch(SCHEMA_V5).unwrap();
+        legacy
+            .execute_batch(
+                "INSERT INTO tasks (id, title, status, kind, product_id, created_at, updated_at)
+                 VALUES ('t-old', 'work', 'approved', 'normal', 'a/b', 'early', 'early');
+                 INSERT INTO tasks (id, title, status, kind, product_id, merge_target_task_id,
+                                    created_at, updated_at)
+                 VALUES ('merge:t-old', 'first', 'done', 'instant:merge', 'a/b', 't-old',
+                         'early', 'early');
+                 INSERT INTO tasks (id, title, status, kind, product_id, created_at, updated_at)
+                 VALUES ('t-new', 'work', 'approved', 'normal', 'a/b', 'late', 'late');
+                 INSERT INTO tasks (id, title, status, kind, product_id, merge_target_task_id,
+                                    created_at, updated_at)
+                 VALUES ('merge:t-new', 'second', 'ready', 'instant:merge', 'a/b', 't-new',
+                         'late', 'late');
+                 INSERT INTO tasks (id, title, status, kind, product_id, branch, commit_sha,
+                                    created_at, updated_at)
+                 VALUES ('t-fresh', 'work', 'approved', 'normal', 'a/b', 'task/t-fresh',
+                         'abc1234', 'later', 'later');",
+            )
+            .unwrap();
+        let before: i64 = legacy
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, 5, "the fixture must start at version 5");
+        assert!(
+            !column_names(&legacy, "tasks").contains(&"merge_sequence".to_owned()),
+            "a version 5 database has no merge order yet"
+        );
+        drop(legacy);
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(user_version(&db), 6);
+        let sequence = |db: &Db, id: &str| -> Option<i64> {
+            db.with_conn(|conn| {
+                Ok(conn.query_row(
+                    "SELECT merge_sequence FROM tasks WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            (sequence(&db, "merge:t-old"), sequence(&db, "merge:t-new")),
+            (Some(1), Some(2)),
+            "every merge already on the record is numbered in issue order"
+        );
+        assert_eq!(
+            (sequence(&db, "t-old"), sequence(&db, "t-new")),
+            (None, None),
+            "only a merge holds a place in a merge train"
+        );
+
+        // The claim that matters after an upgrade: the issuer carries on past
+        // the backfilled numbers instead of restarting at 1 and putting a new
+        // merge in front of one that has been waiting since before the upgrade.
+        let issued = crate::task::issue_merge(&db, "t-fresh", datetime!(2026-03-04 05:06:07 UTC))
+            .expect("a merge is issued against approved work");
+        assert_eq!(
+            issued.merge_sequence,
+            Some(3),
+            "the next issue continues past the highest backfilled place: {issued:?}"
+        );
+
+        // Reopening runs the step again and must renumber nothing.
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(user_version(&db), 6);
+        assert_eq!(
+            (sequence(&db, "merge:t-old"), sequence(&db, "merge:t-new")),
+            (Some(1), Some(2)),
+            "a second open changes nothing"
+        );
     }
 
     /// A review that finished — approved, or sent back for changes — is over,

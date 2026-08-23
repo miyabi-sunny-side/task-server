@@ -5,7 +5,6 @@
   import {
     fetchControl,
     fetchTasks,
-    postMerge,
     postRelease,
     type ControlPlane,
     type TaskSummary,
@@ -18,7 +17,7 @@
   let items = $state<TaskSummary[]>([]);
   let listState = $state<FetchState>("loading");
 
-  let busy = $state<"" | "merge" | "release">("");
+  let busy = $state(false);
   let result = $state<ActionResult>({ kind: "none", message: "" });
   let modalOpen = $state(false);
   let releaseError = $state("");
@@ -27,6 +26,16 @@
   let listController: AbortController | undefined;
   let controlLoaded = false;
   let listLoaded = false;
+
+  // Whatever the panel is already drawing in a readout, the list below leaves
+  // out: one object drawn twice on one screen reads as two.
+  let drawnByPanel = $derived(
+    [
+      ...(plane?.pending_reviews ?? []),
+      ...(plane?.unreviewed ?? []),
+      ...(plane?.mergeable ?? []),
+    ].map((item) => item.id),
+  );
 
   function aborted(error: unknown): boolean {
     return error instanceof DOMException && error.name === "AbortError";
@@ -38,6 +47,10 @@
       : "原因不明のエラー";
   }
 
+  // One request draws the whole panel, jam reasons included: `pending_merges`
+  // carries each merge's own `verification`. A second request per blocked head
+  // would be a second thing to fail and a second generation to race, and this
+  // region has neither.
   async function loadControl() {
     controlController?.abort();
     controlController = new AbortController();
@@ -77,33 +90,6 @@
     return Promise.all([loadControl(), loadList()]);
   }
 
-  // No confirmation step: nothing is chosen, so nothing is asked. One request
-  // per candidate, and a partial failure is reported as such.
-  async function onmerge() {
-    const targets = plane?.mergeable ?? [];
-    if (targets.length === 0 || busy !== "") {
-      return;
-    }
-    busy = "merge";
-    result = { kind: "none", message: "" };
-    const outcomes = await Promise.allSettled(
-      targets.map((target) => postMerge(target.id)),
-    );
-    const issued = outcomes.filter((one) => one.status === "fulfilled").length;
-    const failures = outcomes
-      .filter((one) => one.status === "rejected")
-      .map((one) => reason(one.reason));
-    busy = "";
-    result =
-      failures.length === 0
-        ? { kind: "success", message: `merge task を ${issued} 件発行しました` }
-        : {
-            kind: "error",
-            message: `merge task を ${issued} 件発行し、${failures.length} 件失敗しました: ${[...new Set(failures)].join(" / ")}`,
-          };
-    await loadBoth();
-  }
-
   function onrelease() {
     if ((plane?.releasable ?? []).length === 0) {
       return;
@@ -119,7 +105,7 @@
   }
 
   async function onconfirmRelease(productId: string, tag: string) {
-    busy = "release";
+    busy = true;
     releaseError = "";
     try {
       const released = await postRelease(productId, tag);
@@ -128,12 +114,12 @@
         kind: "success",
         message: `${released.product_id} を ${released.tag} で release しました (${released.released.length} 件)`,
       };
-      busy = "";
+      busy = false;
       await loadBoth();
     } catch (error) {
       // A refused release is corrected where the tag was typed.
       releaseError = reason(error);
-      busy = "";
+      busy = false;
     }
   }
 
@@ -160,13 +146,13 @@
     {plane}
     {busy}
     {result}
-    {onmerge}
     {onrelease}
     onretry={() => void loadControl()}
   />
   <StatusTaskList
     fetchState={listState}
     {items}
+    drawnElsewhere={drawnByPanel}
     onretry={() => void loadList()}
   />
 </div>
@@ -174,7 +160,7 @@
 {#if modalOpen}
   <ReleaseModal
     releasable={plane?.releasable ?? []}
-    busy={busy === "release"}
+    {busy}
     error={releaseError}
     onclose={closeModal}
     onconfirm={(productId, tag) => void onconfirmRelease(productId, tag)}

@@ -328,7 +328,8 @@ async fn claim_kind(state: &AppState, worker_name: &str, kinds: &Value) -> (Stat
     .await
 }
 
-/// Issue a review for `id`, claim it as a reviewer, and answer it.
+/// Claim the review the report of `id` issued, and answer it. Nobody files it:
+/// finishing the work is what puts it in front of a reviewer.
 async fn answer_review(
     state: &AppState,
     id: &str,
@@ -336,17 +337,12 @@ async fn answer_review(
     verdict: &str,
     findings: &str,
 ) -> Value {
-    let (status, review) = post_review(state, id).await;
-    assert_eq!(
-        status,
-        StatusCode::CREATED,
-        "issue review for {id}: {review}"
-    );
-    let review_id = review["id"].as_str().expect("review id").to_owned();
-
     let (status, lease) = claim_kind(state, "sol", &json!(["review"])).await;
     assert_eq!(status, StatusCode::OK, "claim review: {lease}");
-    assert_eq!(lease["id"], review_id.as_str(), "unexpected lease: {lease}");
+    assert_eq!(
+        lease["review_target_task_id"], id,
+        "the reviewer must get the review of {id}: {lease}"
+    );
     let claim_id = claim_id_of(&lease);
 
     let (status, answered) = post_review_report(
@@ -397,6 +393,28 @@ async fn land_merge(state: &AppState, merge_id: &str, commit_sha: &str) -> Value
     landed
 }
 
+/// The review the report of `id` issued, read back through the API.
+async fn issued_review(state: &AppState, id: &str) -> Value {
+    let (status, review) = get_task(state, &format!("review:{id}")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the report of {id} must have issued a review: {review}"
+    );
+    review
+}
+
+/// The merge the approval of `id` issued, read back through the API.
+async fn issued_merge(state: &AppState, id: &str) -> Value {
+    let (status, merge) = get_task(state, &format!("merge:{id}")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the approval of {id} must have issued a merge: {merge}"
+    );
+    merge
+}
+
 /// Drive one task the whole way to `merged` through the control plane.
 async fn drive_to_merged(state: &AppState, id: &str, product_id: &str, commit_sha: &str) -> String {
     create_task(
@@ -408,8 +426,7 @@ async fn drive_to_merged(state: &AppState, id: &str, product_id: &str, commit_sh
     work_to_done(state, id, commit_sha).await;
     approve_task(state, id, commit_sha).await;
 
-    let (status, merge) = post_merge(state, id).await;
-    assert_eq!(status, StatusCode::CREATED, "issue merge for {id}: {merge}");
+    let merge = issued_merge(state, id).await;
     let merge_id = merge["id"].as_str().expect("merge id").to_owned();
     land_merge(state, &merge_id, commit_sha).await;
 
@@ -433,6 +450,23 @@ async fn assert_merge_did_not_land(state: &AppState, merge_id: &str, target_id: 
         target["status"], "approved",
         "the target must not have moved: {target}"
     );
+}
+
+/// The control plane once `id` was approved: its merge is on the queue, its
+/// review is answered, and there is nothing left for a human to press.
+async fn assert_merge_is_in_flight(state: &AppState, id: &str) {
+    let plane = control(state).await;
+    assert_eq!(
+        ids_of(&plane["mergeable"]),
+        Vec::<&str>::new(),
+        "approved work is already in flight: {plane}"
+    );
+    assert_eq!(
+        ids_of(&plane["pending_merges"]),
+        [format!("merge:{id}").as_str()],
+        "{plane}"
+    );
+    assert_eq!(ids_of(&plane["pending_reviews"]), Vec::<&str>::new());
 }
 
 async fn control(state: &AppState) -> Value {
@@ -520,13 +554,19 @@ async fn http_alone_drives_a_task_from_creation_to_release() {
         Vec::<&str>::new(),
         "work nobody reviewed is not mergeable: {plane}"
     );
+    let plane = control(&state).await;
+    assert_eq!(
+        ids_of(&plane["pending_reviews"]),
+        ["review:t-cutover"],
+        "the report put the work in front of a reviewer: {plane}"
+    );
     let approved = approve_task(&state, "t-cutover", "abc1234").await;
     assert_eq!(approved["latest_review"]["verdict"], "approve");
-    let plane = control(&state).await;
-    assert_eq!(ids_of(&plane["mergeable"]), ["t-cutover"]);
 
-    let (status, merge) = post_merge(&state, "t-cutover").await;
-    assert_eq!(status, StatusCode::CREATED, "issue merge: {merge}");
+    // The approval issues the merge, so nothing is waiting to be pressed.
+    assert_merge_is_in_flight(&state, "t-cutover").await;
+
+    let merge = issued_merge(&state, "t-cutover").await;
     let merge_id = merge["id"].as_str().expect("merge id").to_owned();
     assert_eq!(merge["kind"], "instant:merge");
     assert_eq!(merge["status"], "ready");
@@ -578,8 +618,11 @@ async fn merge_candidates_are_approved_tasks_and_are_issued_once() {
     }
 
     work_to_done(&state, "t-a-done", "abc1234").await;
-    // Left leased on purpose: a wip task is not a merge candidate.
-    claim_next(&state, "t-b-wip").await;
+    // Left leased on purpose: a wip task is not a merge candidate. The filter
+    // keeps this claim off the review the report just queued.
+    let (status, lease) = claim_kind(&state, "grok", &json!(["normal"])).await;
+    assert_eq!(status, StatusCode::OK, "claim: {lease}");
+    assert_eq!(lease["id"], "t-b-wip", "unexpected lease: {lease}");
 
     let plane = control(&state).await;
     assert_eq!(
@@ -592,17 +635,11 @@ async fn merge_candidates_are_approved_tasks_and_are_issued_once() {
     let plane = control(&state).await;
     assert_eq!(
         ids_of(&plane["mergeable"]),
-        ["t-a-done"],
-        "only approved work is mergeable: {plane}"
-    );
-    assert_eq!(
-        ids_of(&plane["pending_merges"]),
         Vec::<&str>::new(),
-        "nothing is in flight yet: {plane}"
+        "the approval already issued the merge: {plane}"
     );
 
-    let (status, merge) = post_merge(&state, "t-a-done").await;
-    assert_eq!(status, StatusCode::CREATED, "issue merge: {merge}");
+    let merge = issued_merge(&state, "t-a-done").await;
     let merge_id = merge["id"].as_str().expect("merge id").to_owned();
     assert_eq!(merge["kind"], "instant:merge");
     assert_eq!(merge["status"], "ready", "a merge is claimable at once");
@@ -621,11 +658,6 @@ async fn merge_candidates_are_approved_tasks_and_are_issued_once() {
     );
 
     let plane = control(&state).await;
-    assert_eq!(
-        ids_of(&plane["mergeable"]),
-        Vec::<&str>::new(),
-        "a task with a live merge is no longer a candidate: {plane}"
-    );
     assert_eq!(ids_of(&plane["pending_merges"]), [merge_id.as_str()]);
 
     let (status, listing) = send(&state, read("/api/tasks")).await;
@@ -679,8 +711,7 @@ async fn a_merge_only_lands_when_every_check_passed() {
     );
     approve_task(&state, "t-land", "abc1234").await;
 
-    let (status, merge) = post_merge(&state, "t-land").await;
-    assert_eq!(status, StatusCode::CREATED, "issue merge: {merge}");
+    let merge = issued_merge(&state, "t-land").await;
     let merge_id = merge["id"].as_str().expect("merge id").to_owned();
     let claim_id = claim_next(&state, &merge_id).await;
 
@@ -768,8 +799,7 @@ async fn a_landed_merge_still_refuses_a_report_without_green_checks() {
     work_to_done(&state, "t-again", "abc1234").await;
     approve_task(&state, "t-again", "abc1234").await;
 
-    let (status, merge) = post_merge(&state, "t-again").await;
-    assert_eq!(status, StatusCode::CREATED, "issue merge: {merge}");
+    let merge = issued_merge(&state, "t-again").await;
     let merge_id = merge["id"].as_str().expect("merge id").to_owned();
     let claim_id = claim_next(&state, &merge_id).await;
 
@@ -847,8 +877,7 @@ async fn a_cancelled_merge_can_be_issued_again() {
     work_to_done(&state, "t-retry", "abc1234").await;
     approve_task(&state, "t-retry", "abc1234").await;
 
-    let (status, first) = post_merge(&state, "t-retry").await;
-    assert_eq!(status, StatusCode::CREATED, "issue merge: {first}");
+    let first = issued_merge(&state, "t-retry").await;
     let first_id = first["id"].as_str().expect("merge id").to_owned();
 
     let (status, again) = post_merge(&state, "t-retry").await;
@@ -1008,8 +1037,7 @@ async fn claim_prefers_instant_merge_and_listing_hides_released() {
     work_to_done(&state, "t-merged", "abc1234").await;
     approve_task(&state, "t-merged", "abc1234").await;
 
-    let (status, merge) = post_merge(&state, "t-merged").await;
-    assert_eq!(status, StatusCode::CREATED, "issue merge: {merge}");
+    let merge = issued_merge(&state, "t-merged").await;
     let merge_id = merge["id"].as_str().expect("merge id").to_owned();
     assert_eq!(merge["kind"], "instant:merge");
     assert_eq!(
@@ -1792,9 +1820,7 @@ async fn a_review_is_issued_once_and_a_finished_one_frees_the_target() {
     set_status(&state, "t-read", "ready").await;
     work_to_done(&state, "t-read", "abc1234").await;
 
-    let (status, review) = post_review(&state, "t-read").await;
-    assert_eq!(status, StatusCode::CREATED, "issue review: {review}");
-    assert_eq!(review["id"], "review:t-read");
+    let review = issued_review(&state, "t-read").await;
     assert_eq!(review["kind"], "review");
     assert_eq!(review["status"], "ready", "a review is claimable at once");
     assert_eq!(review["review_target_task_id"], "t-read");
@@ -1840,13 +1866,12 @@ async fn a_review_is_issued_once_and_a_finished_one_frees_the_target() {
     assert_eq!(status, StatusCode::OK, "a verdict is a success: {answered}");
 
     work_to_done(&state, "t-read", "def5678").await;
-    let (status, second) = post_review(&state, "t-read").await;
+    let (status, second) = get_task(&state, "review:t-read~2").await;
     assert_eq!(
         status,
-        StatusCode::CREATED,
+        StatusCode::OK,
         "a finished attempt must not block the next: {second}"
     );
-    assert_eq!(second["id"], "review:t-read~2");
     assert!(
         !second["id"].as_str().expect("id").contains('/'),
         "a task id is one path segment: {second}"
@@ -1873,8 +1898,7 @@ async fn the_status_route_cannot_finish_a_review_without_a_verdict() {
     set_status(&state, "t-read", "ready").await;
     work_to_done(&state, "t-read", "abc1234").await;
 
-    let (status, review) = post_review(&state, "t-read").await;
-    assert_eq!(status, StatusCode::CREATED, "issue review: {review}");
+    issued_review(&state, "t-read").await;
     let (status, lease) = claim_kind(&state, "sol", &json!(["review"])).await;
     assert_eq!(status, StatusCode::OK, "claim review: {lease}");
     assert_eq!(lease["id"], "review:t-read");
@@ -1988,15 +2012,15 @@ async fn the_status_route_cannot_raise_an_answered_review() {
         "an answered review cannot be leased again: {none}"
     );
 
-    // And the frozen attempt does not keep the next one out.
+    // And the frozen attempt does not keep the next one out: the report of the
+    // rework issues it.
     work_to_done(&state, "t-read", "def5678").await;
-    let (status, next) = post_review(&state, "t-read").await;
+    let (status, next) = get_task(&state, "review:t-read~2").await;
     assert_eq!(
         status,
-        StatusCode::CREATED,
+        StatusCode::OK,
         "a finished attempt blocks nothing: {next}"
     );
-    assert_eq!(next["id"], "review:t-read~2");
     assert_eq!(next["commit_sha"], "def5678");
 }
 
@@ -2016,9 +2040,7 @@ async fn a_merge_issued_for_a_commit_the_work_has_left_behind_lands_nothing() {
     work_to_done(&state, "t-move", "abc1234").await;
     approve_task(&state, "t-move", "abc1234").await;
 
-    let (status, merge) = post_merge(&state, "t-move").await;
-    assert_eq!(status, StatusCode::CREATED, "{merge}");
-    assert_eq!(merge["id"], "merge:t-move");
+    let merge = issued_merge(&state, "t-move").await;
     assert_eq!(merge["commit_sha"], "abc1234");
 
     // The work is taken back, redone on another commit, and approved again.
@@ -2134,7 +2156,16 @@ async fn a_review_hands_work_back_with_findings_the_worker_can_read() {
     );
     assert_eq!(approved["latest_review"]["subject_commit_sha"], "def5678");
     let plane = control(&state).await;
-    assert_eq!(ids_of(&plane["mergeable"]), ["t-fix"]);
+    assert_eq!(
+        ids_of(&plane["pending_merges"]),
+        ["merge:t-fix"],
+        "the approval put it on the main line's queue: {plane}"
+    );
+    assert_eq!(
+        ids_of(&plane["mergeable"]),
+        Vec::<&str>::new(),
+        "and nothing is left for a human to press: {plane}"
+    );
 }
 
 /// The accident the snapshot exists to stop: a reviewer reads one commit, the
@@ -2152,8 +2183,7 @@ async fn an_approval_of_a_commit_the_work_has_left_behind_is_refused() {
     set_status(&state, "t-stale", "ready").await;
     work_to_done(&state, "t-stale", "abc1234").await;
 
-    let (status, review) = post_review(&state, "t-stale").await;
-    assert_eq!(status, StatusCode::CREATED, "{review}");
+    issued_review(&state, "t-stale").await;
     let (status, lease) = claim_kind(&state, "sol", &json!(["review"])).await;
     assert_eq!(status, StatusCode::OK, "{lease}");
     let claim_id = claim_id_of(&lease);
@@ -2215,6 +2245,479 @@ async fn an_approval_of_a_commit_the_work_has_left_behind_is_refused() {
     assert_eq!(refused["code"], "invalid", "{refused}");
 }
 
+/// Take `id` all the way to `approved`, which is where its merge is issued.
+/// The claim is filtered because the queue now has reviews and merges in it, and
+/// this helper is about the ordinary work.
+async fn approved_task(state: &AppState, id: &str, product_id: &str, commit_sha: &str) {
+    create_task(
+        state,
+        &json!({"id": id, "title": format!("task {id}"), "product_id": product_id}),
+    )
+    .await;
+    set_status(state, id, "ready").await;
+    let (status, lease) = claim_kind(state, "grok", &json!(["normal"])).await;
+    assert_eq!(status, StatusCode::OK, "claim {id}: {lease}");
+    assert_eq!(lease["id"], id, "unexpected lease: {lease}");
+    let (status, done) = post_report(state, &report_body(&claim_id_of(&lease), commit_sha)).await;
+    assert_eq!(status, StatusCode::OK, "report {id}: {done}");
+    approve_task(state, id, commit_sha).await;
+}
+
+fn blocked_report_body(claim_id: &str, commit_sha: &str, reason: &str, checks: &Value) -> Value {
+    json!({
+        "claim_id": claim_id,
+        "commit_sha": commit_sha,
+        "verification": reason,
+        "checks": checks,
+        "outcome": "blocked",
+    })
+}
+
+/// The control plane answers with what is in flight and with the one thing that
+/// should never be there: work that finished and has nobody reading it.
+#[tokio::test]
+async fn the_control_plane_shows_what_is_in_flight_and_what_lost_its_reader() {
+    let (_dir, state) = file_backed_state();
+    put_product(&state, PRODUCT, true).await;
+    create_task(
+        &state,
+        &json!({"id": "t-1", "title": "watched", "product_id": PRODUCT}),
+    )
+    .await;
+    set_status(&state, "t-1", "ready").await;
+    work_to_done(&state, "t-1", "abc1234").await;
+
+    let plane = control(&state).await;
+    assert_eq!(
+        ids_of(&plane["pending_reviews"]),
+        ["review:t-1"],
+        "the report put the work in front of a reviewer: {plane}"
+    );
+    assert_eq!(
+        ids_of(&plane["unreviewed"]),
+        Vec::<&str>::new(),
+        "so nothing is stranded: {plane}"
+    );
+    assert_summary_shape(&plane["pending_reviews"][0]);
+
+    // Cancelling the attempt is how that reader is lost, and `done` has no way
+    // forward without a verdict — so the window is what makes it visible.
+    let (status, cancelled) = post_status(&state, "review:t-1", "cancelled").await;
+    assert_eq!(status, StatusCode::OK, "{cancelled}");
+    let plane = control(&state).await;
+    assert_eq!(ids_of(&plane["pending_reviews"]), Vec::<&str>::new());
+    assert_eq!(
+        ids_of(&plane["unreviewed"]),
+        ["t-1"],
+        "work nobody is reading has to be visible: {plane}"
+    );
+
+    // Issuing one by hand is the remedy, and closes the window.
+    let (status, second) = post_review(&state, "t-1").await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    let plane = control(&state).await;
+    assert_eq!(ids_of(&plane["pending_reviews"]), ["review:t-1~2"]);
+    assert_eq!(ids_of(&plane["unreviewed"]), Vec::<&str>::new());
+
+    approve_task(&state, "t-1", "abc1234").await;
+    let plane = control(&state).await;
+    assert_eq!(
+        ids_of(&plane["pending_reviews"]),
+        Vec::<&str>::new(),
+        "an answered review is not pending: {plane}"
+    );
+    assert_eq!(ids_of(&plane["pending_merges"]), ["merge:t-1"]);
+    assert_eq!(
+        ids_of(&plane["mergeable"]),
+        Vec::<&str>::new(),
+        "and nothing is left for a human to press: {plane}"
+    );
+}
+
+/// A product's merges go out one at a time and in the order they were issued,
+/// because each one rebases onto the main line the one before it wrote. A merge
+/// that could not be integrated stops that train until a human calls it off —
+/// and stops nobody else's.
+#[tokio::test]
+async fn a_products_merges_are_handed_out_one_at_a_time_and_a_blocked_one_stops_them() {
+    let (_dir, state) = file_backed_state();
+    put_product(&state, PRODUCT, true).await;
+    put_product(&state, KEEPER, true).await;
+
+    approved_task(&state, "t-a-first", PRODUCT, "aaa1111").await;
+    approved_task(&state, "t-b-second", PRODUCT, "bbb2222").await;
+    approved_task(&state, "t-z-elsewhere", KEEPER, "ccc3333").await;
+
+    let plane = control(&state).await;
+    assert_eq!(
+        ids_of(&plane["pending_merges"]),
+        ["merge:t-a-first", "merge:t-b-second", "merge:t-z-elsewhere"],
+        "the queue is listed in the order it will be handed out: {plane}"
+    );
+
+    let (status, lease) = claim_kind(&state, "luna", &json!(["instant:merge"])).await;
+    assert_eq!(status, StatusCode::OK, "{lease}");
+    assert_eq!(lease["id"], "merge:t-a-first", "the train head goes first");
+    let claim_id = claim_id_of(&lease);
+
+    // Another product is rebasing onto another main line, so its merge runs
+    // beside this one.
+    let (status, other) = claim_kind(&state, "sol", &json!(["instant:merge"])).await;
+    assert_eq!(status, StatusCode::OK, "{other}");
+    assert_eq!(other["id"], "merge:t-z-elsewhere", "{other}");
+
+    let (status, waiting) = claim_kind(&state, "grok", &json!(["instant:merge"])).await;
+    assert_eq!(status, StatusCode::OK, "{waiting}");
+    assert_eq!(
+        waiting["status"], "no-work",
+        "the second merge of a product waits for the first: {waiting}"
+    );
+
+    // The head cannot be integrated, and says so. That is a report, not an
+    // error: the reason and the checks are kept on the merge.
+    let checks = json!([{"name": "git rebase", "exit_code": 1}]);
+    let (status, blocked) = post_report(
+        &state,
+        &blocked_report_body(
+            &claim_id,
+            "aaa1111",
+            "rebase onto main conflicts in src/task.rs",
+            &checks,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a blocked report is kept: {blocked}"
+    );
+    assert_eq!(blocked["status"], "blocked");
+    assert_eq!(
+        blocked["verification"], "rebase onto main conflicts in src/task.rs",
+        "the reason has to be readable: {blocked}"
+    );
+    assert_eq!(blocked["checks"], checks, "{blocked}");
+    assert_eq!(
+        blocked["commit_sha"], "aaa1111",
+        "a blocked merge keeps the subject it was issued for: {blocked}"
+    );
+    let (status, target) = get_task(&state, "t-a-first").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        target["status"], "approved",
+        "nothing landed, so the target does not move: {target}"
+    );
+
+    // Reporting the same thing again is accepted and changes nothing.
+    let (status, again) = post_report(
+        &state,
+        &blocked_report_body(
+            &claim_id,
+            "aaa1111",
+            "rebase onto main conflicts in src/task.rs",
+            &checks,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again, blocked, "a repeat writes nothing new: {again}");
+
+    let (status, still_waiting) = claim_kind(&state, "grok", &json!(["instant:merge"])).await;
+    assert_eq!(status, StatusCode::OK, "{still_waiting}");
+    assert_eq!(
+        still_waiting["status"], "no-work",
+        "and the blocked train is still stopped: {still_waiting}"
+    );
+
+    // Calling the blocked attempt off is what moves the train.
+    let (status, cancelled) = post_status(&state, "merge:t-a-first", "cancelled").await;
+    assert_eq!(status, StatusCode::OK, "{cancelled}");
+    let (status, moved) = claim_kind(&state, "grok", &json!(["instant:merge"])).await;
+    assert_eq!(status, StatusCode::OK, "{moved}");
+    assert_eq!(moved["id"], "merge:t-b-second");
+
+    // The work the cancelled merge would have landed is a merge candidate
+    // again: the reconciliation window is what a human presses on.
+    let plane = control(&state).await;
+    assert_eq!(ids_of(&plane["mergeable"]), ["t-a-first"], "{plane}");
+    let (status, reissued) = post_merge(&state, "t-a-first").await;
+    assert_eq!(status, StatusCode::CREATED, "{reissued}");
+    assert_eq!(reissued["id"], "merge:t-a-first~2");
+}
+
+/// A merge that could not be integrated is called off and reissued, never
+/// restarted.
+///
+/// The card offers the two presses that call it off and refuses the one that
+/// would hand this very attempt back to a worker, so the screen and the API say
+/// the same thing about how a jam clears. The reason it stopped rides along
+/// with the queue on `/api/control`, which is what lets a screen name the jam
+/// without reading the merge card.
+#[tokio::test]
+async fn the_status_route_cannot_restart_a_blocked_merge() {
+    let (_dir, state) = file_backed_state();
+    put_product(&state, PRODUCT, true).await;
+    approved_task(&state, "t-a-jam", PRODUCT, "aaa1111").await;
+    approved_task(&state, "t-b-behind", PRODUCT, "bbb2222").await;
+
+    let (status, lease) = claim_kind(&state, "luna", &json!(["instant:merge"])).await;
+    assert_eq!(status, StatusCode::OK, "{lease}");
+    assert_eq!(lease["id"], "merge:t-a-jam", "{lease}");
+    let (status, blocked) = post_report(
+        &state,
+        &blocked_report_body(
+            &claim_id_of(&lease),
+            "aaa1111",
+            "rebase onto main conflicts in src/task.rs",
+            &json!([{"name": "git rebase", "exit_code": 1}]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{blocked}");
+    assert_eq!(blocked["status"], "blocked", "{blocked}");
+
+    let (status, card) = get_task(&state, "merge:t-a-jam").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        transitions(&card),
+        ["cancelled", "dropped"],
+        "a blocked merge offers the release and nothing that restarts it: {card}"
+    );
+
+    let (status, refused) = post_status(&state, "merge:t-a-jam", "ready").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "pressing ready on a blocked merge: {refused}"
+    );
+    assert_eq!(refused["code"], "invalid", "{refused}");
+    let (status, held) = get_task(&state, "merge:t-a-jam").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(held, card, "the refusal writes nothing: {held}");
+
+    let (status, still_waiting) = claim_kind(&state, "sol", &json!(["instant:merge"])).await;
+    assert_eq!(status, StatusCode::OK, "{still_waiting}");
+    assert_eq!(
+        still_waiting["status"], "no-work",
+        "and the refused press did not let the train move: {still_waiting}"
+    );
+
+    // The queue says why it stopped, in the same payload that drew it.
+    let plane = control(&state).await;
+    assert_eq!(
+        ids_of(&plane["pending_merges"]),
+        ["merge:t-a-jam", "merge:t-b-behind"],
+        "{plane}"
+    );
+    let merges = plane["pending_merges"]
+        .as_array()
+        .expect("pending_merges array");
+    assert_summary_shape(&merges[0]);
+    assert_eq!(
+        merges[0]["verification"], "rebase onto main conflicts in src/task.rs",
+        "the blocked head carries the reason a screen shows: {plane}"
+    );
+    assert_eq!(
+        merges[1]["verification"],
+        Value::Null,
+        "a merge that is still running has no reason to show: {plane}"
+    );
+
+    // Calling it off is the release, and what follows is a new attempt.
+    let (status, cancelled) = post_status(&state, "merge:t-a-jam", "cancelled").await;
+    assert_eq!(status, StatusCode::OK, "{cancelled}");
+    let (status, reissued) = post_merge(&state, "t-a-jam").await;
+    assert_eq!(status, StatusCode::CREATED, "{reissued}");
+    assert_eq!(
+        reissued["id"], "merge:t-a-jam~2",
+        "the reissue is a new row, not the blocked one reopened: {reissued}"
+    );
+    assert_eq!(
+        reissued["status"], "ready",
+        "and it starts clean: {reissued}"
+    );
+    assert_eq!(reissued["verification"], Value::Null, "{reissued}");
+    let (status, failed) = get_task(&state, "merge:t-a-jam").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        failed["verification"], "rebase onto main conflicts in src/task.rs",
+        "while the attempt that failed keeps saying why: {failed}"
+    );
+}
+
+/// The status route cannot say how a merge ended. `done` and `blocked` are the
+/// worker's answer, and `POST /worker/report` is the only way to give one.
+///
+/// This is the outcome side of the same rule the `ready` refusal covers, and it
+/// is the side with teeth: pressing `blocked` files a jam that stops the
+/// product's train with no reason and no checks on the row, and pressing `done`
+/// walks around the check gate and the target landing together, leaving
+/// approved work that never merged and that neither reconciliation window on
+/// `/api/control` shows — `pending_merges` stops at `done`, and `mergeable`
+/// still sees the merge row holding the target.
+#[tokio::test]
+async fn the_status_route_cannot_write_the_outcome_of_a_merge() {
+    let (_dir, state) = file_backed_state();
+    put_product(&state, PRODUCT, true).await;
+    approved_task(&state, "t-a-merge", PRODUCT, "aaa1111").await;
+
+    // Issued and waiting. The card offers the claim and the two releases, and
+    // no outcome at all.
+    let (status, issued) = get_task(&state, "merge:t-a-merge").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        transitions(&issued),
+        ["wip", "cancelled", "dropped"],
+        "an issued merge offers no outcome: {issued}"
+    );
+    for to in ["done", "blocked"] {
+        let (status, refused) = post_status(&state, "merge:t-a-merge", to).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "pressing {to} on an issued merge: {refused}"
+        );
+        assert_eq!(refused["code"], "invalid", "{refused}");
+    }
+    let (status, held) = get_task(&state, "merge:t-a-merge").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(held, issued, "the refusals write nothing: {held}");
+
+    // Running. `done` here is the press that would fabricate a landing.
+    let (status, lease) = claim_kind(&state, "luna", &json!(["instant:merge"])).await;
+    assert_eq!(status, StatusCode::OK, "{lease}");
+    assert_eq!(lease["id"], "merge:t-a-merge", "{lease}");
+    let (status, running) = get_task(&state, "merge:t-a-merge").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        transitions(&running),
+        ["ready", "cancelled", "dropped"],
+        "a running merge offers no outcome either: {running}"
+    );
+    for to in ["done", "blocked"] {
+        let (status, refused) = post_status(&state, "merge:t-a-merge", to).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "pressing {to} on a running merge: {refused}"
+        );
+        assert_eq!(refused["code"], "invalid", "{refused}");
+    }
+    assert_merge_did_not_land(&state, "merge:t-a-merge", "t-a-merge").await;
+    assert_merge_is_in_flight(&state, "t-a-merge").await;
+
+    // The worker's own report still lands it, gate and target together. It is
+    // reported against the lease luna is holding, which is the whole point:
+    // only the claim that ran the merge can say how it ended.
+    let (status, landed) = post_report(
+        &state,
+        &report_with_checks(&claim_id_of(&lease), "aaa1111", &green_checks()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{landed}");
+    assert_eq!(landed["status"], "done", "{landed}");
+    let (status, target) = get_task(&state, "t-a-merge").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        target["status"], "merged",
+        "the report is what moves the target: {target}"
+    );
+
+    // And a landed merge is not pressed back into a jam.
+    let (status, landed) = get_task(&state, "merge:t-a-merge").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, refused) = post_status(&state, "merge:t-a-merge", "blocked").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "pressing blocked on a landed merge: {refused}"
+    );
+    let (status, still_landed) = get_task(&state, "merge:t-a-merge").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(still_landed, landed, "{still_landed}");
+    let (status, target) = get_task(&state, "t-a-merge").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(target["status"], "merged", "{target}");
+}
+
+/// `outcome` is optional on the wire, and it means one thing on every worker
+/// surface: left out it is `done`, and a name that is neither `done` nor
+/// `blocked` is refused rather than read as a success.
+///
+/// Both surfaces read it through the same helper, so this is the contract they
+/// share. A fallback on an unrecognised name is the failure that matters: it
+/// would file a report nobody understood as a finished one, and on a merge that
+/// is a landing.
+#[tokio::test]
+async fn an_omitted_report_outcome_is_done_and_an_unknown_one_is_refused() {
+    let (_dir, state) = file_backed_state();
+    put_product(&state, PRODUCT, true).await;
+    ready_task(&state, "t-typo", 0).await;
+    let claim_id = claim_next(&state, "t-typo").await;
+
+    let (status, refused) = post_report(
+        &state,
+        &json!({
+            "claim_id": claim_id,
+            "commit_sha": "abc1234",
+            "verification": "cargo test",
+            "outcome": "Blocked",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an outcome nobody defined is refused: {refused}"
+    );
+    assert_eq!(refused["code"], "invalid", "{refused}");
+    let (status, held) = get_task(&state, "t-typo").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        held["status"], "wip",
+        "and the refusal writes nothing: {held}"
+    );
+
+    // Left out entirely, it is the report every worker written before outcomes
+    // existed sends.
+    let (status, done) = post_report(&state, &report_body(&claim_id, "abc1234")).await;
+    assert_eq!(status, StatusCode::OK, "{done}");
+    assert_eq!(
+        done["status"], "done",
+        "an omitted outcome is `done`: {done}"
+    );
+}
+
+/// The outcome refusal is a merge rule. Ordinary work is still moved by hand
+/// over the same route, `blocked` included, and comes back from it.
+#[tokio::test]
+async fn the_status_route_still_moves_ordinary_work_by_hand() {
+    let (_dir, state) = file_backed_state();
+    put_product(&state, PRODUCT, true).await;
+    ready_task(&state, "t-hand", 0).await;
+    set_status(&state, "t-hand", "wip").await;
+
+    let (status, running) = get_task(&state, "t-hand").await;
+    assert_eq!(status, StatusCode::OK);
+    for to in ["done", "blocked"] {
+        assert!(
+            transitions(&running).contains(&to.to_owned()),
+            "ordinary work still offers {to}: {running}"
+        );
+    }
+
+    let stopped = set_status(&state, "t-hand", "blocked").await;
+    assert_eq!(stopped["status"], "blocked", "{stopped}");
+    let restarted = set_status(&state, "t-hand", "ready").await;
+    assert_eq!(
+        restarted["status"], "ready",
+        "blocked ordinary work is restarted by hand: {restarted}"
+    );
+    set_status(&state, "t-hand", "wip").await;
+    let finished = set_status(&state, "t-hand", "done").await;
+    assert_eq!(finished["status"], "done", "{finished}");
+}
+
 /// A worker loop takes the kinds of work it handles. Left out, it still takes
 /// anything, so a loop written before roles existed keeps working.
 #[tokio::test]
@@ -2230,8 +2733,7 @@ async fn a_claim_takes_only_the_kinds_the_worker_asks_for() {
     set_status(&state, "t-reviewed", "ready").await;
     work_to_done(&state, "t-reviewed", "abc1234").await;
     ready_task(&state, "t-plain", 0).await;
-    let (status, review) = post_review(&state, "t-reviewed").await;
-    assert_eq!(status, StatusCode::CREATED, "{review}");
+    issued_review(&state, "t-reviewed").await;
 
     let (status, none) = claim_kind(&state, "luna", &json!(["instant:merge"])).await;
     assert_eq!(status, StatusCode::OK, "{none}");

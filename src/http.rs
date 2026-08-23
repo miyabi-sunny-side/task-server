@@ -9,8 +9,8 @@ use crate::error::Error;
 use crate::product::{self, Product};
 use crate::state::AppState;
 use crate::task::{
-    self, Check, NewTask, Releasable, ReviewOutcome, ReviewVerdict, Task, TaskKind, TaskPatch,
-    TaskStatus,
+    self, Check, NewTask, Releasable, ReportOutcome, ReviewOutcome, ReviewVerdict, Task, TaskKind,
+    TaskPatch, TaskStatus,
 };
 
 /// A row in the task list: enough to render a card in a list, no body.
@@ -35,6 +35,36 @@ impl From<Task> for TaskSummary {
             product_id: task.product_id,
             priority: task.priority,
             updated_at: task.updated_at,
+        }
+    }
+}
+
+/// A merge the control plane is carrying: the ordinary summary, plus why it
+/// stopped if it did.
+///
+/// The reason is on the merge task's own `verification`, written there by the
+/// worker's blocked report, and this is the one list that has to show it: a
+/// stopped merge holds up every merge of its product, so the screen drawing the
+/// train cannot say what is happening without it. Carried here rather than
+/// added to [`TaskSummary`] because a summary is what every list of tasks
+/// carries and this is what *this* list needs — flattened, so the summary stays
+/// the single definition of what a row is and the wire shape gains one key
+/// rather than a nested object.
+#[derive(Debug, Serialize)]
+pub struct PendingMerge {
+    #[serde(flatten)]
+    pub summary: TaskSummary,
+    /// Why this merge stopped, as the worker wrote it. `null` while it is
+    /// running: only a blocked merge has a reason, and a merge is blocked only
+    /// by a report that had one.
+    pub verification: Option<String>,
+}
+
+impl From<Task> for PendingMerge {
+    fn from(task: Task) -> Self {
+        Self {
+            verification: task.verification.clone(),
+            summary: task.into(),
         }
     }
 }
@@ -65,9 +95,16 @@ pub struct ClaimBody {
 pub struct ReportBody {
     pub claim_id: String,
     pub commit_sha: String,
+    /// What the worker ran, or — when `outcome` is `blocked` — why it could not
+    /// finish. Either way it is the evidence a human reads off the task.
     pub verification: String,
     #[serde(default)]
     pub checks: Vec<Check>,
+    /// `done` (the default, and what a worker written before this sent) or
+    /// `blocked`: the work could not be finished, and the reason and checks are
+    /// to be kept on the task rather than thrown away with a refusal.
+    #[serde(default)]
+    pub outcome: Option<String>,
 }
 
 /// A review's completion. Deliberately not [`ReportBody`]: a verdict is not a
@@ -94,12 +131,20 @@ pub struct ReleaseBody {
     pub tag: String,
 }
 
-/// What the admin screen needs to decide whether "merge" and "release" are
-/// live buttons.
+/// What the admin screen needs to show the queue and decide whether "release"
+/// is a live button.
+///
+/// Reviews and merges are issued by the control plane itself, so the two
+/// `pending_*` lists are what is in flight rather than what a human is being
+/// asked to press. `mergeable` and `unreviewed` are reconciliation windows: both
+/// are empty while the automatic issuing works, and anything in either of them
+/// is work that lost its next step.
 #[derive(Debug, Serialize)]
 pub struct ControlPlane {
     pub mergeable: Vec<TaskSummary>,
-    pub pending_merges: Vec<TaskSummary>,
+    pub pending_merges: Vec<PendingMerge>,
+    pub pending_reviews: Vec<TaskSummary>,
+    pub unreviewed: Vec<TaskSummary>,
     pub releasable: Vec<Releasable>,
 }
 
@@ -319,7 +364,12 @@ pub async fn api_control(
     require_identity(&headers, &state)?;
     Ok(Json(ControlPlane {
         mergeable: summaries(task::mergeable(&state.db)?),
-        pending_merges: summaries(task::pending_merges(&state.db)?),
+        pending_merges: task::pending_merges(&state.db)?
+            .into_iter()
+            .map(PendingMerge::from)
+            .collect(),
+        pending_reviews: summaries(task::pending_reviews(&state.db)?),
+        unreviewed: summaries(task::unreviewed(&state.db)?),
         releasable: task::releasable(&state.db)?,
     }))
 }
@@ -432,12 +482,14 @@ pub async fn worker_report(
     Json(body): Json<ReportBody>,
 ) -> Result<Json<TaskCard>, Error> {
     require_worker(&headers, &state)?;
+    let outcome = ReportOutcome::parse_optional(body.outcome.as_deref())?;
     let reported = task::report(
         &state.db,
         &body.claim_id,
         &body.commit_sha,
         &body.verification,
         &body.checks,
+        outcome,
         state.clock.now(),
     )?;
     Ok(Json(card(&state.db, reported)?))

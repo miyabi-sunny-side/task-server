@@ -827,14 +827,13 @@ async fn a_reviewer_answers_over_mcp_and_http_sees_the_same_row() {
     let mut worker = McpClient::new(&router, "/worker/mcp", WORKER_CAPABILITY);
     worker.initialize().await;
 
-    let (status, review) = http(
-        &router,
-        "POST",
-        "/api/reviews",
-        Some(json!({ "task_id": "t-1" })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "issue review: {review}");
+    // The report of t-1 issued the review; nobody files it by hand.
+    let (status, review) = http(&router, "GET", "/api/tasks/review:t-1", None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the report issues a review: {review}"
+    );
 
     // A loop that asks for merges is told there is no work, not handed the
     // review that is waiting.
@@ -921,6 +920,292 @@ async fn a_reviewer_answers_over_mcp_and_http_sees_the_same_row() {
     );
 }
 
+/// The MCP status tool inherits the merge release contract too: a blocked merge
+/// is called off and reissued, never restarted.
+///
+/// A model driving the board is exactly who would reach for `ready` to get a
+/// jammed train moving, so the refusal has to reach this surface with the same
+/// stable code HTTP answers with — and `dropped` has to keep working, because
+/// calling the attempt off is the way out.
+/// Answer the review `t-1`'s report issued with an approval, which is what
+/// issues `merge:t-1`. `t-1` must already be `done`.
+async fn merge_issued_over_mcp(router: &Router) {
+    let mut worker = McpClient::new(router, "/worker/mcp", WORKER_CAPABILITY);
+    worker.initialize().await;
+    let claimed = worker
+        .call(
+            "task_claim",
+            json!({ "worker": "sol", "kinds": ["review"] }),
+        )
+        .await;
+    let claim_id = claimed["structuredContent"]["task"]["claim_id"]
+        .as_str()
+        .expect("claim id")
+        .to_owned();
+    worker
+        .call(
+            "task_review_report",
+            json!({
+                "claim_id": claim_id,
+                "subject_commit_sha": "abc1234",
+                "verdict": "approve",
+                "findings": "reads well",
+            }),
+        )
+        .await;
+}
+
+/// Claim `merge:t-1` the way a merge worker does, and hand back the lease it
+/// has to report against.
+async fn merge_claimed_over_mcp(router: &Router) -> String {
+    let mut worker = McpClient::new(router, "/worker/mcp", WORKER_CAPABILITY);
+    worker.initialize().await;
+    let claimed = worker
+        .call(
+            "task_claim",
+            json!({ "worker": "luna", "kinds": ["instant:merge"] }),
+        )
+        .await;
+    assert_eq!(
+        claimed["structuredContent"]["task"]["id"], "merge:t-1",
+        "the approval issues the merge: {claimed}"
+    );
+    claimed["structuredContent"]["task"]["claim_id"]
+        .as_str()
+        .expect("claim id")
+        .to_owned()
+}
+
+/// Take `t-1` from `done` all the way to a merge that reported it could not be
+/// integrated: approve the review the report issued, claim the merge that
+/// approval issued, and block it.
+async fn merge_blocked_over_mcp(router: &Router) {
+    merge_issued_over_mcp(router).await;
+    let claim_id = merge_claimed_over_mcp(router).await;
+    let mut worker = McpClient::new(router, "/worker/mcp", WORKER_CAPABILITY);
+    worker.initialize().await;
+    let blocked = worker
+        .call(
+            "task_report",
+            json!({
+                "claim_id": claim_id,
+                "commit_sha": "abc1234",
+                "verification": "rebase onto main conflicts in src/task.rs",
+                "checks": [{"name": "git rebase", "exit_code": 1}],
+                "outcome": "blocked",
+            }),
+        )
+        .await;
+    assert_eq!(blocked["isError"], json!(false), "{blocked}");
+    assert_eq!(
+        blocked["structuredContent"]["task"]["status"], "blocked",
+        "{blocked}"
+    );
+}
+
+/// Press both outcomes on `merge:t-1` over MCP and insist on the refusal.
+async fn assert_merge_outcomes_are_refused_over_mcp(admin: &mut McpClient) {
+    for pressed in ["done", "blocked"] {
+        let refused = admin
+            .call(
+                "task_set_status",
+                json!({ "id": "merge:t-1", "status": pressed }),
+            )
+            .await;
+        assert_eq!(
+            refused["isError"],
+            json!(true),
+            "a press must not write the outcome of a merge: {refused}"
+        );
+        assert_eq!(
+            refused["structuredContent"]["code"], "invalid",
+            "the same stable code HTTP answers with: {refused}"
+        );
+        let message = refused["structuredContent"]["error"]
+            .as_str()
+            .expect("error message");
+        assert!(
+            message.contains("/worker/report"),
+            "the refusal must name where the answer comes from: {message}"
+        );
+    }
+}
+
+/// The MCP status tool cannot say how a merge *ended* either.
+///
+/// A model driving the board is exactly who would press `done` to tidy a queue
+/// up or `blocked` to park an attempt, and both are the worker's answer. The
+/// refusal has to reach this surface with the same stable code HTTP answers
+/// with, and the report has to keep working straight through it.
+#[tokio::test]
+async fn mcp_status_change_cannot_write_the_outcome_of_a_merge() {
+    let (_dir, state) = file_backed_state();
+    let router = task_server::app(state);
+    catalogue(&router, "sunny-side/task-server").await;
+
+    work_to_done_over_mcp(&router, "t-1").await;
+    merge_issued_over_mcp(&router).await;
+    let mut admin = McpClient::new(&router, "/mcp", MCP_CAPABILITY);
+    admin.initialize().await;
+
+    assert_merge_outcomes_are_refused_over_mcp(&mut admin).await;
+
+    let card = admin.call("task_get", json!({ "id": "merge:t-1" })).await;
+    let card = &card["structuredContent"];
+    assert_eq!(
+        card["task"]["status"], "ready",
+        "a refusal moves no row: {card}"
+    );
+    assert_eq!(
+        card["task"]["verification"],
+        Value::Null,
+        "and writes no reason onto it: {card}"
+    );
+    assert_eq!(
+        card["available_transitions"]
+            .as_array()
+            .expect("available_transitions"),
+        &vec![json!("wip"), json!("cancelled"), json!("dropped")],
+        "no outcome is offered on a merge: {card}"
+    );
+
+    // The two windows a pressed `done` would have emptied together.
+    let (status, plane) = http(&router, "GET", "/api/control", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(plane["mergeable"], json!([]), "{plane}");
+    assert_eq!(plane["pending_merges"][0]["id"], "merge:t-1", "{plane}");
+
+    // Running, and refused the same way; then the worker's own report lands it.
+    let claim_id = merge_claimed_over_mcp(&router).await;
+    assert_merge_outcomes_are_refused_over_mcp(&mut admin).await;
+    let (status, target) = http(&router, "GET", "/api/tasks/t-1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        target["status"], "approved",
+        "the target has not moved: {target}"
+    );
+
+    let mut worker = McpClient::new(&router, "/worker/mcp", WORKER_CAPABILITY);
+    worker.initialize().await;
+    // The same `outcome` contract HTTP holds: a name nobody defined is refused
+    // rather than read as the success that would land this merge.
+    let typo = worker
+        .call(
+            "task_report",
+            json!({
+                "claim_id": claim_id,
+                "commit_sha": "abc1234",
+                "verification": "merged onto main",
+                "checks": [{"name": "cargo test", "exit_code": 0}],
+                "outcome": "Done",
+            }),
+        )
+        .await;
+    assert_eq!(typo["isError"], json!(true), "{typo}");
+    assert_eq!(typo["structuredContent"]["code"], "invalid", "{typo}");
+    let (status, target) = http(&router, "GET", "/api/tasks/t-1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        target["status"], "approved",
+        "the refused report landed nothing: {target}"
+    );
+
+    let landed = worker
+        .call(
+            "task_report",
+            json!({
+                "claim_id": claim_id,
+                "commit_sha": "abc1234",
+                "verification": "merged onto main",
+                "checks": [{"name": "cargo test", "exit_code": 0}],
+            }),
+        )
+        .await;
+    assert_eq!(landed["isError"], json!(false), "{landed}");
+    assert_eq!(
+        landed["structuredContent"]["task"]["status"], "done",
+        "an omitted outcome is still `done`: {landed}"
+    );
+    let (status, target) = http(&router, "GET", "/api/tasks/t-1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        target["status"], "merged",
+        "and the report is what moves the target: {target}"
+    );
+}
+
+#[tokio::test]
+async fn mcp_status_change_cannot_restart_a_blocked_merge() {
+    let (_dir, state) = file_backed_state();
+    let router = task_server::app(state);
+    catalogue(&router, "sunny-side/task-server").await;
+
+    work_to_done_over_mcp(&router, "t-1").await;
+    merge_blocked_over_mcp(&router).await;
+    let mut admin = McpClient::new(&router, "/mcp", MCP_CAPABILITY);
+    admin.initialize().await;
+
+    let refused = admin
+        .call(
+            "task_set_status",
+            json!({ "id": "merge:t-1", "status": "ready" }),
+        )
+        .await;
+    assert_eq!(
+        refused["isError"],
+        json!(true),
+        "a press must not restart a blocked merge: {refused}"
+    );
+    assert_eq!(
+        refused["structuredContent"]["code"], "invalid",
+        "the same stable code HTTP answers with: {refused}"
+    );
+
+    let card = admin.call("task_get", json!({ "id": "merge:t-1" })).await;
+    let card = &card["structuredContent"];
+    assert_eq!(
+        card["task"]["status"], "blocked",
+        "a refusal moves no row: {card}"
+    );
+    let offered = card["available_transitions"]
+        .as_array()
+        .expect("available_transitions");
+    assert!(
+        !offered.contains(&json!("ready")),
+        "ready is never offered on a blocked merge: {card}"
+    );
+    assert_eq!(
+        offered,
+        &vec![json!("cancelled"), json!("dropped")],
+        "only the presses that call the attempt off are offered: {card}"
+    );
+
+    // Dropping it is a release exactly like cancelling, and the merge the work
+    // earns afterwards is a new row.
+    let dropped = admin
+        .call(
+            "task_set_status",
+            json!({ "id": "merge:t-1", "status": "dropped" }),
+        )
+        .await;
+    assert_eq!(dropped["isError"], json!(false), "{dropped}");
+
+    let (status, reissued) = http(
+        &router,
+        "POST",
+        "/api/merges",
+        Some(json!({ "task_id": "t-1" })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the dropped attempt freed the target: {reissued}"
+    );
+    assert_eq!(reissued["id"], "merge:t-1~2", "{reissued}");
+    assert_eq!(reissued["verification"], Value::Null, "{reissued}");
+}
+
 /// The MCP status tool is the other operator surface, and it inherits the same
 /// domain rule: a review is finished by its verdict, so `done` is refused there
 /// too. A model that could press it would be closing its own review with no
@@ -937,14 +1222,12 @@ async fn mcp_status_change_cannot_finish_a_review() {
     let mut worker = McpClient::new(&router, "/worker/mcp", WORKER_CAPABILITY);
     worker.initialize().await;
 
-    let (status, review) = http(
-        &router,
-        "POST",
-        "/api/reviews",
-        Some(json!({ "task_id": "t-1" })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "issue review: {review}");
+    let (status, review) = http(&router, "GET", "/api/tasks/review:t-1", None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the report issues a review: {review}"
+    );
     let claimed = worker
         .call(
             "task_claim",

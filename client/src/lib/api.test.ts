@@ -4,7 +4,6 @@ import {
   ApiError,
   fetchControl,
   fetchTasks,
-  postMerge,
   postRelease,
   postTaskStatus,
   type TaskCard,
@@ -27,6 +26,7 @@ const CARD: TaskCard = {
   commit_sha: null,
   verification: null,
   release_tag: null,
+  merge_sequence: null,
   created_at: "2026-08-15T10:00:00Z",
   updated_at: "2026-08-15T12:00:00Z",
   available_transitions: ["wip", "blocked"],
@@ -85,6 +85,8 @@ describe("api", () => {
     const plane = {
       mergeable: [],
       pending_merges: [],
+      pending_reviews: [],
+      unreviewed: [],
       releasable: [{ product_id: "sunny-side/task-server", task_count: 3 }],
     };
     const fetchMock = vi
@@ -98,24 +100,6 @@ describe("api", () => {
     expect(String(input)).toBe("/api/control");
     expect(init?.method).toBeUndefined();
     expect(control).toEqual(plane);
-  });
-
-  it("issues one merge per task id with the auth headers", async () => {
-    setSessionCsrf("csrf-token-2");
-    const fetchMock = vi
-      .fn<typeof fetch>()
-      .mockResolvedValue(jsonResponse({ id: "m-1" }));
-    vi.stubGlobal("fetch", fetchMock);
-
-    await postMerge("t-a");
-
-    const [input, init] = fetchMock.mock.calls[0];
-    expect(String(input)).toBe("/api/merges");
-    expect(init?.method).toBe("POST");
-    expect(init?.body).toBe(JSON.stringify({ task_id: "t-a" }));
-    const headers = new Headers(init?.headers);
-    expect(headers.get("content-type")).toBe("application/json");
-    expect(headers.get("X-CSRF-Token")).toBe("csrf-token-2");
   });
 
   it("posts a release with product and tag and returns the released set", async () => {
@@ -150,7 +134,7 @@ describe("api", () => {
       vi.fn<typeof fetch>().mockResolvedValue(
         new Response(
           JSON.stringify({
-            error: "task t-a already has a merge in flight",
+            error: "product sunny-side/task-server has nothing to release",
             code: "conflict",
           }),
           { status: 409, headers: { "content-type": "application/json" } },
@@ -158,9 +142,9 @@ describe("api", () => {
       ),
     );
 
-    const error = await postMerge("t-a").then(
+    const error = await postRelease("sunny-side/task-server", "v0.2.0").then(
       () => {
-        throw new Error("postMerge resolved but the server refused");
+        throw new Error("postRelease resolved but the server refused");
       },
       (rejected: unknown) => rejected,
     );
@@ -169,7 +153,9 @@ describe("api", () => {
     const refusal = error as ApiError;
     expect(refusal.status).toBe(409);
     expect(refusal.code).toBe("conflict");
-    expect(refusal.message).toBe("task t-a already has a merge in flight");
+    expect(refusal.message).toBe(
+      "product sunny-side/task-server has nothing to release",
+    );
   });
 
   it("rejects when the server refuses the transition", async () => {

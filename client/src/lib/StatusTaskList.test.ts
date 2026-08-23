@@ -128,6 +128,55 @@ describe("StatusTaskList", () => {
     }
   });
 
+  it("hides the tasks the panel draws in its readouts, and nothing more", () => {
+    // The pending review sits in the review queue; the done task with no
+    // review and the approved task with no merge sit in reconciliation.
+    render(StatusTaskList, {
+      props: {
+        fetchState: "ready",
+        items: ITEMS,
+        drawnElsewhere: ["r-1", "t-done", "t-approved"],
+      },
+    });
+
+    for (const id of ["r-1", "t-done", "t-approved"]) {
+      expect(document.querySelector(`a[href="/tasks/${id}"]`)).toBeNull();
+    }
+    expect(groups().map((group) => group.dataset.status)).toEqual([
+      "draft",
+      "ready",
+      "wip",
+      "merged",
+      "blocked",
+      "cancelled",
+      "dropped",
+    ]);
+    const ready = groups().find((group) => group.dataset.status === "ready")!;
+    expect(cardsOf(ready).map((card) => card.getAttribute("href"))).toEqual([
+      "/tasks/t-ready",
+    ]);
+    expect(
+      ready.querySelector<HTMLElement>("[data-count]")?.textContent?.trim(),
+    ).toBe("1");
+  });
+
+  it("keeps a review the panel no longer draws in its status group", () => {
+    // Same rule, other way round: once the review is not pending, the review
+    // queue is not drawing it, so it falls back into its group with its badge.
+    render(StatusTaskList, {
+      props: {
+        fetchState: "ready",
+        items: [summary("r-1", "done", "review", "レビュー: t-done")],
+        drawnElsewhere: [],
+      },
+    });
+
+    const done = groups().find((group) => group.dataset.status === "done")!;
+    const card = done.querySelector<HTMLElement>('a[href="/tasks/r-1"]')!;
+    expect(card).not.toBeNull();
+    expect(card.querySelector(".badge")?.textContent?.trim()).toBe("review");
+  });
+
   it("gives a card exactly one focusable element, the link itself", () => {
     render(StatusTaskList, { props: { fetchState: "ready", items: ITEMS } });
 

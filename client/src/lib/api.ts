@@ -48,6 +48,8 @@ export interface TaskCard {
   commit_sha: string | null;
   verification: string | null;
   release_tag: string | null;
+  // Only a merge task carries one: the position the server will claim it in.
+  merge_sequence: number | null;
   created_at: string;
   updated_at: string;
   available_transitions: string[];
@@ -126,10 +128,24 @@ export interface Releasable {
   task_count: number;
 }
 
-// What the top page needs to decide whether merge and release are live.
+// An outstanding merge, as /api/control reports it: the ordinary summary plus
+// why this one stopped. A blocked merge holds up every merge of its product,
+// so the reason travels with the queue rather than being fetched card by card
+// — one payload, one generation, nothing to fail on its own.
+export interface PendingMerge extends TaskSummary {
+  // `null` while the merge is running: only a blocked merge has a reason.
+  verification: string | null;
+}
+
+// What the top page needs to draw the automated stretch of the pipeline and
+// decide whether release is a live button. The `pending_*` lists are what the
+// server is carrying; `mergeable` and `unreviewed` are the reconciliation
+// windows, empty whenever the automatic issuing works.
 export interface ControlPlane {
   mergeable: TaskSummary[];
-  pending_merges: TaskSummary[];
+  pending_merges: PendingMerge[];
+  pending_reviews: TaskSummary[];
+  unreviewed: TaskSummary[];
   releasable: Releasable[];
 }
 
@@ -141,12 +157,6 @@ export interface ReleaseResult {
 
 export function fetchControl(signal?: AbortSignal): Promise<ControlPlane> {
   return requestJson("/api/control", { signal });
-}
-
-// Issue the merge task for one finished task. One target per request: the
-// server refuses a second merge for the same target with 409.
-export function postMerge(taskId: string): Promise<TaskCard> {
-  return postJson("/api/merges", { task_id: taskId });
 }
 
 export function postRelease(
