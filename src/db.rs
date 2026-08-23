@@ -125,6 +125,39 @@ PRAGMA user_version = 4;
 COMMIT;
 ";
 
+/// Version 5 adds the review control plane: a review task points at the work it
+/// reads and records the verdict it answered with.
+///
+/// The review keeps a target column of its own rather than sharing the merge's,
+/// because the two are live for different spans. A merge owns its target once it
+/// has landed, so `done` still blocks a second one; a review is over the moment
+/// it answers, and a task sent back for changes has to be reviewable again. One
+/// column could not carry both predicates, and a finished review sharing the
+/// merge column would have blocked the merge that follows it.
+///
+/// The subject of a review — the commit it was issued for — needs no column: it
+/// is the review's own `commit_sha`, inherited from the target exactly as a
+/// merge inherits one, and the findings are the review's `verification`, which
+/// is already the column for evidence a human reads.
+///
+/// `review_attempt` is the one thing the id cannot say. Retries are derived ids
+/// — `review:t-1`, `review:t-1~2`, `review:t-1~3` — and comparing those as text
+/// puts `~9` after `~10`, so "the latest review" would go backwards on the tenth
+/// attempt. The attempt number is written as an integer instead, and it is the
+/// order `latest_review` reads by. Timestamps could not stand in for it: they
+/// are second-precision, so two attempts finished in the same second are a tie.
+const SCHEMA_V5: &str = "\
+BEGIN;
+ALTER TABLE tasks ADD COLUMN review_target_task_id TEXT REFERENCES tasks(id);
+ALTER TABLE tasks ADD COLUMN review_verdict TEXT;
+ALTER TABLE tasks ADD COLUMN review_attempt INTEGER;
+CREATE UNIQUE INDEX tasks_open_review_target_idx ON tasks(review_target_task_id)
+  WHERE review_target_task_id IS NOT NULL
+    AND status NOT IN ('done', 'cancelled', 'dropped');
+PRAGMA user_version = 5;
+COMMIT;
+";
+
 /// How long a writer waits for a lock before giving up, in milliseconds.
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -278,6 +311,9 @@ fn migrate(conn: &Connection) -> Result<(), Error> {
     if version < 4 {
         conn.execute_batch(SCHEMA_V4)?;
     }
+    if version < 5 {
+        conn.execute_batch(SCHEMA_V5)?;
+    }
     Ok(())
 }
 
@@ -328,7 +364,7 @@ fn check_references(conn: &Connection) -> Result<(), Error> {
 mod tests {
     use rusqlite::Connection;
 
-    use super::{Db, SCHEMA_V1, SCHEMA_V2};
+    use super::{Db, SCHEMA_V1, SCHEMA_V2, SCHEMA_V4};
 
     fn pragma_string(db: &Db, pragma: &str) -> String {
         db.with_conn(|conn| Ok(conn.query_row(&format!("PRAGMA {pragma}"), [], |row| row.get(0))?))
@@ -419,11 +455,11 @@ mod tests {
         let named = Db::open(":memory:").unwrap();
         assert_eq!(pragma_string(&named, "journal_mode"), "memory");
         assert_eq!(pragma_int(&named, "busy_timeout"), 5000);
-        assert_eq!(user_version(&named), 4);
+        assert_eq!(user_version(&named), 5);
 
         let private = Db::open_in_memory().unwrap();
         assert_eq!(pragma_int(&private, "busy_timeout"), 5000);
-        assert_eq!(user_version(&private), 4);
+        assert_eq!(user_version(&private), 5);
 
         // A URI spelling is not one of them. Only the exact `:memory:` is
         // exempt, so a URI is an ordinary filename: it lands on disk in WAL,
@@ -463,6 +499,19 @@ mod tests {
             .collect()
     }
 
+    /// The rows of several tasks, without the columns a later version added:
+    /// the version 3 rebuild is what is under test, not what came after it.
+    fn rebuilt_rows(conn: &Connection, ids: [&str; 3]) -> Vec<Vec<(String, String)>> {
+        ids.into_iter()
+            .map(|id| {
+                task_row(conn, id)
+                    .into_iter()
+                    .filter(|(name, _)| !name.starts_with("review_"))
+                    .collect()
+            })
+            .collect()
+    }
+
     /// The columns a table has, as the database reports them. Read from the
     /// schema rather than inferred, so a migration can be asked whether it ran.
     fn column_names(conn: &Connection, table: &str) -> Vec<String> {
@@ -488,7 +537,7 @@ mod tests {
     #[test]
     fn migration_creates_the_current_schema() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(user_version(&db), 4);
+        assert_eq!(user_version(&db), 5);
         let tables: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row(
@@ -519,7 +568,7 @@ mod tests {
         drop(db);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 4);
+        assert_eq!(user_version(&db), 5);
         let products: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row("SELECT count(*) FROM products", [], |row| row.get(0))?)
@@ -554,7 +603,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 4);
+        assert_eq!(user_version(&db), 5);
 
         let (title, status, priority, merge_target, checks): (
             String,
@@ -645,29 +694,18 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(before, 2, "the fixture must start at version 2");
-        let rows_before: Vec<Vec<(String, String)>> = ["t-target", "merge:t-target", "t-plain"]
-            .into_iter()
-            .map(|id| task_row(&legacy, id))
-            .collect();
+        let rows_before = rebuilt_rows(&legacy, ["t-target", "merge:t-target", "t-plain"]);
         let indexes_before = index_names(&legacy);
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 4);
+        assert_eq!(user_version(&db), 5);
 
         db.with_conn(|conn| {
-            let rows_after: Vec<Vec<(String, String)>> = ["t-target", "merge:t-target", "t-plain"]
-                .into_iter()
-                .map(|id| task_row(conn, id))
-                .collect();
+            let rows_after = rebuilt_rows(conn, ["t-target", "merge:t-target", "t-plain"]);
             assert_eq!(
                 rows_after, rows_before,
                 "the rebuild must keep every column"
-            );
-            assert_eq!(
-                index_names(conn),
-                indexes_before,
-                "the rebuild must recreate every index"
             );
             assert_eq!(
                 indexes_before,
@@ -677,6 +715,17 @@ mod tests {
                     "tasks_status_idx"
                 ],
                 "the fixture must start with all three indexes"
+            );
+            // Exactly the three the rebuild had to recreate plus the one
+            // version 5 adds — no index quietly dropped, none quietly gained.
+            let mut expected = indexes_before.clone();
+            expected.push("tasks_open_review_target_idx".to_owned());
+            expected.sort();
+            assert_eq!(
+                index_names(conn),
+                expected,
+                "the migrated database must carry the old indexes and the review index, and \
+                 nothing else"
             );
 
             let products: i64 =
@@ -754,7 +803,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 4);
+        assert_eq!(user_version(&db), 5);
         let archived = |db: &Db| -> (usize, Option<String>) {
             db.with_conn(|conn| {
                 let columns = column_names(conn, "products");
@@ -779,7 +828,7 @@ mod tests {
         // column is not added twice and the row is not re-marked.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 4);
+        assert_eq!(user_version(&db), 5);
         assert_eq!(archived(&db), (1, None), "a second open changes nothing");
         let tasks: i64 = db
             .with_conn(|conn| {
@@ -943,5 +992,162 @@ mod tests {
             })
             .unwrap();
         assert_eq!(products, 0);
+    }
+
+    /// Version 5 adds the review control plane. Everything a version 4 database
+    /// already holds has to survive it, and the two new columns start empty:
+    /// nothing was reviewed before they existed.
+    #[test]
+    fn a_version_four_database_gains_empty_review_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sqlite.db");
+
+        let legacy = Connection::open(&path).unwrap();
+        legacy.execute_batch(SCHEMA_V1).unwrap();
+        legacy.execute_batch(SCHEMA_V2).unwrap();
+        legacy
+            .execute_batch(
+                "INSERT INTO products (id, repository, description, releases, created_at, updated_at)
+                 VALUES ('a/b', 'https://example.test/a/b.git', 'kept', 1, 'then', 'then');
+                 INSERT INTO tasks (id, title, body, status, kind, product_id, priority, branch,
+                                    commit_sha, verification, created_at, updated_at)
+                 VALUES ('t-old', 'older than the review', 'body', 'done', 'normal', 'a/b', 4,
+                         'task/t-old', 'abc1234', 'cargo test', 'then', 'then');",
+            )
+            .unwrap();
+        super::rebuild_tasks_without_the_product_key(&legacy).unwrap();
+        legacy.execute_batch(SCHEMA_V4).unwrap();
+        let before: i64 = legacy
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, 4, "the fixture must start at version 4");
+        let columns = column_names(&legacy, "tasks");
+        assert!(
+            !columns.contains(&"review_target_task_id".to_owned())
+                && !columns.contains(&"review_verdict".to_owned()),
+            "a version 4 database has no review columns yet"
+        );
+        let row_before = task_row(&legacy, "t-old");
+        drop(legacy);
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(user_version(&db), 5);
+        db.with_conn(|conn| {
+            let columns = column_names(conn, "tasks");
+            for added in ["review_target_task_id", "review_verdict"] {
+                assert_eq!(
+                    columns.iter().filter(|name| *name == added).count(),
+                    1,
+                    "{added} must be added exactly once: {columns:?}"
+                );
+            }
+            let (target, verdict): (Option<String>, Option<String>) = conn.query_row(
+                "SELECT review_target_task_id, review_verdict FROM tasks WHERE id = 't-old'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert!(
+                target.is_none() && verdict.is_none(),
+                "a row that predates the columns is unreviewed"
+            );
+            let kept: Vec<(String, String)> = task_row(conn, "t-old")
+                .into_iter()
+                .filter(|(name, _)| !name.starts_with("review_"))
+                .collect();
+            assert_eq!(kept, row_before, "no existing column may change");
+            Ok(())
+        })
+        .unwrap();
+
+        // Reopening runs the step again and must change nothing.
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(user_version(&db), 5);
+        let tasks: i64 = db
+            .with_conn(|conn| {
+                Ok(conn.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(tasks, 1, "a second open changes nothing");
+    }
+
+    /// A review that finished — approved, or sent back for changes — is over,
+    /// and must not keep the next review of the same task out. That is exactly
+    /// where the review index parts company with the merge index, which is why
+    /// the two cannot share a column.
+    #[test]
+    fn one_open_review_targets_a_task_while_a_finished_one_frees_it() {
+        let db = Db::open_in_memory().unwrap();
+        let insert = |id: &str, status: &str, column: &str| {
+            db.with_conn(|conn| {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO tasks (id, title, status, kind, {column},
+                                            created_at, updated_at)
+                         VALUES (?1, 'attempt', ?2, 'review', 't-target', 'now', 'now')"
+                    ),
+                    rusqlite::params![id, status],
+                )?;
+                Ok(())
+            })
+        };
+        let finish = |id: &str, status: &str| {
+            db.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE tasks SET status = ?2 WHERE id = ?1",
+                    rusqlite::params![id, status],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        };
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, created_at, updated_at)
+                 VALUES ('t-target', 'target', 'done', 'now', 'now')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        insert("r-1", "ready", "review_target_task_id").unwrap();
+        assert!(
+            insert("r-2", "ready", "review_target_task_id").is_err(),
+            "a second open review for the same target must be refused"
+        );
+
+        finish("r-1", "done");
+        insert("r-2", "ready", "review_target_task_id")
+            .expect("a finished review must not block the next one");
+        finish("r-2", "cancelled");
+        insert("r-3", "ready", "review_target_task_id")
+            .expect("a cancelled review must not block the next one");
+
+        // The merge index keeps its own rule: a `done` merge still owns its
+        // target, because a landed merge is not an invitation to land again.
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, kind, merge_target_task_id,
+                                    created_at, updated_at)
+                 VALUES ('m-1', 'merge', 'done', 'instant:merge', 't-target', 'now', 'now')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let second_merge = db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, kind, merge_target_task_id,
+                                    created_at, updated_at)
+                 VALUES ('m-2', 'merge', 'ready', 'instant:merge', 't-target', 'now', 'now')",
+                [],
+            )?;
+            Ok(())
+        });
+        assert!(
+            second_merge.is_err(),
+            "a landed merge still owns its target, so the two indexes differ"
+        );
     }
 }

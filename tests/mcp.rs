@@ -366,7 +366,7 @@ async fn both_endpoints_handshake_and_expose_only_their_own_tools() {
     worker.initialize().await;
     assert_eq!(
         worker.tool_names().await,
-        ["task_claim", "task_report"],
+        ["task_claim", "task_report", "task_review_report"],
         "a worker capability never reaches task CRUD"
     );
 
@@ -693,11 +693,12 @@ async fn task_create_has_no_kind_and_cannot_file_a_merge() {
     }
 }
 
-/// The refusal of `merged` and `released` is one domain rule, so pressing it
-/// over MCP answers exactly what pressing it over HTTP answers, and moves
-/// nothing.
+/// The refusal of `approved`, `merged`, and `released` is one domain rule, so
+/// pressing it over MCP answers exactly what pressing it over HTTP answers, and
+/// moves nothing. `approved` matters most here: a model that could press it
+/// would be approving its own work.
 #[tokio::test]
-async fn mcp_status_change_refuses_merged_and_released() {
+async fn mcp_status_change_refuses_approved_merged_and_released() {
     let (_dir, state) = file_backed_state();
     let router = task_server::app(state);
     catalogue(&router, "sunny-side/task-server").await;
@@ -741,7 +742,7 @@ async fn mcp_status_change_refuses_merged_and_released() {
 
     // `done` is exactly the status the transition table would let through, so
     // this is the bypass the shared rule has to close.
-    for status in ["merged", "released"] {
+    for status in ["approved", "merged", "released"] {
         let refused = admin
             .call("task_set_status", json!({ "id": "t-1", "status": status }))
             .await;
@@ -766,4 +767,248 @@ async fn mcp_status_change_refuses_merged_and_released() {
         assert_eq!(status_code, StatusCode::OK);
         assert_eq!(card["status"], "done", "a refusal moves no row: {card}");
     }
+}
+
+/// File `id` for the catalogued product and take it to `done` over MCP, the way
+/// an implementing loop does.
+async fn work_to_done_over_mcp(router: &Router, id: &str) {
+    let mut admin = McpClient::new(router, "/mcp", MCP_CAPABILITY);
+    admin.initialize().await;
+    admin
+        .call(
+            "task_create",
+            json!({
+                "id": id,
+                "title": "read me",
+                "product_id": "sunny-side/task-server",
+            }),
+        )
+        .await;
+    admin
+        .call("task_set_status", json!({ "id": id, "status": "ready" }))
+        .await;
+
+    let mut worker = McpClient::new(router, "/worker/mcp", WORKER_CAPABILITY);
+    worker.initialize().await;
+    let claimed = worker
+        .call(
+            "task_claim",
+            json!({ "worker": "opus", "kinds": ["normal"] }),
+        )
+        .await;
+    let claim_id = claimed["structuredContent"]["task"]["claim_id"]
+        .as_str()
+        .expect("claim id")
+        .to_owned();
+    let reported = worker
+        .call(
+            "task_report",
+            json!({
+                "claim_id": claim_id,
+                "commit_sha": "abc1234",
+                "verification": "cargo test",
+            }),
+        )
+        .await;
+    assert_eq!(reported["structuredContent"]["task"]["status"], "done");
+}
+
+/// The worker face carries the review contract too, or a reviewer loop on MCP
+/// would have to fall back to HTTP for the one call it exists to make.
+#[tokio::test]
+async fn a_reviewer_answers_over_mcp_and_http_sees_the_same_row() {
+    let (_dir, state) = file_backed_state();
+    let router = task_server::app(state);
+    catalogue(&router, "sunny-side/task-server").await;
+
+    work_to_done_over_mcp(&router, "t-1").await;
+    let mut admin = McpClient::new(&router, "/mcp", MCP_CAPABILITY);
+    admin.initialize().await;
+    let mut worker = McpClient::new(&router, "/worker/mcp", WORKER_CAPABILITY);
+    worker.initialize().await;
+
+    let (status, review) = http(
+        &router,
+        "POST",
+        "/api/reviews",
+        Some(json!({ "task_id": "t-1" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "issue review: {review}");
+
+    // A loop that asks for merges is told there is no work, not handed the
+    // review that is waiting.
+    let idle = worker
+        .call(
+            "task_claim",
+            json!({ "worker": "luna", "kinds": ["instant:merge"] }),
+        )
+        .await;
+    assert_eq!(idle["structuredContent"]["status"], "no-work", "{idle}");
+    assert_eq!(idle["isError"], json!(false), "{idle}");
+
+    let claimed = worker
+        .call(
+            "task_claim",
+            json!({ "worker": "sol", "kinds": ["review"] }),
+        )
+        .await;
+    let review_task = &claimed["structuredContent"]["task"];
+    assert_eq!(review_task["id"], "review:t-1");
+    assert_eq!(review_task["kind"], "review");
+    assert_eq!(review_task["commit_sha"], "abc1234");
+    let claim_id = review_task["claim_id"]
+        .as_str()
+        .expect("claim id")
+        .to_owned();
+
+    // An approval of a commit the review was not issued for is refused with the
+    // same stable code HTTP answers with, and writes nothing.
+    let refused = worker
+        .call(
+            "task_review_report",
+            json!({
+                "claim_id": claim_id,
+                "subject_commit_sha": "def5678",
+                "verdict": "approve",
+                "findings": "approving something else",
+            }),
+        )
+        .await;
+    assert_eq!(refused["isError"], json!(true), "{refused}");
+    assert_eq!(
+        refused["structuredContent"]["code"], "review_subject_mismatch",
+        "{refused}"
+    );
+
+    let answered = worker
+        .call(
+            "task_review_report",
+            json!({
+                "claim_id": claim_id,
+                "subject_commit_sha": "abc1234",
+                "verdict": "request_changes",
+                "findings": "the empty case is unguarded",
+            }),
+        )
+        .await;
+    assert_eq!(
+        answered["isError"],
+        json!(false),
+        "asking for changes is a finished review, not a failure: {answered}"
+    );
+    assert_eq!(answered["structuredContent"]["task"]["status"], "done");
+    assert_eq!(
+        answered["structuredContent"]["task"]["review_verdict"],
+        "request_changes"
+    );
+
+    // One database: HTTP reads the same row, and the worker reads the findings
+    // off the task it will claim again.
+    let (status, card) = http(&router, "GET", "/api/tasks/t-1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(card["status"], "ready", "the work went back: {card}");
+    assert_eq!(card["latest_review"]["verdict"], "request_changes");
+    assert_eq!(
+        card["latest_review"]["findings"],
+        "the empty case is unguarded"
+    );
+
+    let seen = admin.call("task_get", json!({ "id": "t-1" })).await;
+    assert_eq!(
+        seen["structuredContent"]["latest_review"]["findings"], "the empty case is unguarded",
+        "the same card over both transports: {seen}"
+    );
+}
+
+/// The MCP status tool is the other operator surface, and it inherits the same
+/// domain rule: a review is finished by its verdict, so `done` is refused there
+/// too. A model that could press it would be closing its own review with no
+/// reading behind it, and freeing the target for the next one on the way out.
+#[tokio::test]
+async fn mcp_status_change_cannot_finish_a_review() {
+    let (_dir, state) = file_backed_state();
+    let router = task_server::app(state);
+    catalogue(&router, "sunny-side/task-server").await;
+
+    work_to_done_over_mcp(&router, "t-1").await;
+    let mut admin = McpClient::new(&router, "/mcp", MCP_CAPABILITY);
+    admin.initialize().await;
+    let mut worker = McpClient::new(&router, "/worker/mcp", WORKER_CAPABILITY);
+    worker.initialize().await;
+
+    let (status, review) = http(
+        &router,
+        "POST",
+        "/api/reviews",
+        Some(json!({ "task_id": "t-1" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "issue review: {review}");
+    let claimed = worker
+        .call(
+            "task_claim",
+            json!({ "worker": "sol", "kinds": ["review"] }),
+        )
+        .await;
+    assert_eq!(claimed["structuredContent"]["task"]["id"], "review:t-1");
+
+    let refused = admin
+        .call(
+            "task_set_status",
+            json!({ "id": "review:t-1", "status": "done" }),
+        )
+        .await;
+    assert_eq!(
+        refused["isError"],
+        json!(true),
+        "a press must not finish a review: {refused}"
+    );
+    assert_eq!(
+        refused["structuredContent"]["code"], "invalid",
+        "the same stable code HTTP answers with: {refused}"
+    );
+    let message = refused["structuredContent"]["error"]
+        .as_str()
+        .expect("error message");
+    assert!(
+        message.contains("verdict"),
+        "the refusal must name the verdict: {message}"
+    );
+
+    let card = admin.call("task_get", json!({ "id": "review:t-1" })).await;
+    let card = &card["structuredContent"];
+    assert_eq!(
+        card["task"]["status"], "wip",
+        "a refusal moves no row: {card}"
+    );
+    assert_eq!(card["task"]["review_verdict"], Value::Null, "{card}");
+    let offered = card["available_transitions"]
+        .as_array()
+        .expect("available_transitions");
+    assert!(
+        !offered.contains(&json!("done")),
+        "done is never offered on a review: {card}"
+    );
+
+    let (status_code, parent) = http(&router, "GET", "/api/tasks/t-1", None).await;
+    assert_eq!(status_code, StatusCode::OK);
+    assert_eq!(
+        parent["status"], "done",
+        "the parent is untouched: {parent}"
+    );
+    assert_eq!(parent["latest_review"], Value::Null, "{parent}");
+
+    let (status_code, again) = http(
+        &router,
+        "POST",
+        "/api/reviews",
+        Some(json!({ "task_id": "t-1" })),
+    )
+    .await;
+    assert_eq!(
+        status_code,
+        StatusCode::CONFLICT,
+        "the refused press must not have freed the one-open-review index: {again}"
+    );
 }

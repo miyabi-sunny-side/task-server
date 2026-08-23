@@ -177,8 +177,12 @@ a
   line-height: 1.4
   color: var(--c-muted)
 
-// Count pill (badge recipe) and the muted caption that replaces it at zero.
-.pill
+// One recipe, two jobs (DESIGN.md, Components): the count pill beside a
+// heading and the neutral outline badge that names a status or a kind. They
+// are written once because a second copy is how the two drift apart — the
+// full radius here is what invariant 16 measures on both.
+.pill, .badge
+  display: inline-block
   padding: var(--sp-1) var(--sp-2)
   border: 1px solid var(--c-border)
   border-radius: var(--radius-full)

@@ -535,19 +535,41 @@ counterpart to carry, so it earns no token pair.
   regions, so the changed counts and lists are the real receipt.
 
   **Task list.** Below the panel, the open tasks grouped by status.
-  `released` is never shown, and `instant:merge` tasks never appear
-  (they belong to the panel). Groups follow the status vocabulary order
-  — `draft`, `ready`, `wip`, `done`, `merged`, then the sidetracks
+  Groups follow the status vocabulary order — the main line `draft`,
+  `ready`, `wip`, `done`, `approved`, `merged`, then the sidetracks
   `blocked`, `cancelled`, `dropped` — and **a group holding nothing is
-  not rendered at all**, heading included. Each group is a section
-  carrying its status as a data attribute, headed by a label-type
-  heading naming the status with its count pill beside it; under the
-  heading, cards per the family recipe (surface-raised, 1px hairline,
-  8px radius, 10px padding) in a single column with 8px gaps. A card
-  links to its Task Card and shows the task title (label) with the
-  product id as a muted caption — the group heading already carries the
-  status, so the card does not repeat it. The list container keeps
-  `data-state="loading|empty|error|success"`:
+  not rendered at all**, heading included. The order is the pipeline
+  read from its start, so `approved` sits between `done` and `merged`:
+  that is where the work stands — finished, carried past review, not
+  yet landed. `released` is never shown — shipped work leaves this
+  page.
+
+  **What the list hides, and why.** The list shows every task that is
+  waiting for someone to pick it up, and hides exactly one thing: work
+  another region of this same page already renders. `instant:merge`
+  tasks are hidden because the control panel draws them as merges in
+  flight, and one object drawn twice on one screen reads as two.
+  Nothing else is hidden. In particular a **`review` task appears in
+  its status group like any other open work**: it is a job waiting for
+  a reviewer to claim, no region of this page draws it, and hiding it
+  would leave an unclaimed review with no surface anywhere in the UI.
+  If a later delivery gives the panel a region that renders reviews,
+  this same rule moves them out of the groups — the question is
+  settled by that rule, not re-opened as a matter of taste.
+
+  Each group is a section carrying its status as a data attribute,
+  headed by a label-type heading naming the status with its count pill
+  beside it; under the heading, cards per the family recipe
+  (surface-raised, 1px hairline, 8px radius, 10px padding) in a single
+  column with 8px gaps. A card links to its Task Card and shows the
+  task title (label) with the product id as a muted caption — the group
+  heading already carries the status, so the card does not repeat it. A
+  task whose kind is not `normal` adds the **outline kind badge** (the
+  Task Card's recipe — caption type, 1px border, muted text) beside the
+  product id, so open implementation work and open review work are told
+  apart without parsing titles; a `normal` task carries no badge, and
+  the badge never adds a second focus stop inside the card link. The
+  list container keeps `data-state="loading|empty|error|success"`:
   - _loading:_ centered muted body-sm text with the accent spinner
     (1.5px-stroke circle, 1.1rem);
   - _empty:_ centered muted body-sm message;
@@ -583,12 +605,39 @@ counterpart to carry, so it earns no token pair.
   muted text; neutral chrome, not a data color), `commit_sha` and
   `verification` as muted captions when present, body text (body, 1.6,
   pre-line), and `available_transitions` as a row of default buttons,
-  one per reachable status. An `instant:merge` task carries a second
-  outline badge next to the status. The `ready` transition, when
-  present, is the single primary (accent-filled) button — it is the
-  human decision the screen exists for. After a successful transition
-  the card reloads so status and buttons update. There is no
+  one per reachable status. A task whose kind is not `normal`
+  (`instant:merge`, `review`) carries a second outline badge naming
+  that kind next to the status. The `ready` transition, when present,
+  is the single primary (accent-filled) button — it is the human
+  decision the screen exists for. After a successful transition the
+  card reloads so status and buttons update. There is no
   icon-dictionary fixture page.
+
+  **Status is worn, never tinted.** Every status reads through the same
+  neutral outline badge and its group heading; no status earns a color,
+  an icon, or a weight of its own. `approved` is told apart from `done`
+  by where it sits in the vocabulary order — past review, before the
+  landing — and that position is the whole of its signal. `approved` is
+  also a status this screen never *produces*: a review report alone
+  enters it, so no control anywhere in this UI is labelled `approved`.
+
+  **Review block.** A task the card payload carries a review outcome
+  for (`review_verdict` and `review_findings`, however the server
+  sources them) renders one block **between the caption row and the
+  body**: a muted caption heading レビュー carrying the verdict as an
+  outline badge, then the findings as body-sm text with `white-space:
+  pre-line`, the whole block built from the card recipe
+  (surface-raised, 1px hairline, md radius, 10px padding). It sits
+  above the body because a worker reopening a task that came back to
+  `ready` has to read the correction before the instruction it
+  corrects; a reader who has to scroll past the brief to find out why
+  it reappeared has been told too late. It stays **neutral**:
+  `request_changes` is an ordinary outcome of review, not a failure of
+  the app, so the danger tokens stay reserved for requests that failed.
+  A task with no review outcome renders no block — never an empty one.
+  A `review` task's own card adds its subject commit as a muted caption
+  in the caption row, so the operator can see which commit the verdict
+  was passed on.
 - **Buttons:** default = surface-raised bg, 1px hairline, label type,
   sm radius, 8×14px padding, hover fills `--c-hover-1`. Primary =
   accent bg, `surface-raised`-token text — **at most one per primary
@@ -707,10 +756,11 @@ counterpart to carry, so it earns no token pair.
       the panel, and the released tasks are gone from the `merged` group
       on reload.
   16. Status groups exist in the DOM only when non-empty; their document
-      order is draft, ready, wip, done, merged, blocked, cancelled,
-      dropped; no group for `released` ever exists; each heading's count
-      pill number equals the number of cards under it; `9999px` radius
-      is computed only on count pills and status badges.
+      order is draft, ready, wip, done, approved, merged, blocked,
+      cancelled, dropped; no group for `released` ever exists; each
+      heading's count pill number equals the number of cards under it;
+      `9999px` radius is computed only on count pills and outline
+      badges.
   17. At 375px the panel's buttons and notes wrap without
       `document.documentElement.scrollWidth` exceeding the viewport,
       every control's hit box is at least 36px tall, and no control row
@@ -751,6 +801,29 @@ counterpart to carry, so it earns no token pair.
       clip (no ink lost) and the ink bounding box is at least 28px wide
       of the 48, so what remains is the whole check rather than a
       fragment.
+  22. Open review is visible work: with a `review` task in `ready`, the
+      `ready` group contains a card linking to it, and that card carries
+      an outline badge reading `review` beside the product id while a
+      `normal` task's card carries no kind badge. No status group ever
+      contains a card for an `instant:merge` task. Tabbing through a
+      card reaches exactly one focusable element — the card link itself.
+  23. `approved` is a status the UI reads and never writes: on a `done`
+      task's Task Card no transition button's text is `approved`, and
+      across the top page and any open modal no control's text is
+      `approved`. An `approved` group renders like every other group —
+      neutral heading, count pill, and no color, icon, or weight telling
+      it apart from `done`.
+  24. A task carrying a review outcome renders the review block on its
+      Task Card, and the block precedes the body element in document
+      order (`compareDocumentPosition`). The block computes the card
+      geometry (1px border, 8px radius, 10px padding); its text colors
+      are the muted and on-surface tokens and never the danger pair; its
+      findings preserve newlines (`white-space` is `pre-line`). A task
+      with no review outcome renders no such block, empty or otherwise.
+      At 375px, findings holding a 40-character unbroken token still
+      leave `document.documentElement.scrollWidth` within the viewport.
+      A `review` task's card shows its subject commit as a muted
+      caption.
 
 ## Do's and Don'ts
 
@@ -770,6 +843,15 @@ counterpart to carry, so it earns no token pair.
   itself.
 - Do drop a status group entirely when it holds nothing; don't render a
   heading with a zero pill under it.
+- Do let a status say what it means through the vocabulary order and the
+  neutral outline badge; don't give one status a color, an icon, or a
+  weight the others don't have.
+- Do keep a task in its status group whenever it is waiting for someone
+  to claim it; hide it only when another region of the same page already
+  draws it.
+- Do show a review's findings on the reviewed task's own card, above the
+  body; don't make the worker who was sent back navigate elsewhere to
+  learn why.
 - Do present the menu as a hamburger-anchored dropdown; centered
   modals are for dialogs (theme settings), never for navigation.
 - Don't use emoji or text glyphs as icons; every UI icon is an

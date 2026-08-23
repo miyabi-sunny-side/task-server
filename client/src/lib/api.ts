@@ -21,6 +21,17 @@ export interface TaskSummary {
   updated_at: string;
 }
 
+// What the latest *finished* review of a task said, read from that review's
+// own row. A review still open has no verdict and does not answer here, so a
+// task with nothing to show simply carries no `latest_review`.
+export interface ReviewOutcome {
+  review_task_id: string;
+  verdict: "approve" | "request_changes";
+  findings: string | null;
+  subject_commit_sha: string | null;
+  reported_at: string;
+}
+
 export interface TaskCard {
   id: string;
   title: string;
@@ -40,6 +51,7 @@ export interface TaskCard {
   created_at: string;
   updated_at: string;
   available_transitions: string[];
+  latest_review?: ReviewOutcome;
 }
 
 // A refusal the server explained. The message is the human wording the

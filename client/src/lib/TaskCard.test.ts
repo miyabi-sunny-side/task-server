@@ -72,16 +72,78 @@ describe("TaskCard", () => {
     expect(ontransition).toHaveBeenCalledTimes(2);
   });
 
-  it("marks an instant:merge task and leaves a normal task unmarked", () => {
+  it("names any kind that is not normal in a badge, and leaves a normal task unmarked", () => {
+    for (const kind of ["instant:merge", "review"]) {
+      render(TaskCard, { props: { task: { ...FIXTURE, kind } } });
+      expect(screen.getByText(kind)).toBeTruthy();
+      cleanup();
+    }
+
+    render(TaskCard, { props: { task: FIXTURE } });
+    expect(screen.queryByText("instant:merge")).toBe(null);
+    expect(screen.queryByText("review")).toBe(null);
+    expect(document.querySelectorAll(".badge")).toHaveLength(1);
+  });
+
+  it("shows a review task's subject commit as a muted caption", () => {
     render(TaskCard, {
-      props: { task: { ...FIXTURE, kind: "instant:merge" } },
+      props: { task: { ...FIXTURE, kind: "review", commit_sha: "9f8e7d6c" } },
     });
-    expect(screen.getByText("instant:merge")).toBeTruthy();
+
+    const caption = document.querySelector<HTMLElement>(
+      '[data-field="subject_commit_sha"]',
+    );
+    expect(caption).not.toBeNull();
+    expect(caption!.classList.contains("caption")).toBe(true);
+    expect(caption!.textContent).toContain("9f8e7d6c");
 
     cleanup();
 
     render(TaskCard, { props: { task: FIXTURE } });
-    expect(screen.queryByText("instant:merge")).toBe(null);
+    expect(
+      document.querySelector('[data-field="subject_commit_sha"]'),
+    ).toBeNull();
+  });
+
+  it("renders the review block before the body, verdict and findings included", () => {
+    render(TaskCard, {
+      props: {
+        task: {
+          ...FIXTURE,
+          latest_review: {
+            review_task_id: "rev-1",
+            verdict: "request_changes",
+            findings: "境界値が抜けています。\n再提出してください。",
+            subject_commit_sha: "abc1234def",
+            reported_at: "2026-08-16T09:00:00Z",
+          },
+        },
+      },
+    });
+
+    const block = document.querySelector<HTMLElement>(
+      '[data-field="latest_review"]',
+    );
+    expect(block).not.toBeNull();
+    expect(block!.textContent).toContain("レビュー");
+    expect(screen.getByText("request_changes").classList).toContain("badge");
+
+    const findings = block!.querySelector<HTMLElement>("[data-findings]");
+    expect(findings?.textContent).toBe(
+      "境界値が抜けています。\n再提出してください。",
+    );
+
+    const body = screen.getByText(FIXTURE.body);
+    expect(
+      block!.compareDocumentPosition(body) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("renders no review block at all for a task no review has answered", () => {
+    render(TaskCard, { props: { task: FIXTURE } });
+
+    expect(document.querySelector('[data-field="latest_review"]')).toBeNull();
+    expect(screen.queryByText("レビュー")).toBe(null);
   });
 
   it("disables every transition button while busy", () => {

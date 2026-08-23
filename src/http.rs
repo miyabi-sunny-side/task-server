@@ -4,10 +4,14 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
+use crate::db::Db;
 use crate::error::Error;
 use crate::product::{self, Product};
 use crate::state::AppState;
-use crate::task::{self, Check, NewTask, Releasable, Task, TaskKind, TaskPatch, TaskStatus};
+use crate::task::{
+    self, Check, NewTask, Releasable, ReviewOutcome, ReviewVerdict, Task, TaskKind, TaskPatch,
+    TaskStatus,
+};
 
 /// A row in the task list: enough to render a card in a list, no body.
 #[derive(Debug, Serialize)]
@@ -35,17 +39,26 @@ impl From<Task> for TaskSummary {
     }
 }
 
-/// The full task plus the transitions a human may actually press.
+/// The full task plus the transitions a human may actually press and, for work
+/// a review has answered, what that review said.
 #[derive(Debug, Serialize)]
 pub struct TaskCard {
     #[serde(flatten)]
     pub task: Task,
     pub available_transitions: Vec<TaskStatus>,
+    /// The latest finished review of this task, read from that review's row.
+    /// Absent while nothing has reviewed it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_review: Option<ReviewOutcome>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ClaimBody {
     pub worker: String,
+    /// Which kinds of work this loop handles. Empty or absent takes anything,
+    /// so a worker written before roles existed keeps working.
+    #[serde(default)]
+    pub kinds: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +68,19 @@ pub struct ReportBody {
     pub verification: String,
     #[serde(default)]
     pub checks: Vec<Check>,
+}
+
+/// A review's completion. Deliberately not [`ReportBody`]: a verdict is not a
+/// commit, and `request_changes` is a finished review rather than a failed one.
+#[derive(Debug, Deserialize)]
+pub struct ReviewReportBody {
+    pub claim_id: String,
+    /// The commit the reviewer read. Must be the one the review was issued for.
+    pub subject_commit_sha: String,
+    /// `approve` or `request_changes`.
+    pub verdict: String,
+    /// What the reviewer found, kept whichever way the verdict went.
+    pub findings: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,12 +194,20 @@ fn require_human_mutation(headers: &HeaderMap, state: &AppState) -> Result<(), E
     }
 }
 
-fn card(task: Task) -> TaskCard {
+fn card(db: &Db, task: Task) -> Result<TaskCard, Error> {
     let available_transitions = task::available_transitions(&task);
-    TaskCard {
+    // Ordinary work is the only thing a review answers for, so nothing else
+    // pays for the lookup.
+    let latest_review = if task.kind == TaskKind::Normal {
+        task::latest_review(db, &task.id)?
+    } else {
+        None
+    };
+    Ok(TaskCard {
         task,
         available_transitions,
-    }
+        latest_review,
+    })
 }
 
 fn summaries(tasks: Vec<Task>) -> Vec<TaskSummary> {
@@ -240,7 +274,7 @@ pub async fn api_create_task(
         },
         state.clock.now(),
     )?;
-    Ok((StatusCode::CREATED, Json(card(created))).into_response())
+    Ok((StatusCode::CREATED, Json(card(&state.db, created)?)).into_response())
 }
 
 pub async fn api_task(
@@ -250,7 +284,7 @@ pub async fn api_task(
 ) -> Result<Json<TaskCard>, Error> {
     require_identity(&headers, &state)?;
     let task = task::get(&state.db, &id)?;
-    Ok(Json(card(task)))
+    Ok(Json(card(&state.db, task)?))
 }
 
 pub async fn api_patch_task(
@@ -261,7 +295,7 @@ pub async fn api_patch_task(
 ) -> Result<Json<TaskCard>, Error> {
     require_human_mutation(&headers, &state)?;
     let updated = task::update(&state.db, &id, &patch, state.clock.now())?;
-    Ok(Json(card(updated)))
+    Ok(Json(card(&state.db, updated)?))
 }
 
 pub async fn api_set_status(
@@ -275,7 +309,7 @@ pub async fn api_set_status(
     // Landing and shipping are earned, not pressed. The rule itself lives in
     // the domain, so the MCP tool refuses exactly what this route refuses.
     let moved = task::set_status_by_operator(&state.db, &id, to, state.clock.now())?;
-    Ok(Json(card(moved)))
+    Ok(Json(card(&state.db, moved)?))
 }
 
 pub async fn api_control(
@@ -297,7 +331,17 @@ pub async fn api_issue_merge(
 ) -> Result<Response, Error> {
     require_human_mutation(&headers, &state)?;
     let issued = task::issue_merge(&state.db, &body.task_id, state.clock.now())?;
-    Ok((StatusCode::CREATED, Json(card(issued))).into_response())
+    Ok((StatusCode::CREATED, Json(card(&state.db, issued)?)).into_response())
+}
+
+pub async fn api_issue_review(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<MergeBody>,
+) -> Result<Response, Error> {
+    require_human_mutation(&headers, &state)?;
+    let issued = task::issue_review(&state.db, &body.task_id, state.clock.now())?;
+    Ok((StatusCode::CREATED, Json(card(&state.db, issued)?)).into_response())
 }
 
 pub async fn api_release(
@@ -360,14 +404,20 @@ pub async fn worker_claim(
     Json(body): Json<ClaimBody>,
 ) -> Result<Response, Error> {
     require_worker(&headers, &state)?;
+    let kinds = body
+        .kinds
+        .iter()
+        .map(|raw| TaskKind::parse(raw))
+        .collect::<Result<Vec<TaskKind>, Error>>()?;
     let leased = task::claim(
         &state.db,
         &body.worker,
+        &kinds,
         state.clock.now(),
         state.claim_ttl_secs,
     )?;
     match leased {
-        Some(task) => Ok(Json(card(task)).into_response()),
+        Some(task) => Ok(Json(card(&state.db, task)?).into_response()),
         None => Ok((
             StatusCode::OK,
             Json(serde_json::json!({ "status": "no-work" })),
@@ -390,7 +440,31 @@ pub async fn worker_report(
         &body.checks,
         state.clock.now(),
     )?;
-    Ok(Json(card(reported)))
+    Ok(Json(card(&state.db, reported)?))
+}
+
+/// The review's own completion route.
+///
+/// It is not `/worker/report` because the two contracts differ: a review answers
+/// with a verdict rather than a commit, carries no checks to gate on, and a
+/// `request_changes` is a success — the reviewer did their job and the answer is
+/// "not yet". The capability is the same one every worker route asks for.
+pub async fn worker_review_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ReviewReportBody>,
+) -> Result<Json<TaskCard>, Error> {
+    require_worker(&headers, &state)?;
+    let verdict = ReviewVerdict::parse(&body.verdict)?;
+    let reported = task::review_report(
+        &state.db,
+        &body.claim_id,
+        &body.subject_commit_sha,
+        verdict,
+        &body.findings,
+        state.clock.now(),
+    )?;
+    Ok(Json(card(&state.db, reported)?))
 }
 
 /// A path no API route claims. It is our refusal, so it answers in the shape

@@ -32,7 +32,7 @@ use crate::error::Error;
 use crate::http::TaskSummary;
 use crate::product;
 use crate::state::AppState;
-use crate::task::{self, Check, NewTask, Task, TaskKind, TaskPatch, TaskStatus};
+use crate::task::{self, Check, NewTask, ReviewVerdict, Task, TaskKind, TaskPatch, TaskStatus};
 
 /// What a client shows in its server list. `Implementation::from_build_env`
 /// reads the SDK's own manifest, so it would answer `rmcp` instead of us.
@@ -66,8 +66,9 @@ pub struct TaskIdArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TaskListArgs {
-    /// One of `draft`, `ready`, `wip`, `done`, `merged`, `released`, `blocked`,
-    /// `cancelled`, `dropped`. Left out, everything that is not `released`.
+    /// One of `draft`, `ready`, `wip`, `done`, `approved`, `merged`,
+    /// `released`, `blocked`, `cancelled`, `dropped`. Left out, everything that
+    /// is not `released`.
     #[serde(default)]
     pub status: Option<String>,
 }
@@ -101,6 +102,10 @@ pub struct TaskSetStatusArgs {
 pub struct TaskClaimArgs {
     /// Who is taking the work, so an abandoned lease can be traced.
     pub worker: String,
+    /// The kinds of work this loop handles: `normal`, `instant:merge`,
+    /// `review`. Left out, anything claimable.
+    #[serde(default)]
+    pub kinds: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -115,6 +120,18 @@ pub struct TaskReportArgs {
     /// only accepted when every one of them exited 0.
     #[serde(default)]
     pub checks: Vec<CheckArgs>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TaskReviewReportArgs {
+    /// The `claim_id` the claim handed back.
+    pub claim_id: String,
+    /// The commit that was read. It has to be the one the review was issued for.
+    pub subject_commit_sha: String,
+    /// `approve` or `request_changes`.
+    pub verdict: String,
+    /// What the review found. Kept whichever way the verdict went.
+    pub findings: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -146,11 +163,20 @@ fn answer(result: Result<Value, Error>) -> CallToolResult {
     }
 }
 
-/// One task with the statuses it may move to next, the same pair the HTTP task
-/// card carries.
-fn card(task: &Task) -> Value {
+/// One task with the statuses it may move to next and the verdict of its latest
+/// finished review, the same card the HTTP API answers with.
+fn card(db: &crate::db::Db, task: &Task) -> Result<Value, Error> {
     let available_transitions = task::available_transitions(task);
-    json!({ "task": task, "available_transitions": available_transitions })
+    let latest_review = if task.kind == TaskKind::Normal {
+        task::latest_review(db, &task.id)?
+    } else {
+        None
+    };
+    Ok(json!({
+        "task": task,
+        "available_transitions": available_transitions,
+        "latest_review": latest_review,
+    }))
 }
 
 /// The administrative tools: the catalogue and the task lifecycle.
@@ -187,8 +213,9 @@ impl Admin {
         description = "Register a new task. It starts in `draft`. Registration is never gated: \
                        `product_id` may name a product that is not in the catalogue yet, and the \
                        refusal arrives later, when the task is promoted to `ready`. This files \
-                       ordinary work; merge tasks are issued by the control plane over HTTP and \
-                       are not filed here."
+                       ordinary work; merge and review tasks belong to the control plane, which \
+                       issues them over HTTP (POST /api/merges, POST /api/reviews), and are not \
+                       filed here."
     )]
     fn task_create(&self, Parameters(args): Parameters<TaskCreateArgs>) -> CallToolResult {
         let now = self.state.clock.now();
@@ -207,13 +234,13 @@ impl Admin {
                 },
                 now,
             )
-            .map(|task| card(&task)),
+            .and_then(|task| card(&self.state.db, &task)),
         )
     }
 
     #[tool(description = "Read one task with the statuses it may move to next.")]
     fn task_get(&self, Parameters(args): Parameters<TaskIdArgs>) -> CallToolResult {
-        answer(task::get(&self.state.db, &args.id).map(|task| card(&task)))
+        answer(task::get(&self.state.db, &args.id).and_then(|task| card(&self.state.db, &task)))
     }
 
     #[tool(
@@ -246,7 +273,7 @@ impl Admin {
         };
         answer(
             task::update(&self.state.db, &args.id, &patch, self.state.clock.now())
-                .map(|task| card(&task)),
+                .and_then(|task| card(&self.state.db, &task)),
         )
     }
 
@@ -259,15 +286,17 @@ impl Admin {
                        either the id is wrong or the clone has to be placed there. Code \
                        `product_archived` is a different refusal: the product is catalogued and \
                        its clone left the tree, so the remedy is restoring that one clone. \
-                       `merged` and `released` are granted by the merge and release control plane \
-                       and are refused here."
+                       `approved`, `merged` and `released` are granted by the review, merge and \
+                       release control plane and are refused here. `done` on a review task is \
+                       refused too: a review is finished by its verdict \
+                       (POST /worker/review-report), never by a status change."
     )]
     fn task_set_status(&self, Parameters(args): Parameters<TaskSetStatusArgs>) -> CallToolResult {
         let now = self.state.clock.now();
         answer(
             TaskStatus::parse(&args.status)
                 .and_then(|to| task::set_status_by_operator(&self.state.db, &args.id, to, now))
-                .map(|task| card(&task)),
+                .and_then(|task| card(&self.state.db, &task)),
         )
     }
 }
@@ -312,13 +341,24 @@ impl Worker {
         description = "Claim the next ready task for `worker` and move it to `wip`. Answers \
                        {\"status\":\"no-work\"} when nothing is claimable — that is an answer, \
                        not a failure. A claimed task carries the `claim_id` task_report needs \
-                       and the branch the work belongs on."
+                       and the branch the work belongs on. Pass `kinds` to take only the work \
+                       this loop handles, such as [\"review\"] for a reviewer; left out, \
+                       anything claimable."
     )]
     fn task_claim(&self, Parameters(args): Parameters<TaskClaimArgs>) -> CallToolResult {
+        let kinds = match args.kinds.as_deref() {
+            Some(raw) => raw.iter().map(|kind| TaskKind::parse(kind)).collect(),
+            None => Ok(Vec::new()),
+        };
+        let kinds = match kinds {
+            Ok(kinds) => kinds,
+            Err(error) => return answer(Err(error)),
+        };
         answer(
             task::claim(
                 &self.state.db,
                 &args.worker,
+                &kinds,
                 self.state.clock.now(),
                 self.state.claim_ttl_secs,
             )
@@ -345,7 +385,39 @@ impl Worker {
                 &checks,
                 self.state.clock.now(),
             )
-            .map(|task| card(&task)),
+            .and_then(|task| card(&self.state.db, &task)),
+        )
+    }
+
+    #[tool(
+        description = "Answer a claimed review task with a verdict, finishing it. `verdict` is \
+                       `approve` or `request_changes`; both are successes, because a review \
+                       that asks for changes did its job. `subject_commit_sha` has to be the \
+                       commit the review was issued for. An approval moves the reviewed task to \
+                       `approved` in the same transaction, and is refused with code \
+                       `review_subject_changed` when that task has moved on to another commit, \
+                       `review_target_moved` when it is no longer waiting in `done`, and \
+                       `review_subject_mismatch` when the commit named is not the one under \
+                       review. `request_changes` hands the task back to `ready` with the \
+                       findings on the record."
+    )]
+    fn task_review_report(
+        &self,
+        Parameters(args): Parameters<TaskReviewReportArgs>,
+    ) -> CallToolResult {
+        answer(
+            ReviewVerdict::parse(&args.verdict)
+                .and_then(|verdict| {
+                    task::review_report(
+                        &self.state.db,
+                        &args.claim_id,
+                        &args.subject_commit_sha,
+                        verdict,
+                        &args.findings,
+                        self.state.clock.now(),
+                    )
+                })
+                .and_then(|task| card(&self.state.db, &task)),
         )
     }
 }

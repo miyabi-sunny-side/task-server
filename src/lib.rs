@@ -29,7 +29,10 @@ pub use http::{ControlPlane, ReleaseResult, TaskCard, TaskSummary};
 pub use import::{ImportError, ImportSources, ImportSummary, import_markdown};
 pub use product::Product;
 pub use state::AppState;
-pub use task::{Check, NewTask, Releasable, Task, TaskKind, TaskPatch, TaskStatus, can_transition};
+pub use task::{
+    Check, NewTask, Releasable, ReviewOutcome, ReviewVerdict, Task, TaskKind, TaskPatch,
+    TaskStatus, can_transition,
+};
 
 pub fn app(state: AppState) -> Router {
     let static_dir = state.static_dir.clone();
@@ -44,6 +47,7 @@ pub fn app(state: AppState) -> Router {
         .route("/tasks/{id}/status", post(http::api_set_status))
         .route("/control", get(http::api_control))
         .route("/merges", post(http::api_issue_merge))
+        .route("/reviews", post(http::api_issue_review))
         .route("/releases", post(http::api_release))
         .route("/products", get(http::api_products))
         // Product ids are `org/repo`, so the capture has to span two segments.
@@ -57,6 +61,7 @@ pub fn app(state: AppState) -> Router {
         .route("/healthz", get(http::healthz))
         .route("/worker/claim", post(http::worker_claim))
         .route("/worker/report", post(http::worker_report))
+        .route("/worker/review-report", post(http::worker_review_report))
         // Same domain layer, second transport: MCP clients speak here, and the
         // capability that opens each endpoint is checked before rmcp sees the
         // request.

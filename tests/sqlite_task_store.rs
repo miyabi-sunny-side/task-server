@@ -1,7 +1,7 @@
 use task_server::db::Db;
 use task_server::error::Error;
 use task_server::product::{self, Product};
-use task_server::task::{self, NewTask, TaskKind, TaskStatus};
+use task_server::task::{self, NewTask, ReviewVerdict, TaskKind, TaskStatus};
 use time::OffsetDateTime;
 use time::macros::datetime;
 
@@ -56,6 +56,7 @@ fn lifecycle_survives_reopen_and_rejects_invalid_transitions() {
         TaskStatus::Ready,
         TaskStatus::Wip,
         TaskStatus::Done,
+        TaskStatus::Approved,
         TaskStatus::Merged,
     ] {
         let task = task::set_status(&db, "t-1", to, now()).unwrap();
@@ -93,7 +94,9 @@ fn instant_merge_task_is_claimed_before_higher_priority_normal_task() {
     let target = new_task("t-target", "household/tasks", TaskKind::Normal, 0);
     task::create(&db, &target, now()).unwrap();
     task::set_status(&db, &target.id, TaskStatus::Ready, now()).unwrap();
-    let leased = task::claim(&db, "worker-0", now(), TTL).unwrap().unwrap();
+    let leased = task::claim(&db, "worker-0", &[], now(), TTL)
+        .unwrap()
+        .unwrap();
     assert_eq!(leased.id, "t-target");
     task::report(
         &db,
@@ -101,6 +104,22 @@ fn instant_merge_task_is_claimed_before_higher_priority_normal_task() {
         "abc1234",
         "cargo test",
         &[],
+        now(),
+    )
+    .unwrap();
+
+    // Only reviewed work is merged, and a reviewer takes review tasks alone.
+    let review = task::issue_review(&db, "t-target", now()).unwrap();
+    let leased = task::claim(&db, "reviewer", &[TaskKind::Review], now(), TTL)
+        .unwrap()
+        .unwrap();
+    assert_eq!(leased.id, review.id);
+    task::review_report(
+        &db,
+        &leased.claim_id.expect("claim_id"),
+        "abc1234",
+        ReviewVerdict::Approve,
+        "read the diff",
         now(),
     )
     .unwrap();
@@ -114,18 +133,26 @@ fn instant_merge_task_is_claimed_before_higher_priority_normal_task() {
     assert_eq!(merge.priority, 0);
     assert_eq!(merge.status, TaskStatus::Ready);
 
-    let first = task::claim(&db, "worker-a", now(), TTL).unwrap().unwrap();
+    let first = task::claim(&db, "worker-a", &[], now(), TTL)
+        .unwrap()
+        .unwrap();
     assert_eq!(first.id, merge.id);
     assert_eq!(first.status, TaskStatus::Wip);
     assert_eq!(first.claimed_by.as_deref(), Some("worker-a"));
     assert!(first.claim_id.is_some());
     assert!(first.claim_expires_at.is_some());
 
-    let second = task::claim(&db, "worker-b", now(), TTL).unwrap().unwrap();
+    let second = task::claim(&db, "worker-b", &[], now(), TTL)
+        .unwrap()
+        .unwrap();
     assert_eq!(second.id, "t-normal");
     assert_ne!(second.claim_id, first.claim_id);
 
-    assert!(task::claim(&db, "worker-c", now(), TTL).unwrap().is_none());
+    assert!(
+        task::claim(&db, "worker-c", &[], now(), TTL)
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// The kind a task is filed as is not the caller's to choose: a merge is issued
@@ -160,6 +187,7 @@ fn merged_is_terminal_for_products_that_do_not_release() {
             TaskStatus::Ready,
             TaskStatus::Wip,
             TaskStatus::Done,
+            TaskStatus::Approved,
             TaskStatus::Merged,
         ] {
             task::set_status(&db, id, to, now()).unwrap();

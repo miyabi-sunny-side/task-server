@@ -1,13 +1,16 @@
 <script lang="ts">
   import type { TaskSummary } from "./api";
 
-  // DESIGN.md, Task list: the status vocabulary order. `released` is absent on
-  // purpose — shipped work leaves the top page.
+  // DESIGN.md, Task list: the status vocabulary order, which is the pipeline
+  // read from its start — so `approved` sits between `done` and `merged`,
+  // past review and not yet landed. `released` is absent on purpose —
+  // shipped work leaves the top page.
   const STATUS_ORDER = [
     "draft",
     "ready",
     "wip",
     "done",
+    "approved",
     "merged",
     "blocked",
     "cancelled",
@@ -24,8 +27,11 @@
     onretry?: () => void;
   } = $props();
 
-  // A merge in flight is the state of the control, not open work: it belongs
-  // to the panel and appears nowhere here.
+  // The list hides exactly one thing: work another region of this same page
+  // already draws. The control panel renders merges in flight, and one object
+  // drawn twice on one screen reads as two. Nothing else is filtered — a
+  // `review` task is drawn nowhere else, so hiding it would leave an
+  // unclaimed review with no surface anywhere in the UI.
   let open = $derived(items.filter((item) => item.kind !== "instant:merge"));
 
   let groups = $derived(
@@ -70,7 +76,14 @@
             <li>
               <a class="card" href={`/tasks/${item.id}`}>
                 <span class="name">{item.title}</span>
-                <span class="product">{item.product_id}</span>
+                <span class="tail">
+                  <!-- Plain spans: the kind must never add a second focus
+                       stop inside the card link (DESIGN.md, Task list). -->
+                  {#if item.kind !== "normal"}
+                    <span class="badge">{item.kind}</span>
+                  {/if}
+                  <span class="product">{item.product_id}</span>
+                </span>
               </a>
             </li>
           {/each}
@@ -96,4 +109,10 @@
     font-size: var(--fs-md)
     font-weight: 500
     line-height: 1.2
+
+  .tail
+    display: flex
+    flex-shrink: 0
+    align-items: baseline
+    gap: var(--sp-2)
 </style>

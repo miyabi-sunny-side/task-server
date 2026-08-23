@@ -95,20 +95,74 @@ JSON API, the MCP endpoints, and the compiled client.
   automated client branches on; the message is not. A request body that is not
   JSON never reaches the domain: the axum extractor rejects it first, with 400
   and a plain-text explanation that carries no `code`.
-- `merged` and `released` belong to the control plane. Every operator surface
-  goes through `task::set_status_by_operator`, which refuses both before
-  delegating to `set_status`, so `POST /api/tasks/{id}/status` and the MCP
-  `task_set_status` tool answer the same refusal from one place. The control
-  plane keeps calling `set_status` directly, `available_transitions` never
-  offers either, and the transition table still allows them because the control
-  plane goes through it.
-- Only the control plane issues `instant:merge`. `task::create` refuses that
-  kind outright, so `POST /api/tasks` answers 400 with code `invalid` and the
-  MCP `task_create` tool has no `kind` argument to choose from. A merge task is
-  written by `task::issue_merge` alone, against a target it names; an orphan
-  merge would be claimed first, could never be reported, and would block the
-  queue.
-- A task is mergeable when it is `normal`, `done`, carries a `branch` and a
+- `approved`, `merged`, and `released` belong to the control plane. Every
+  operator surface goes through `task::set_status_by_operator`, which refuses
+  all three before delegating to `set_status`, so `POST /api/tasks/{id}/status`
+  and the MCP `task_set_status` tool answer the same refusal from one place. The
+  control plane keeps calling `set_status` directly, `available_transitions`
+  never offers any of them, and the transition table still allows them because
+  the control plane goes through it.
+- `done` on a `review` task belongs to the control plane for the same reason.
+  `task::set_status_by_operator` refuses it inside the transaction that reads the
+  row, and `available_transitions` leaves it out, so neither HTTP nor MCP can
+  finish a review without a verdict — which would also have freed the
+  one-open-review index, whose predicate stops at `done`. While the review is
+  still open, only `done` is closed: `wip` is how a reviewer claims the task, and
+  `blocked`, `cancelled`, and `dropped` stay pressable so an attempt can be
+  called off. That `cancelled` and `dropped` release the index is the point of
+  abandoning an attempt.
+- A review that **answered** is terminal for every operator surface, and
+  `available_transitions` on it is empty. `task::operator_refusal` treats a
+  `review` task as answered when it is `done` *or* carries a `review_verdict` —
+  `review_report` writes both in one statement, so the two always agree, and
+  either mark alone is enough to say the attempt is over. Freezing it closes two
+  holes: `blocked` would put a finished attempt back inside the one-open-review
+  index and stand in the way of the next review, and from `blocked` the row would
+  walk through `ready` to a claim and report a second verdict over the one the
+  target lives by. Freezing strands nothing, because `done` frees the index
+  whether or not the verdict is there.
+- The transition table carries no `done → ready`. Work leaves `done` backwards
+  only through a review that requested changes, which has its own atomic
+  operation, so no human can reopen finished work by hand.
+- Only the control plane issues `instant:merge` and `review`. `task::create`
+  refuses every kind it owns, so `POST /api/tasks` answers 400 with code
+  `invalid` and the MCP `task_create` tool has no `kind` argument to choose
+  from. Those tasks are written by `task::issue_merge` and `task::issue_review`
+  alone, against a target they name; an orphan would be claimed, could never be
+  reported, and would block the queue.
+- A review is issued by `POST /api/reviews` against a `normal` task that is
+  `done` with a `branch` and a `commit_sha`. It inherits the target's product,
+  branch and priority and snapshots the target's `commit_sha` as the subject of
+  the review; its own completion never rewrites that. Findings live in the
+  review's `verification`, the verdict in `review_verdict`, and no column
+  duplicates either onto the target: `GET /api/tasks/{id}` derives
+  `latest_review` from the review's own row.
+- One open review per target, kept by a partial unique index whose predicate
+  excludes `done`, `cancelled`, and `dropped`. That is where it parts company
+  with the merge index, which keeps `done`: a landed merge still owns its
+  target, while a review that answered is over and must not block the next
+  round. The two therefore need columns of their own. A retry is
+  `review:<id>~2`, `~3`, …
+- The attempt number is stored in `review_attempt`, and it — not the id, not the
+  timestamp — is what `latest_review` orders by. Derived ids compare the wrong
+  way round as text (`~9` after `~10`), and timestamps are whole seconds, so two
+  attempts answered in the same second tie. Attempts of one target are strictly
+  serial (the index means attempt *n+1* cannot exist while *n* is in flight), so
+  the highest attempt is always the latest answer.
+- `POST /worker/review-report` is the review's completion contract, and
+  deliberately not `/worker/report`, which refuses a review task outright. It
+  takes `{claim_id, subject_commit_sha, verdict, findings}`, runs no check gate,
+  and treats `request_changes` as a success — the reviewer did their job and the
+  answer is "not yet". `approve` promotes the target to `approved` in the same
+  transaction after confirming the target is still `done`, still on the commit
+  the review snapshotted, and that the body names that commit; the three
+  refusals carry codes `review_target_moved`, `review_subject_changed`, and
+  `review_subject_mismatch`, and write nothing. `request_changes` returns the
+  target to `ready` in one write and deliberately skips the `ready` catalogue
+  gate: this is the continuation of work already admitted, and an archived
+  product would otherwise leave a task that can be neither approved nor handed
+  back.
+- A task is mergeable when it is `normal`, `approved`, carries a `branch` and a
   `commit_sha`, and no live merge already targets it. `POST /api/merges` issues
   one `instant:merge` task per target, in `ready`, inheriting the target's
   `product_id`, `branch`, and `commit_sha`. A partial unique index keeps that at
@@ -118,15 +172,26 @@ JSON API, the MCP endpoints, and the compiled client.
   `~2`, `~3`, … so the id stays deterministic and one path segment.
 - Nothing lands untested. A report on an `instant:merge` task is refused unless
   it carries `checks` and every `exit_code` is `0`, whatever the merge's current
-  status. Accepting it moves the merge to `done` and its target from `done` to
-  `merged` in one transaction; a refusal changes neither row.
+  status. Accepting it moves the merge to `done` and its target from `approved`
+  to `merged` in one transaction; a refusal changes neither row.
+- Nothing lands unread either. `task::land_merge_target` confirms, in that same
+  transaction, that the target is still `approved` **and** still on the commit
+  the merge was issued for; a target that was reopened, redone and approved again
+  on another commit is refused with code `merge_subject_changed`, and neither row
+  moves. This is the review-side `review_subject_changed` guard applied to the
+  other end of the same hazard: `approved` alone never says *which* commit was
+  approved. The comparison uses the merge row as the report found it, because the
+  report writes its own `commit_sha` over the snapshot.
 - A task may only reach `released` when its product has `releases` set.
   `POST /api/releases` moves every `merged` normal task of one product to
   `released` under a single `release_tag`, in one transaction. A product that
   does not release, or one with nothing merged, is 409.
 - Claim hands out the next `ready` task, `instant:merge` first, then higher
   `priority`, then oldest. The row is only taken while it is still `ready`,
-  so two workers never hold the same task.
+  so two workers never hold the same task. An optional `kinds` narrows the
+  candidates to the work one loop handles; empty or absent takes anything, so a
+  loop written before roles existed keeps working. It is routing, not
+  authorization: a worker that asks for everything is still given everything.
 - One task, one branch. A claim on a task without a `branch` sets
   `task/<id>`; an existing branch is never rewritten.
 - A report is matched by `claim_id`. A stale or unknown `claim_id` is
@@ -155,11 +220,12 @@ JSON API, the MCP endpoints, and the compiled client.
   proxy that already decides which names it serves and the default would refuse
   the name that proxy forwards.
 - `/mcp` carries `product_list`, `task_create`, `task_get`, `task_list`,
-  `task_update`, and `task_set_status`; `/worker/mcp` carries `task_claim` and
-  `task_report`. Catalogue writes, merges, and releases are human decisions and
-  have no tool; `task_create` files ordinary work and takes no `kind`, and
-  `task_set_status` refuses `merged` and `released` with code `invalid` through
-  the same domain function the HTTP status route calls.
+  `task_update`, and `task_set_status`; `/worker/mcp` carries `task_claim`,
+  `task_report`, and `task_review_report`. Catalogue writes, reviews, merges,
+  and releases are human decisions and have no tool; `task_create` files
+  ordinary work and takes no `kind`, and `task_set_status` refuses `approved`,
+  `merged`, and `released` with code `invalid` through the same domain function
+  the HTTP status route calls.
 - A refusal the domain owns is not a protocol failure: it is a tool result with
   `isError: true` whose `structuredContent` is the same `{"error", "code"}` pair
   HTTP answers with, repeated in the text content. Arguments that fail to
@@ -174,7 +240,9 @@ JSON API, the MCP endpoints, and the compiled client.
 
 ## Status vocabulary
 
-`draft → ready → wip → done → merged → released`
+`draft → ready → wip → done → approved → merged → released`
+
+`approved` is granted by an approving review report and by nothing else.
 
 Sideways from any live status: `blocked`, `cancelled`, `dropped`.
 `blocked` returns to `ready`. `wip` may fall back to `ready`.
@@ -191,16 +259,17 @@ Sideways from any live status: `blocked`, `cancelled`, `dropped`.
 | PATCH | `/api/tasks/{id}` | human mutation |
 | POST | `/api/tasks/{id}/status` | human mutation |
 | GET | `/api/control` | read |
-| POST | `/api/merges`, `/api/releases` | human mutation |
+| POST | `/api/reviews`, `/api/merges`, `/api/releases` | human mutation |
 | GET | `/api/products`, `/api/products/{id}` | read |
 | PUT | `/api/products/{id}` | human mutation |
-| POST | `/worker/claim`, `/worker/report` | worker capability |
+| POST | `/worker/claim`, `/worker/report`, `/worker/review-report` | worker capability |
 | POST | `/mcp` | bearer `MCP_CAPABILITY` |
 | POST | `/worker/mcp` | bearer `WORKER_CAPABILITY` |
 
 `GET /api/tasks` returns summaries and hides `released` unless `?status=` asks
 for a status explicitly; an unknown status is a 400. Single-task responses are
-the full task plus `available_transitions`.
+the full task plus `available_transitions`, and `latest_review` when a review
+has answered for it.
 
 `GET /api/control` answers `{ mergeable, pending_merges, releasable }`: the
 merge button is live while `mergeable` is non-empty, the release button while
