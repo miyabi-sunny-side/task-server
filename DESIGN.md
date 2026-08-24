@@ -322,7 +322,7 @@ Soft-rectangle language, tokens `--radius-sm/md/lg/full` (6/8/12/9999px):
 - **sm (6px):** buttons, inputs, all small controls.
 - **md (8px):** cards and list rows.
 - **lg (12px):** modals and floating menus.
-- **full:** count pills and the status badge only.
+- **full:** count pills, the status badge, and the spinner only.
 
 Never mix radii within one composite control. No circular buttons.
 
@@ -837,8 +837,8 @@ counterpart to carry, so it earns no token pair.
       order is draft, ready, wip, done, approved, merged, blocked,
       cancelled, dropped; no group for `released` ever exists; each
       heading's count pill number equals the number of cards under it;
-      `9999px` radius is computed only on count pills and outline
-      badges.
+      `9999px` radius is computed only on count pills, outline badges,
+      and the spinner.
   17. At 375px the panel's button, notes, and readouts wrap without
       `document.documentElement.scrollWidth` exceeding the viewport,
       every control's hit box is at least 36px tall, and no two blocks of
