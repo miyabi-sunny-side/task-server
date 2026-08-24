@@ -287,7 +287,7 @@ run:
 | `id` | Where it sits locally, `<org>/<repo>`. Never the remote's owner: `sunny-side/5ch-viewer` keeps that id even though it pushes to `miyabisun`. |
 | `repository` | The `origin` URL in `.git/config`, normalised to its browsable `https://` form. |
 | `description` | The first non-empty line of `README.md`, without its leading `#`. Absent is empty. |
-| `releases` | A workflow under `.github/workflows` whose `.yml` or `.yaml` name contains `release`, **or** a tag in `.git/refs/tags` or `.git/packed-refs` whose whole name is a strict SemVer version, optionally `v`-prefixed. `v1.2.3` and `1.2.3-rc.1+build.5` count; `01.2.3`, `1.2.3-`, and `1.2.3-@@` do not, because `releases` switches the release control plane on and a scratch tag is not a release. |
+| `releases` | Whether `.github/workflows` is there as a directory. Nothing in it is read and an empty one still counts: a product that releases has its artefacts built for it — a binary compiled by CI, an image CI pushes — and that is a workflow whatever the files are called. A tag is not evidence, because a version can be cut by hand; a `.github/workflows` that is a plain file, or that resolves out of the tree, is not the directory. |
 
 A worktree and a submodule keep `.git` as a file naming the real git directory,
 and that pointer is followed — including a worktree's `commondir` — because git
@@ -526,7 +526,11 @@ Merged work then piles up per product. For a product with `releases` set,
 `GET /api/control` reports how much is waiting, and `POST /api/releases` stamps
 every merged task of that product with one `release_tag` and moves them all to
 `released`. A product that does not release, or one with nothing merged,
-answers 409.
+answers 409. An archived product does not release either, whatever its stored
+`releases` says: the flag is derived from a clone that is no longer in the tree,
+and the workflows that would build the release run from that clone. It is left
+out of `releasable` and refused at `released`, and putting the clone back is the
+whole remedy — the next walk re-reads the flag.
 
 Stop the service with <kbd>Ctrl</kbd>+<kbd>C</kbd>.
 

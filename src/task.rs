@@ -582,9 +582,23 @@ fn operator_refusal(task: &Task, to: TaskStatus) -> Option<Error> {
 /// Whether the owning product ships releases. A task without a product does not.
 fn product_releases(conn: &Connection, product_id: Option<&str>) -> Result<bool, Error> {
     match product_id {
-        Some(product_id) => Ok(product::read(conn, product_id)?.releases),
+        Some(product_id) => Ok(releases(&product::read(conn, product_id)?)),
         None => Ok(false),
     }
+}
+
+/// Whether this product may release *now*.
+///
+/// The stored flag is derived from the clone's `.github/workflows`, so an
+/// archived product — one whose working copy left the project tree — carries the
+/// answer of the last walk that could still look. Nothing can check it while the
+/// clone is gone, and the release itself needs that clone: the workflows that
+/// build the artefacts run from it. So the mark refuses, and it refuses here
+/// rather than by rewriting `releases`: the row keeps what the tree last said,
+/// and a clone put back releases again on the next walk with nobody re-entering
+/// anything.
+fn releases(product: &product::Product) -> bool {
+    product.releases && !product.archived
 }
 
 /// The catalogue is the register of product identity, and `ready` is where it
@@ -1607,12 +1621,17 @@ fn latest_review_of(conn: &Connection, target_id: &str) -> Result<Option<ReviewO
 }
 
 /// Merged work waiting for a release tag, per releasing product.
+///
+/// An archived product is left out for the reason [`releases`] gives: it could
+/// not be released if it were pressed, so offering the button would be an
+/// invitation to a refusal.
 pub fn releasable(db: &Db) -> Result<Vec<Releasable>, Error> {
     db.with_conn(|conn| {
         let mut statement = conn.prepare(
             "SELECT tasks.product_id, count(*) FROM tasks
              JOIN products ON products.id = tasks.product_id
-             WHERE products.releases = 1 AND tasks.kind = 'normal' AND tasks.status = 'merged'
+             WHERE products.releases = 1 AND products.archived_at IS NULL
+               AND tasks.kind = 'normal' AND tasks.status = 'merged'
              GROUP BY tasks.product_id
              ORDER BY tasks.product_id ASC",
         )?;
@@ -1640,7 +1659,7 @@ pub fn release_product(
     let stamp = format_z(now);
     db.with_tx(|tx| {
         let product = product::read(tx, product_id)?;
-        if !product.releases {
+        if !releases(&product) {
             return Err(Error::Conflict(format!(
                 "product {product_id} does not release"
             )));
@@ -2903,6 +2922,89 @@ mod tests {
             get(&db, "t-ship-1").unwrap().release_tag.as_deref(),
             Some("v0.2.0"),
             "the refused release must not have restamped anything"
+        );
+    }
+
+    /// An archived product releases nothing, whatever its stored `releases`
+    /// says. The flag is derived from the clone's `.github/workflows`, and an
+    /// archived product has no clone in the tree to derive it from any more —
+    /// the row keeps the last answer, which is exactly the answer that can no
+    /// longer be checked. Releasing is also the one operation that most needs
+    /// the working copy: the CI that builds the artefacts runs from it.
+    ///
+    /// So the archive mark is read where the question is asked rather than
+    /// written over `releases`: the stored flag stays untouched, and a clone put
+    /// back releases again on the next walk without anyone re-entering anything.
+    #[test]
+    fn an_archived_product_releases_nothing_until_its_clone_is_back() {
+        let db = db_with_product();
+        let elsewhere = Product {
+            id: "c/d".into(),
+            repository: "https://example.test/c/d.git".into(),
+            description: String::new(),
+            releases: true,
+            archived: false,
+        };
+        let on_disk = Product {
+            id: "a/b".into(),
+            repository: "https://example.test/a/b.git".into(),
+            description: String::new(),
+            releases: true,
+            archived: false,
+        };
+
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        for to in [
+            TaskStatus::Ready,
+            TaskStatus::Wip,
+            TaskStatus::Done,
+            TaskStatus::Approved,
+            TaskStatus::Merged,
+        ] {
+            set_status(&db, "t-1", to, now()).unwrap();
+        }
+
+        // The walk no longer finds `a/b`, so its row is archived.
+        product::reconcile(&db, std::slice::from_ref(&elsewhere), later()).unwrap();
+        let archived = product::get(&db, "a/b").unwrap();
+        assert!(archived.archived);
+        assert!(
+            archived.releases,
+            "the stored flag is left exactly as the last walk wrote it"
+        );
+
+        assert!(
+            releasable(&db).unwrap().is_empty(),
+            "an archived product is not offered as release-ready"
+        );
+        assert!(matches!(
+            release_product(&db, "a/b", "v0.2.0", later()),
+            Err(Error::Conflict(_))
+        ));
+        assert!(matches!(
+            set_status(&db, "t-1", TaskStatus::Released, later()),
+            Err(Error::Invalid(_))
+        ));
+        assert_eq!(
+            get(&db, "t-1").unwrap().status,
+            TaskStatus::Merged,
+            "the refused release leaves the task where it was"
+        );
+
+        // The clone comes back, and so does the release.
+        product::reconcile(&db, &[elsewhere, on_disk], later()).unwrap();
+        assert_eq!(
+            releasable(&db).unwrap(),
+            vec![Releasable {
+                product_id: "a/b".into(),
+                task_count: 1,
+            }]
+        );
+        assert_eq!(
+            release_product(&db, "a/b", "v0.2.0", later())
+                .unwrap()
+                .len(),
+            1
         );
     }
 

@@ -48,8 +48,10 @@ JSON API, the MCP endpoints, and the compiled client.
   the warning is about the walk; an unreadable root fails the startup. Unset means
   nothing is walked. The retired `APP_PRODUCTS_SEED` refuses the start.
 - A git repository is git's own definition, not "it has a config": `HEAD` reading
-  as a ref or an object name, an object store, and `refs`. `releases` needs a
-  whole strict SemVer tag (`v` optional), so `01.2.3` or `1.2.3-` is not one.
+  as a ref or an object name, an object store, and `refs`. `releases` is whether
+  the clone has a `.github/workflows` **directory** — no name is read and an empty
+  one counts, because a product that releases has its artefacts built by CI. A tag
+  is not evidence, and a plain file of that name is not the directory.
 - The walk never reads outside `APP_PROJECTS_DIR`. Every path is canonicalised and
   has to stay under the root: a `.git` symlink, a `gitdir:` pointer, or a
   `commondir` leading out is skipped as `outside_root` and counted, and README,
@@ -273,7 +275,12 @@ JSON API, the MCP endpoints, and the compiled client.
   `POST /api/merges` are the handles that clear them. `unreviewed` spells
   "live" exactly as the one-open-review index does, so a task is listed there
   precisely when a new review could be issued for it.
-- A task may only reach `released` when its product has `releases` set.
+- A task may only reach `released` when its product has `releases` set and is not
+  archived: the flag is derived from a clone that has left the tree, and the
+  workflows that build the release run from that clone. The mark is read at the
+  question rather than written over `releases`, so the stored flag stays and a
+  restored clone releases again on the next walk. An archived product is left out
+  of `releasable` too.
   `POST /api/releases` moves every `merged` normal task of one product to
   `released` under a single `release_tag`, in one transaction. A product that
   does not release, or one with nothing merged, is 409.

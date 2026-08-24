@@ -76,6 +76,8 @@ fn tree(root: &Path) {
     write(&viewer.join("README.md"), "# a viewer of things\n\nbody\n");
     write(&viewer.join(".github/workflows/release.yml"), "on: push\n");
 
+    // Tagged, and with no `.github/workflows`: a version was cut here by hand,
+    // and nothing in the repository builds a release.
     let helper = clone_at(
         root,
         "sunny-side/helper",
@@ -126,16 +128,19 @@ fn deriving_the_catalogue_twice_writes_nothing_the_second_time() {
     let viewer = product::get(&db, "sunny-side/viewer").expect("viewer");
     assert_eq!(viewer.repository, "https://github.com/miyabisun/viewer");
     assert_eq!(viewer.description, "a viewer of things");
-    assert!(viewer.releases, "a release workflow means it releases");
+    assert!(viewer.releases, "a workflows directory means it releases");
 
     let helper = product::get(&db, "sunny-side/helper").expect("helper");
     assert_eq!(helper.repository, "https://github.com/org/helper");
     assert_eq!(helper.description, "", "no README is an empty description");
-    assert!(helper.releases, "a packed semver tag means it releases");
+    assert!(
+        !helper.releases,
+        "a tag is not a release pipeline: nothing here builds anything"
+    );
 
     let notes = product::get(&db, "household/notes").expect("notes");
     assert_eq!(notes.description, "prose with no heading");
-    assert!(!notes.releases, "no workflow and no tag means it does not");
+    assert!(!notes.releases, "no workflows directory means it does not");
 
     let after_first = stamps(&dir);
     assert_eq!(

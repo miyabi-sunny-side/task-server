@@ -7,19 +7,18 @@
 //!
 //! Read-only, and git-binary-free. Everything derived here comes out of files a
 //! clone already has: `.git/config` for the remote, `README.md` for the
-//! description, `.github/workflows` and `.git/refs/tags` for whether the product
+//! description, and a `.github/workflows` directory for whether the product
 //! releases. Shelling out to `git` would need a writable `HOME` and a git binary,
 //! neither of which a read-only container mount has.
 //!
 //! The tree is also the boundary. Every path this opens is canonicalised and has
 //! to sit under the canonical root: a `.git` that is a symlink, a `gitdir:`
 //! pointer that is absolute or climbs out with `..`, a worktree `commondir`, a
-//! linked `README.md`, a linked `refs` — each of those is a way to make the walk
-//! read a file the operator never put in the tree. What leaves the root is
-//! skipped and counted, not followed.
+//! linked `README.md`, a linked `.github/workflows` — each of those is a way to
+//! make the walk read a file the operator never put in the tree. What leaves the
+//! root is skipped and counted, not followed.
 
 use std::collections::BTreeMap;
-use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -134,8 +133,9 @@ pub fn source_from_vars(get: impl Fn(&str) -> Option<String>) -> Result<Catalogu
 ///
 /// Returns `Error::Io` when the root, an org directory, or a file a repository
 /// does have cannot be read. A repository that simply lacks a remote, a README,
-/// or a tag is skipped or defaulted, never an error: only a tree that could not
-/// be read at all is, because an empty answer reads as "every product is gone".
+/// or workflows is skipped or defaulted, never an error: only a tree that could
+/// not be read at all is, because an empty answer reads as "every product is
+/// gone".
 pub fn scan(root: impl AsRef<Path>) -> Result<Report, Error> {
     Walk::rooted(root.as_ref())?.run()
 }
@@ -261,8 +261,7 @@ impl Walk {
                 .as_deref()
                 .map(first_heading_line)
                 .unwrap_or_default(),
-            releases: self.has_release_workflow(&entry.path)?
-                || self.has_semver_tag(&dirs.common)?,
+            releases: self.releases(&entry.path)?,
             // On disk is what the walk means, so nothing it finds is archived.
             archived: false,
         }))
@@ -357,28 +356,23 @@ impl Walk {
         Ok(true)
     }
 
-    /// Whether `.github/workflows` holds a workflow that releases.
-    fn has_release_workflow(&self, repo: &Path) -> Result<bool, Error> {
-        Ok(self
-            .names_within(&repo.join(".github/workflows"))?
-            .iter()
-            .any(|name| is_release_workflow(name)))
-    }
-
-    /// Whether the repository carries a semver tag, loose or packed.
+    /// Whether this product ships releases: whether it has a
+    /// `.github/workflows` directory.
     ///
-    /// Read from the files rather than asked of `git`: the binary may not be in
-    /// the image, and a read-only mount has no writable `HOME` for it either way.
-    fn has_semver_tag(&self, common: &Path) -> Result<bool, Error> {
-        if self
-            .names_within(&common.join("refs/tags"))?
-            .iter()
-            .any(|name| is_semver_tag(name))
-        {
-            return Ok(true);
-        }
-        let packed = self.read_within(&common.join("packed-refs"))?;
-        Ok(packed.is_some_and(|text| packed_refs_have_semver_tag(&text)))
+    /// The directory is the whole test — no name is read, and an empty one still
+    /// counts. A product that releases does not make its users build it: a Rust
+    /// binary is compiled by CI, a service is shipped as an image CI pushes. Both
+    /// mean workflows, so the directory is the shape of a repository whose
+    /// releases are built for it, and what the workflows happen to be called is
+    /// not a fact about the product.
+    ///
+    /// Only a directory answers yes: a file of that name is not a workflow
+    /// directory, and one that resolves outside the root is not this tree's.
+    fn releases(&self, repo: &Path) -> Result<bool, Error> {
+        Ok(matches!(
+            self.dir_within(&repo.join(".github/workflows"))?,
+            Hop::Dir(_)
+        ))
     }
 
     /// The canonical form of `path`, refused when it leaves the root.
@@ -417,31 +411,6 @@ impl Walk {
             },
             Inside::No | Inside::Missing => Ok(None),
         }
-    }
-
-    /// The names in a directory a repository may not have, listed only when it is
-    /// inside the root. Names are the whole test for both release signals, so
-    /// nothing in it is opened.
-    fn names_within(&self, path: &Path) -> Result<Vec<String>, Error> {
-        let Inside::Yes(real) = self.resolve(path)? else {
-            return Ok(Vec::new());
-        };
-        let mut names = Vec::new();
-        match fs::read_dir(&real) {
-            Ok(listing) => {
-                for entry in listing {
-                    let entry = entry.map_err(|err| io_error(&real, &err))?;
-                    names.push(entry.file_name().to_string_lossy().into_owned());
-                }
-            }
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-                ) => {}
-            Err(err) => return Err(io_error(&real, &err)),
-        }
-        Ok(names)
     }
 }
 
@@ -497,22 +466,6 @@ fn head_names_a_commit(head: &str) -> bool {
     }
     // sha-1 and sha-256 object names, the two git has.
     matches!(head.len(), 40 | 64) && head.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-/// Whether a file name under `.github/workflows` is a release workflow.
-///
-/// The name is the whole test. A workflow's contents say when it triggers, not
-/// what it is for, and this is a catalogue flag rather than a build system.
-fn is_release_workflow(name: &str) -> bool {
-    let name = Path::new(name);
-    let is_workflow = name
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml"));
-    is_workflow
-        && name
-            .file_stem()
-            .and_then(OsStr::to_str)
-            .is_some_and(|stem| stem.to_ascii_lowercase().contains("release"))
 }
 
 /// The `origin` remote's URL, or `None` when the config names no origin.
@@ -580,81 +533,6 @@ fn first_heading_line(readme: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Whether a ref name is a release: a whole, strict `SemVer` version, optionally
-/// `v`-prefixed.
-///
-/// The whole name is validated, not just the part before a `-`. `releases = true`
-/// turns the release control plane on for the product, so a scratch tag that
-/// merely opens like a version — `01.2.3`, `1.2.3-`, `1.2.3-@@` — must not be
-/// read as evidence that this product ever cut a release.
-fn is_semver_tag(name: &str) -> bool {
-    let version = name.strip_prefix('v').unwrap_or(name);
-    // Build metadata comes off first: it is introduced by the first `+`, and may
-    // itself contain the `-` that would otherwise look like a pre-release.
-    let (version, build) = split_at_first(version, '+');
-    let (core, pre) = split_at_first(version, '-');
-    let mut parts = core.split('.');
-    let (Some(major), Some(minor), Some(patch), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return false;
-    };
-    if ![major, minor, patch].into_iter().all(is_numeric_identifier) {
-        return false;
-    }
-    // A `Some("")` suffix is a malformed name, not an absent one: every
-    // identifier of a present suffix has to be legal, and the empty string is
-    // not.
-    pre.is_none_or(|pre| pre.split('.').all(is_prerelease_identifier))
-        && build.is_none_or(|build| build.split('.').all(is_build_identifier))
-}
-
-/// The text before the first `separator`, and everything after it when there was
-/// one. Absent and empty are different answers, which is the point.
-fn split_at_first(text: &str, separator: char) -> (&str, Option<&str>) {
-    match text.split_once(separator) {
-        Some((left, right)) => (left, Some(right)),
-        None => (text, None),
-    }
-}
-
-/// A numeric identifier: digits, with no leading zero unless it *is* zero.
-fn is_numeric_identifier(part: &str) -> bool {
-    !part.is_empty()
-        && part.bytes().all(|byte| byte.is_ascii_digit())
-        && (part == "0" || !part.starts_with('0'))
-}
-
-/// A pre-release identifier: alphanumerics and hyphens, and a purely numeric one
-/// carries no leading zero either, because pre-releases are ordered numerically.
-fn is_prerelease_identifier(part: &str) -> bool {
-    if !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()) {
-        return is_numeric_identifier(part);
-    }
-    is_build_identifier(part)
-}
-
-/// A build identifier: alphanumerics and hyphens, non-empty. A leading zero is
-/// allowed here — build metadata carries no order.
-fn is_build_identifier(part: &str) -> bool {
-    !part.is_empty()
-        && part
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-}
-
-/// Whether `packed-refs` lists a release tag. The peel lines (`^<sha>`) and the
-/// header carry no ref name, and a branch is not a tag.
-fn packed_refs_have_semver_tag(packed: &str) -> bool {
-    packed
-        .lines()
-        .filter_map(|line| {
-            let (_, name) = line.trim().split_once(char::is_whitespace)?;
-            name.trim().strip_prefix("refs/tags/")
-        })
-        .any(is_semver_tag)
-}
-
 fn io_error(path: &Path, err: &io::Error) -> Error {
     Error::Io(format!("{}: {err}", path.display()))
 }
@@ -666,8 +544,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        Catalogue, Report, first_heading_line, is_semver_tag, normalize_remote_url, origin_url,
-        packed_refs_have_semver_tag, scan, source_from_vars,
+        Catalogue, Report, first_heading_line, normalize_remote_url, origin_url, scan,
+        source_from_vars,
     };
     use crate::error::Error;
 
@@ -788,81 +666,78 @@ mod tests {
         assert_eq!(origin_url(""), None);
     }
 
-    /// A release is a semver tag, and a tag is either a loose ref or a line of
-    /// `packed-refs`. Branches and annotated peel lines in that file are not
-    /// tags and must not count.
+    /// `releases` asks the clone one question: is there a `.github/workflows`
+    /// directory? A product that releases has its artefacts built for it — a
+    /// compiled binary nobody should have to build themselves, an image pushed
+    /// to a registry — and that is a workflow, whatever the files in it are
+    /// called. So the directory is the whole evidence, an empty one included: it
+    /// is the shape of a repository whose releases are made by CI.
+    ///
+    /// A tag is not evidence. It records that a version was cut, by hand as
+    /// easily as by CI, and a repository that tags without a workflow is
+    /// released by whoever is at the keyboard rather than by this control plane.
     #[test]
-    fn a_semver_tag_is_recognised_loose_or_packed() {
-        for name in [
-            "v0.1.0",
-            "0.1.0",
-            "v10.20.30",
-            "v1.2.3-rc.1",
-            "v1.2.3+build",
-            "1.2.3-0.3.7",
-            "1.2.3-rc-1",
-            "1.2.3+21AF26D3-117B",
-            "1.2.3-beta.11+exp.sha.5114f85",
-            "0.0.0",
-        ] {
-            assert!(is_semver_tag(name), "{name} is a release tag");
-        }
-        for name in ["v0.1", "main", "v1.2.3.4", "release-1", "v..", ""] {
-            assert!(!is_semver_tag(name), "{name} is not a release tag");
-        }
+    fn a_workflows_directory_is_the_whole_release_test() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
 
-        assert!(packed_refs_have_semver_tag(
-            "# pack-refs with: peeled fully-peeled sorted \n\
-             abc123 refs/heads/main\n\
-             def456 refs/tags/v0.2.0\n\
-             ^0123456\n"
-        ));
-        assert!(
-            !packed_refs_have_semver_tag(
-                "# pack-refs with: peeled\nabc123 refs/heads/v1.0.0\nabc123 refs/tags/nightly\n"
-            ),
-            "a branch named like a version is not a tag"
+        // The name of the workflow says nothing: a repository with any CI at all
+        // is one whose releases are built for it.
+        let unrelated = repo(root, "org/unrelated-name", "git@github.com:org/a.git");
+        write(unrelated.join(".github/workflows/ci.yml"), "on: push\n");
+
+        let empty = repo(root, "org/empty-workflows", "git@github.com:org/b.git");
+        fs::create_dir_all(empty.join(".github/workflows")).unwrap();
+
+        let bare = repo(root, "org/no-workflows", "git@github.com:org/c.git");
+        fs::create_dir_all(bare.join(".github")).unwrap();
+
+        // Tagged to the eyeballs, and it still does not release.
+        let tagged = repo(root, "org/tagged", "git@github.com:org/d.git");
+        write(tagged.join(".git/refs/tags/v1.2.3"), "abc\n");
+        write(tagged.join(".git/packed-refs"), "abc123 refs/tags/v2.0.0\n");
+
+        // A file where the directory should be is not a directory.
+        let filed = repo(root, "org/workflows-file", "git@github.com:org/e.git");
+        write(filed.join(".github/workflows"), "not a directory\n");
+
+        let report = scan(root).unwrap();
+        assert_eq!(
+            report
+                .products
+                .iter()
+                .map(|product| (product.id.as_str(), product.releases))
+                .collect::<Vec<_>>(),
+            [
+                ("org/empty-workflows", true),
+                ("org/no-workflows", false),
+                ("org/tagged", false),
+                ("org/unrelated-name", true),
+                ("org/workflows-file", false),
+            ],
+            "{:?}",
+            report.skipped
         );
-        assert!(!packed_refs_have_semver_tag(""));
     }
 
-    /// The whole tag is validated, not the digits before the first `-`. Every
-    /// name here opens like a version and is not one, and each would otherwise
-    /// have switched the release control plane on for a product that never
-    /// released: a leading zero is not a semver number, an empty suffix is
-    /// malformed rather than absent, and a suffix has an alphabet of its own.
+    /// The tree answers every walk, not the first one. A clone that grows a
+    /// workflow directory releases from then on, and one that loses it stops —
+    /// which is what makes putting a clone back the whole remedy for a product
+    /// that left.
     #[test]
-    fn a_tag_that_merely_opens_like_a_version_is_not_a_release() {
-        for name in [
-            "01.2.3",
-            "1.02.3",
-            "1.2.03",
-            "v01.2.3",
-            "1.2.3-",
-            "1.2.3+",
-            "1.2.3-@@",
-            "1.2.3-rc..1",
-            "1.2.3-rc.@",
-            "1.2.3+build..1",
-            "1.2.3-01",
-            "1.2.3-rc.01",
-            "1.2.3 ",
-            " 1.2.3",
-            "1.2.3-rc 1",
-            "1.2.3-rc_1",
-            "1.2.-3",
-            "1.2.3rc",
-        ] {
-            assert!(
-                !is_semver_tag(name),
-                "{name:?} must not be read as a release"
-            );
-        }
-        assert!(
-            packed_refs_have_semver_tag("abc123 refs/tags/v1.2.3\n"),
-            "the strict check still accepts the real thing"
-        );
-        assert!(!packed_refs_have_semver_tag("abc123 refs/tags/01.2.3\n"));
+    fn the_release_flag_is_re_read_on_every_walk() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let one = repo(root, "org/one", "git@github.com:org/one.git");
+
+        let releases = |root: &Path| scan(root).unwrap().products[0].releases;
+        assert!(!releases(root), "no workflows yet");
+
+        fs::create_dir_all(one.join(".github/workflows")).unwrap();
+        assert!(releases(root), "the walk reads the tree as it is now");
+
+        fs::remove_dir_all(one.join(".github")).unwrap();
+        assert!(!releases(root), "and again when it goes away");
     }
 
     /// The whole contract of one walk: two levels, git repositories only, with
@@ -878,6 +753,7 @@ mod tests {
 
         let two = repo(root, "sunny-side/two", "https://github.com/org/two.git");
         write(two.join(".git/refs/tags/v0.3.1"), "abc123\n");
+        // Tagged, and with no workflows: releases stay off.
 
         let report = scan(root).unwrap();
         assert_eq!(ids(&report), ["sunny-side/one", "sunny-side/two"]);
@@ -888,12 +764,15 @@ mod tests {
             "the local org never rewrites the remote: id and repository are two facts"
         );
         assert_eq!(first.description, "the first product");
-        assert!(first.releases, "a release workflow means it releases");
+        assert!(first.releases, "a workflow directory means it releases");
 
         let second = &report.products[1];
         assert_eq!(second.repository, "https://github.com/org/two");
         assert_eq!(second.description, "", "no README is an empty description");
-        assert!(second.releases, "a semver tag alone means it releases");
+        assert!(
+            !second.releases,
+            "a tag is not a release pipeline: nothing here builds anything"
+        );
         assert!(report.skipped.is_empty(), "{:?}", report.skipped);
     }
 
@@ -989,7 +868,7 @@ mod tests {
     }
 
     /// A worktree and a submodule keep `.git` as a *file* pointing elsewhere, and
-    /// the refs live in the common directory that file leads to. Reading
+    /// the config lives in the common directory that file leads to. Reading
     /// `<repo>/.git/config` directly would skip both for having no remote — and
     /// following the pointer is only allowed because git puts those directories
     /// inside the superproject, which is inside the root.
@@ -1000,7 +879,6 @@ mod tests {
 
         // The superproject, which owns the git storage the other two borrow.
         let host = repo(root, "org/host", "git@github.com:org/host.git");
-        write(host.join(".git/refs/tags/v9.9.9"), "abc\n");
 
         // A worktree: the pointer leads to a per-worktree directory that defers
         // to the superproject's `.git` for config and refs.
@@ -1008,7 +886,7 @@ mod tests {
         write(worktree_git.join("HEAD"), "ref: refs/heads/feature\n");
         write(worktree_git.join("commondir"), "../..\n");
         let feature = root.join("org/feature");
-        fs::create_dir_all(&feature).unwrap();
+        fs::create_dir_all(feature.join(".github/workflows")).unwrap();
         fs::write(
             feature.join(".git"),
             "gitdir: ../host/.git/worktrees/feature\n",
@@ -1023,7 +901,6 @@ mod tests {
             module.join("config"),
             "[remote \"origin\"]\n\turl = git@github.com:org/sub.git\n",
         );
-        write(module.join("refs/tags/v1.2.3"), "abc\n");
         let sub = root.join("org/sub");
         fs::create_dir_all(&sub).unwrap();
         fs::write(sub.join(".git"), "gitdir: ../host/.git/modules/sub\n").unwrap();
@@ -1044,13 +921,16 @@ mod tests {
         );
         assert!(
             worktree.releases,
-            "a worktree's tags live in its common directory"
+            "the workflows are read from the worktree's own working copy"
         );
 
         let submodule = &report.products[2];
         assert_eq!(submodule.repository, "https://github.com/org/sub");
         assert_eq!(submodule.description, "a submodule");
-        assert!(submodule.releases, "the tag is in the pointed-to dir");
+        assert!(
+            !submodule.releases,
+            "the shared git directory says nothing about who builds the releases"
+        );
 
         assert_eq!(skips(&report), [("org/broken", "not_a_repository")]);
     }
@@ -1158,10 +1038,10 @@ mod tests {
     }
 
     /// The metadata a repository inside the root may keep is also inside the
-    /// root. A `README.md`, a workflow directory, or a `refs` directory that
-    /// resolves out of the tree — through a chain of links, as one has to be able
-    /// to — is treated as absent, so a file the operator never placed can neither
-    /// describe a product nor switch its release control on.
+    /// root. A `README.md` or a `.github/workflows` that resolves out of the
+    /// tree — through a chain of links, as one has to be able to — is treated as
+    /// absent, so a directory the operator never placed can neither describe a
+    /// product nor switch its release control on.
     #[cfg(unix)]
     #[test]
     fn metadata_linked_out_of_the_root_is_not_read() {
@@ -1169,7 +1049,6 @@ mod tests {
 
         write(outside.join("secret.md"), "# leaked from outside\n");
         write(outside.join("workflows/release.yml"), "on: push\n");
-        write(outside.join("tags/v9.9.9"), "abc\n");
         // One more hop, so the check cannot be a test of the link's own name.
         let hop = outside.join("hop");
         std::os::unix::fs::symlink(&outside, &hop).unwrap();
@@ -1178,7 +1057,6 @@ mod tests {
         std::os::unix::fs::symlink(hop.join("secret.md"), one.join("README.md")).unwrap();
         fs::create_dir_all(one.join(".github")).unwrap();
         std::os::unix::fs::symlink(hop.join("workflows"), one.join(".github/workflows")).unwrap();
-        std::os::unix::fs::symlink(hop.join("tags"), one.join(".git/refs/tags")).unwrap();
 
         let report = scan(&root).unwrap();
         assert_eq!(ids(&report), ["org/one"], "{:?}", report.skipped);
@@ -1189,13 +1067,13 @@ mod tests {
         );
         assert!(
             !product.releases,
-            "a workflow and a tag outside the root do not turn release control on"
+            "a workflow directory outside the root does not turn release control on"
         );
 
         // The control: the same two facts, kept inside the tree, do count.
         let two = repo(&root, "org/two", "git@github.com:org/two.git");
         write(two.join("README.md"), "# described from inside\n");
-        write(two.join(".git/refs/tags/v9.9.9"), "abc\n");
+        fs::create_dir_all(two.join(".github/workflows")).unwrap();
         let report = scan(&root).unwrap();
         let inside = &report.products[1];
         assert_eq!(inside.description, "described from inside");
