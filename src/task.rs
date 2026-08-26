@@ -10,7 +10,7 @@ use crate::product::{self, check_product_id};
 const COLUMNS: &str = "id, title, body, status, kind, product_id, priority, branch, claimed_by, \
                        claim_id, claimed_at, claim_expires_at, commit_sha, verification, \
                        release_tag, created_at, updated_at, merge_target_task_id, checks_json, \
-                       review_target_task_id, review_verdict, merge_sequence";
+                       review_target_task_id, review_verdict";
 
 /// Every status, in vocabulary order. Used to enumerate legal transitions.
 pub(crate) const ALL_STATUSES: [TaskStatus; 10] = [
@@ -252,12 +252,6 @@ pub struct Task {
     /// Set on a `review` task once it answered.
     #[serde(default)]
     pub review_verdict: Option<ReviewVerdict>,
-    /// Set on an `instant:merge` task: its place in the merge train, in the
-    /// order merges were issued. Read only against other merges of the same
-    /// product, and never against `created_at` or the id — neither can order two
-    /// merges issued in the same second. See `SCHEMA_V6`.
-    #[serde(default)]
-    pub merge_sequence: Option<i64>,
     /// Decoded from `checks_json`; the column itself is never exposed.
     #[serde(default)]
     pub checks: Vec<Check>,
@@ -738,34 +732,37 @@ const CLAIMABLE: &str = "(status = 'ready'
                           OR (status = 'wip' AND claim_expires_at IS NOT NULL
                               AND claim_expires_at <= {now}))";
 
-/// The merges a claim may take: the one at the head of its product's train, and
-/// any task that is not a merge at all.
+/// The merges a claim may take: any whose product is not already held, and any
+/// task that is not a merge at all.
 ///
 /// A merge rebases its branch onto the main line, so the merges of one product
-/// are strictly serial — the second would otherwise rebase onto a main line the
-/// first has not written. So a merge is only claimable while no merge of the
-/// same product that was issued *earlier* is still live, where live is `ready`,
-/// `wip` or `blocked`: work that has not started, work in flight, and work that
-/// stopped and is waiting for a human. `done`, `cancelled` and `dropped` are
-/// over and release the ones behind them.
-///
-/// A merge whose lease expired is `wip` and still live, so it blocks the train —
-/// but it does not block *itself*: nothing was issued before it, so the head of a
-/// stalled train is retaken by the next worker rather than overtaken by the
-/// merge behind it.
+/// are serial — the second would otherwise rebase onto a main line the first has
+/// not written. A merge is therefore claimable only while no *other* merge of
+/// the same product is `wip` or `blocked`: work in flight, and work that stopped
+/// and is waiting for a human. `done`, `cancelled` and `dropped` are over and
+/// release the rest. **Which of a product's `ready` merges goes first is not
+/// decided here, and is not promised anywhere.**
 ///
 /// `IS` rather than `=` on the product, because two merges that carry no product
-/// are still each other's train, and `NULL = NULL` would say otherwise. A merge
-/// with no `merge_sequence` — one written by hand, or by something other than
-/// [`issue_merge`] — holds no place in any train: every comparison against it is
-/// `NULL`, so it neither waits nor blocks.
+/// are still each other's train, and `NULL = NULL` would say otherwise.
+///
+/// Only a merge that is `wip` or `blocked` holds the others up — one that is
+/// running, or one that stopped and is waiting for a human. Two `ready` merges
+/// do **not** wait on each other: if they did, each would see the other and
+/// neither could ever be taken. What keeps them from running together is the
+/// claim itself, which takes one row in one transaction; the moment it does,
+/// that row is `wip` and the rest of the product's merges wait on it.
+///
+/// The candidate is excluded from its own test by id, so a merge whose lease
+/// expired is still the row that may be taken again rather than the row that
+/// blocks itself.
 const MERGE_TRAIN_HEAD: &str = "(kind != 'instant:merge'
                                  OR NOT EXISTS (
                                    SELECT 1 FROM tasks ahead
                                    WHERE ahead.kind = 'instant:merge'
-                                     AND ahead.status IN ('ready', 'wip', 'blocked')
+                                     AND ahead.id != tasks.id
+                                     AND ahead.status IN ('wip', 'blocked')
                                      AND ahead.product_id IS tasks.product_id
-                                     AND ahead.merge_sequence < tasks.merge_sequence
                                  ))";
 
 /// Hand the next claimable task to `worker`. The row is only taken while it is
@@ -1149,11 +1146,12 @@ pub fn mergeable(db: &Db) -> Result<Vec<Task>, Error> {
     })
 }
 
-/// Merge tasks that have been issued and not finished yet, in train order.
+/// Merge tasks that have been issued and not finished yet.
 ///
-/// The order is the order they will actually be handed out in — the same
-/// `merge_sequence` the claim reads — so a screen showing this list is showing
-/// the queue rather than an alphabetical rearrangement of it.
+/// The order is stable — oldest first, ties broken by id — and it is only that.
+/// Which merge is handed out next is not promised: any of a product's `ready`
+/// merges may be the one a claim takes. A screen showing this list is showing
+/// what is outstanding, not a queue position.
 pub fn pending_merges(db: &Db) -> Result<Vec<Task>, Error> {
     db.with_conn(|conn| {
         query_all(
@@ -1162,7 +1160,7 @@ pub fn pending_merges(db: &Db) -> Result<Vec<Task>, Error> {
                 "SELECT {COLUMNS} FROM tasks
                  WHERE kind = 'instant:merge'
                    AND status NOT IN ('done', 'cancelled', 'dropped')
-                 ORDER BY merge_sequence ASC, created_at ASC, id ASC"
+                 ORDER BY created_at ASC, id ASC"
             ),
             &[],
         )
@@ -1307,9 +1305,9 @@ fn issue_merge_in_tx(tx: &Connection, target_id: &str, stamp: &str) -> Result<Ta
     let (id, _attempt) = free_attempt_id(tx, &merge_task_id(target_id))?;
     tx.execute(
         "INSERT INTO tasks (id, title, body, status, kind, product_id, priority, branch,
-                            commit_sha, merge_target_task_id, merge_sequence,
+                            commit_sha, merge_target_task_id,
                             created_at, updated_at)
-         VALUES (?1, ?2, '', 'ready', 'instant:merge', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+         VALUES (?1, ?2, '', 'ready', 'instant:merge', ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
         rusqlite::params![
             id,
             format!("merge {target_id}: {}", target.title),
@@ -1318,7 +1316,6 @@ fn issue_merge_in_tx(tx: &Connection, target_id: &str, stamp: &str) -> Result<Ta
             branch,
             commit_sha,
             target_id,
-            next_merge_sequence(tx)?,
             stamp,
         ],
     )
@@ -1329,21 +1326,6 @@ fn issue_merge_in_tx(tx: &Connection, target_id: &str, stamp: &str) -> Result<Ta
         )
     })?;
     read(tx, &id)
-}
-
-/// The place at the back of the merge train for the merge being issued now.
-///
-/// One counter for the whole table rather than one per product: a train only
-/// needs its own merges strictly ordered against each other, and taking the
-/// highest number ever issued gives every product that at once. It is read
-/// inside the issuing transaction, and writers serialize at `BEGIN IMMEDIATE`,
-/// so two merges can never be handed the same place.
-fn next_merge_sequence(conn: &Connection) -> Result<i64, Error> {
-    Ok(conn.query_row(
-        "SELECT coalesce(max(merge_sequence), 0) + 1 FROM tasks",
-        [],
-        |row| row.get(0),
-    )?)
 }
 
 /// The partial unique index (and the primary key) is what actually forbids a
@@ -1754,7 +1736,6 @@ fn from_row(row: &Row<'_>) -> Result<Task, Error> {
         checks: decode_checks(row.get::<_, Option<String>>(18)?.as_deref())?,
         review_target_task_id: row.get(19)?,
         review_verdict: decode_verdict(row.get::<_, Option<String>>(20)?.as_deref())?,
-        merge_sequence: row.get(21)?,
     })
 }
 
@@ -4362,30 +4343,30 @@ mod tests {
     }
 
     /// Two merges of one product cannot run at once: the second would rebase
-    /// onto a main line the first has not written yet. So the queue hands out
-    /// the older one and holds the younger back until the older is out of the
-    /// way.
+    /// onto a main line the first has not written yet. One of them is handed
+    /// out — which one is nobody's promise — and the other waits until the
+    /// running one is out of the way.
     #[test]
-    fn a_merge_waits_for_the_one_issued_before_it_in_its_product() {
+    fn a_products_merges_are_handed_out_one_at_a_time() {
         let db = db_with_product();
         let first = merge_waiting_for(&db, "t-1", "a/b");
         let second = merge_waiting_for(&db, "t-2", "a/b");
-        assert!(
-            first.merge_sequence < second.merge_sequence,
-            "the fixture must issue {} before {}",
-            first.id,
-            second.id
-        );
+        let both = [first.id.clone(), second.id.clone()];
 
-        assert_eq!(claim_merge(&db, "luna", later()), Some(first.id.clone()));
+        let taken = claim_merge(&db, "luna", later()).expect("one of the two is handed out");
+        assert!(
+            both.contains(&taken),
+            "an unexpected task was claimed: {taken}"
+        );
         assert_eq!(
             claim_merge(&db, "sol", later()),
             None,
-            "the second merge waits behind the first"
+            "the other merge waits while one of them is running"
         );
 
-        // Landing the first releases the one behind it.
-        let leased = get(&db, &first.id).unwrap();
+        // Landing the running one releases the one that waited.
+        let leased = get(&db, &taken).unwrap();
+        let landed = leased.merge_target_task_id.clone().expect("target");
         report(
             &db,
             &leased.claim_id.expect("claim_id"),
@@ -4396,8 +4377,28 @@ mod tests {
             later(),
         )
         .unwrap();
-        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Merged);
-        assert_eq!(claim_merge(&db, "sol", later()), Some(second.id));
+        assert_eq!(get(&db, &landed).unwrap().status, TaskStatus::Merged);
+
+        let rest: Vec<&String> = both.iter().filter(|id| **id != taken).collect();
+        assert_eq!(claim_merge(&db, "sol", later()).as_ref(), Some(rest[0]));
+    }
+
+    /// Neither of two `ready` merges may wait on the other. If they did, each
+    /// would see the other and the product would never move again — the failure
+    /// a strict issue order used to prevent, and that no order is needed to
+    /// prevent once only a running or jammed merge holds its product.
+    #[test]
+    fn two_ready_merges_of_one_product_do_not_deadlock() {
+        let db = db_with_product();
+        let first = merge_waiting_for(&db, "t-1", "a/b");
+        let second = merge_waiting_for(&db, "t-2", "a/b");
+        assert_eq!(get(&db, &first.id).unwrap().status, TaskStatus::Ready);
+        assert_eq!(get(&db, &second.id).unwrap().status, TaskStatus::Ready);
+
+        assert!(
+            claim_merge(&db, "luna", later()).is_some(),
+            "two ready merges must not hold each other up"
+        );
     }
 
     /// Block the head of a train the way a worker does, and answer with the row
@@ -4901,57 +4902,29 @@ mod tests {
         );
     }
 
-    /// An expired lease is the head of the train being handed to somebody else,
-    /// never the merge behind it moving up: nothing was issued before the head,
-    /// so the head is the only merge that predicate lets through.
+    /// An expired lease is the running merge being handed to somebody else,
+    /// never the one waiting behind it moving up. The running row is `wip`, so
+    /// it holds the rest of its product back; it is exempt from its own test, so
+    /// it is the one that can be taken again.
     #[test]
-    fn an_expired_merge_lease_goes_back_to_the_head_of_the_train() {
+    fn an_expired_merge_lease_is_retaken_not_overtaken() {
         let db = db_with_product();
-        let first = merge_waiting_for(&db, "t-b", "a/b");
-        let behind = merge_waiting_for(&db, "t-a", "a/b");
-        assert!(
-            behind.id < first.id,
-            "the follower has to be the one the queue would otherwise prefer: {} vs {}",
-            behind.id,
-            first.id
-        );
+        let one = merge_waiting_for(&db, "t-a", "a/b");
+        let other = merge_waiting_for(&db, "t-b", "a/b");
 
-        assert_eq!(claim_merge(&db, "luna", later()), Some(first.id.clone()));
+        let running = claim_merge(&db, "luna", later()).expect("one of the two runs");
+        let waiting = [one.id, other.id]
+            .into_iter()
+            .find(|id| *id != running)
+            .expect("the other one waits");
+
         let expired = later() + time::Duration::seconds(61);
+        let retaken = claim_merge(&db, "sol", expired).expect("the stalled merge comes back");
         assert_eq!(
-            claim_merge(&db, "sol", expired),
-            Some(first.id),
-            "the stalled head is retaken, not overtaken"
+            retaken, running,
+            "the stalled merge is retaken, not overtaken"
         );
-    }
-
-    /// The order is the sequence and nothing else. Merge ids are derived from
-    /// the target's name, so they sort alphabetically, and `format_z` writes
-    /// whole seconds, so two merges issued in the same second tie on time. The
-    /// fixture is built so both of those would answer the wrong way round.
-    #[test]
-    fn the_merge_train_follows_the_issue_order_not_the_id_text() {
-        let db = db_with_product();
-        let first = merge_waiting_for(&db, "t-b", "a/b");
-        let second = merge_waiting_for(&db, "t-a", "a/b");
-        assert_eq!(
-            first.created_at, second.created_at,
-            "the fixture has to be the tie this test is about: same second"
-        );
-        assert!(
-            second.id < first.id,
-            "and the younger merge has to sort first as text, or the hazard is gone: \
-             {} vs {}",
-            second.id,
-            first.id
-        );
-
-        assert_eq!(
-            claim_merge(&db, "luna", later()),
-            Some(first.id),
-            "the merge issued first goes first"
-        );
-        assert_eq!(claim_merge(&db, "sol", later()), None);
+        assert_ne!(retaken, waiting);
     }
 
     /// A merge that could not be integrated has to leave a record. Rolling the

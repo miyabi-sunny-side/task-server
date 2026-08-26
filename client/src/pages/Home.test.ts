@@ -321,7 +321,7 @@ describe("Home", () => {
     expect(list.querySelector('a[href="/tasks/t-ready-2"]')).not.toBeNull();
   });
 
-  it("shows a blocked head's cause off the control payload, asking nothing else", async () => {
+  it("shows a stopped merge's cause off the control payload, asking nothing else", async () => {
     let jammed = true;
     const fetchMock = stubFetch({
       control: () =>
@@ -349,7 +349,7 @@ describe("Home", () => {
 
     const reason = document.querySelector("[data-reason]");
     expect(reason?.textContent).toContain("src/task.rs");
-    expect(region("control").textContent).toContain("後続 1 件が待機中");
+    expect(region("control").textContent).toContain("他 1 件が待機中");
     // The reason rides along with the queue, so nothing is fetched per card:
     // there is no second request to fail on its own, and none to land out of
     // order over a newer one.

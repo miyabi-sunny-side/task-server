@@ -16,8 +16,8 @@ function merge(id: string, productId: string, status = "ready"): PendingMerge {
   };
 }
 
-// The server hands `pending_merges` over in merge_sequence order, so this
-// array is the distribution order read straight through.
+// The server hands `pending_merges` over in a stable order that promises
+// nothing about who runs next; grouping reads it straight through.
 const PENDING: PendingMerge[] = [
   merge("m-1", "sunny-side/one"),
   merge("m-2", "sunny-side/two"),
@@ -27,6 +27,33 @@ const PENDING: PendingMerge[] = [
 ];
 
 describe("mergeTrains", () => {
+  it("lifts the merge holding a product to the front of its train", () => {
+    for (const holding of ["wip", "blocked"]) {
+      const pending = [
+        merge("m-1", "sunny-side/one"),
+        merge("m-3", "sunny-side/one", holding),
+        merge("m-5", "sunny-side/one"),
+      ];
+
+      const [train] = mergeTrains(pending);
+
+      expect(train.items.map((item) => item.id)).toEqual(["m-3", "m-1", "m-5"]);
+    }
+  });
+
+  it("leaves a train alone when nothing is holding it", () => {
+    const pending = [
+      merge("m-5", "sunny-side/one"),
+      merge("m-1", "sunny-side/one"),
+    ];
+
+    const [train] = mergeTrains(pending);
+
+    // No status earns the front, so the server's own order survives: the list
+    // must not shuffle under the reader between two loads.
+    expect(train.items.map((item) => item.id)).toEqual(["m-5", "m-1"]);
+  });
+
   it("splits one flat list into a train per product", () => {
     expect(
       mergeTrains(PENDING).map((train) => [
@@ -39,7 +66,7 @@ describe("mergeTrains", () => {
     ]);
   });
 
-  it("orders the trains by the head each product first put on the wire", () => {
+  it("orders the trains by the merge each product first put on the wire", () => {
     const reordered = [PENDING[1], PENDING[0], PENDING[2]];
 
     expect(mergeTrains(reordered).map((train) => train.productId)).toEqual([

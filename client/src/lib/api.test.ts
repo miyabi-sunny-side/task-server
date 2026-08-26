@@ -26,7 +26,6 @@ const CARD: TaskCard = {
   commit_sha: null,
   verification: null,
   release_tag: null,
-  merge_sequence: null,
   created_at: "2026-08-15T10:00:00Z",
   updated_at: "2026-08-15T12:00:00Z",
   available_transitions: ["wip", "blocked"],

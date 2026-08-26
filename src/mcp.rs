@@ -349,10 +349,9 @@ impl Worker {
                        not a failure. A claimed task carries the `claim_id` task_report needs \
                        and the branch the work belongs on. Pass `kinds` to take only the work \
                        this loop handles, such as [\"review\"] for a reviewer; left out, \
-                       anything claimable. A merge is only handed out at the head of its \
-                       product's queue: merges of one product run one at a time, in the order \
-                       they were issued, because each rebases onto what the one before it \
-                       landed."
+                       anything claimable. Merges of one product run one at a time, because \
+                       each rebases onto what the one before it landed — but which of a \
+                       product's ready merges is handed out first is not promised."
     )]
     fn task_claim(&self, Parameters(args): Parameters<TaskClaimArgs>) -> CallToolResult {
         let kinds = match args.kinds.as_deref() {

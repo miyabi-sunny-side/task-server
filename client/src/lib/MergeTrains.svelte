@@ -16,45 +16,46 @@
   let trains = $derived(mergeTrains(pending));
 
   // A jam is legible only when its cause and its cost are both named, and
-  // neither is worth saying about a train that is running.
-  function jamOf(items: PendingMerge[]) {
-    const head = items[0];
-    return head.status === "blocked"
-      ? { reason: head.verification ?? "", waiting: items.length - 1 }
-      : { reason: "", waiting: 0 };
+  // neither is worth saying about a train that is running. The cause belongs
+  // to the stopped merge itself rather than to a position, so a reordering
+  // can never move it onto the wrong card (DESIGN.md, Merge trains).
+  function waitingOf(items: PendingMerge[]) {
+    return items.some((item) => item.status === "blocked")
+      ? items.filter((item) => item.status === "ready").length
+      : 0;
   }
 </script>
 
 {#if trains.length > 0}
   <div class="trains" data-block="trains">
     {#each trains as train (train.productId)}
-      {@const jam = jamOf(train.items)}
+      {@const waiting = waitingOf(train.items)}
       <div class="train" data-train={train.productId}>
         <p class="head">
           <span class="caption">{train.productId}</span>
           <span class="pill" data-count>{train.items.length}</span>
         </p>
         <ul class="cards">
-          {#each train.items as item, index (item.id)}
+          {#each train.items as item (item.id)}
             <li>
               <a class="card" href={`/tasks/${item.id}`}>
                 <span class="line">
                   <span class="name">{item.title}</span>
                   <span class="tail">
-                    <!-- The head wears its status badge like every other
+                    <!-- Every card wears its status badge like any other
                          readout card, so no caption repeats a status. -->
                     <span class="badge">{item.status}</span>
                   </span>
                 </span>
-                {#if index === 0 && jam.reason !== ""}
-                  <span class="reason" data-reason>{jam.reason}</span>
+                {#if item.status === "blocked" && (item.verification ?? "") !== ""}
+                  <span class="reason" data-reason>{item.verification}</span>
                 {/if}
               </a>
             </li>
           {/each}
         </ul>
-        {#if jam.waiting > 0}
-          <p class="caption">後続 {jam.waiting} 件が待機中</p>
+        {#if waiting > 0}
+          <p class="caption">他 {waiting} 件が待機中</p>
         {/if}
       </div>
     {/each}

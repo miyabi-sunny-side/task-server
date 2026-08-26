@@ -2334,10 +2334,11 @@ async fn the_control_plane_shows_what_is_in_flight_and_what_lost_its_reader() {
     );
 }
 
-/// A product's merges go out one at a time and in the order they were issued,
-/// because each one rebases onto the main line the one before it wrote. A merge
-/// that could not be integrated stops that train until a human calls it off —
-/// and stops nobody else's.
+/// A product's merges go out one at a time, because each one rebases onto the
+/// main line the one before it wrote. **Which of them goes first is not
+/// promised**, so this reads the answer rather than dictating it. A merge that
+/// could not be integrated stops that product until a human calls it off — and
+/// stops nobody else's.
 #[tokio::test]
 async fn a_products_merges_are_handed_out_one_at_a_time_and_a_blocked_one_stops_them() {
     let (_dir, state) = file_backed_state();
@@ -2352,12 +2353,21 @@ async fn a_products_merges_are_handed_out_one_at_a_time_and_a_blocked_one_stops_
     assert_eq!(
         ids_of(&plane["pending_merges"]),
         ["merge:t-a-first", "merge:t-b-second", "merge:t-z-elsewhere"],
-        "the queue is listed in the order it will be handed out: {plane}"
+        "the list is stable — oldest first, ties by id — and only that: {plane}"
     );
 
+    // Whichever of this product's two merges is handed out is the one that runs;
+    // the test follows it rather than naming it in advance.
     let (status, lease) = claim_kind(&state, "luna", &json!(["instant:merge"])).await;
     assert_eq!(status, StatusCode::OK, "{lease}");
-    assert_eq!(lease["id"], "merge:t-a-first", "the train head goes first");
+    let running = lease["id"].as_str().expect("id").to_owned();
+    let subject = lease["commit_sha"].as_str().expect("commit_sha").to_owned();
+    let waiting_id = ["merge:t-a-first", "merge:t-b-second"]
+        .into_iter()
+        .find(|id| *id != running)
+        .expect("one of the product's merges runs, the other waits")
+        .to_owned();
+    assert_ne!(running, "merge:t-z-elsewhere", "{lease}");
     let claim_id = claim_id_of(&lease);
 
     // Another product is rebasing onto another main line, so its merge runs
@@ -2380,7 +2390,7 @@ async fn a_products_merges_are_handed_out_one_at_a_time_and_a_blocked_one_stops_
         &state,
         &blocked_report_body(
             &claim_id,
-            "aaa1111",
+            &subject,
             "rebase onto main conflicts in src/task.rs",
             &checks,
         ),
@@ -2398,10 +2408,14 @@ async fn a_products_merges_are_handed_out_one_at_a_time_and_a_blocked_one_stops_
     );
     assert_eq!(blocked["checks"], checks, "{blocked}");
     assert_eq!(
-        blocked["commit_sha"], "aaa1111",
+        blocked["commit_sha"], subject,
         "a blocked merge keeps the subject it was issued for: {blocked}"
     );
-    let (status, target) = get_task(&state, "t-a-first").await;
+    let landed = blocked["merge_target_task_id"]
+        .as_str()
+        .expect("target")
+        .to_owned();
+    let (status, target) = get_task(&state, &landed).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         target["status"], "approved",
@@ -2413,7 +2427,7 @@ async fn a_products_merges_are_handed_out_one_at_a_time_and_a_blocked_one_stops_
         &state,
         &blocked_report_body(
             &claim_id,
-            "aaa1111",
+            &subject,
             "rebase onto main conflicts in src/task.rs",
             &checks,
         ),
@@ -2430,19 +2444,19 @@ async fn a_products_merges_are_handed_out_one_at_a_time_and_a_blocked_one_stops_
     );
 
     // Calling the blocked attempt off is what moves the train.
-    let (status, cancelled) = post_status(&state, "merge:t-a-first", "cancelled").await;
+    let (status, cancelled) = post_status(&state, &running, "cancelled").await;
     assert_eq!(status, StatusCode::OK, "{cancelled}");
     let (status, moved) = claim_kind(&state, "grok", &json!(["instant:merge"])).await;
     assert_eq!(status, StatusCode::OK, "{moved}");
-    assert_eq!(moved["id"], "merge:t-b-second");
+    assert_eq!(moved["id"], waiting_id, "{moved}");
 
     // The work the cancelled merge would have landed is a merge candidate
     // again: the reconciliation window is what a human presses on.
     let plane = control(&state).await;
-    assert_eq!(ids_of(&plane["mergeable"]), ["t-a-first"], "{plane}");
-    let (status, reissued) = post_merge(&state, "t-a-first").await;
+    assert_eq!(ids_of(&plane["mergeable"]), [landed.as_str()], "{plane}");
+    let (status, reissued) = post_merge(&state, &landed).await;
     assert_eq!(status, StatusCode::CREATED, "{reissued}");
-    assert_eq!(reissued["id"], "merge:t-a-first~2");
+    assert_eq!(reissued["id"], format!("{running}~2"), "{reissued}");
 }
 
 /// A merge that could not be integrated is called off and reissued, never

@@ -28,7 +28,7 @@ function merge(
   };
 }
 
-// Interleaved on the wire, exactly as merge_sequence hands them over.
+// Interleaved on the wire, exactly as the server hands them over.
 const PENDING: PendingMerge[] = [
   merge("m-1", ONE),
   merge("m-2", TWO),
@@ -75,7 +75,10 @@ describe("MergeTrains", () => {
     }
   });
 
-  it("keeps each train's cards in issue order, head first", () => {
+  // Nothing here is holding a product, so no card earns the front and the
+  // server's own stable order survives — the list must not shuffle under the
+  // reader between two loads.
+  it("keeps the server's order when no merge is holding a product", () => {
     render(MergeTrains, { props: { pending: PENDING } });
 
     expect(
@@ -93,7 +96,7 @@ describe("MergeTrains", () => {
     expect(trains()).toHaveLength(0);
   });
 
-  it("names a blocked head's cause and what is waiting behind it", () => {
+  it("names the stopped merge's cause and how many wait on it", () => {
     const jammed = [
       merge("m-1", ONE, "blocked", "rebase conflict:\n  src/task.rs"),
       merge("m-3", ONE),
@@ -108,9 +111,12 @@ describe("MergeTrains", () => {
     const reason = jam.querySelector<HTMLElement>("[data-reason]");
     expect(reason?.textContent).toContain("rebase conflict:");
     expect(reason?.textContent).toContain("src/task.rs");
-    // The head owns the reason; the cards behind it are merely waiting.
-    expect(cardsOf(jam)[0].contains(reason)).toBe(true);
-    expect(jam.textContent).toContain("後続 2 件が待機中");
+    // The reason belongs to the stopped merge itself, not to a position, and
+    // no other card carries one.
+    const cards = cardsOf(jam);
+    expect(cards[0].contains(reason)).toBe(true);
+    expect(jam.querySelectorAll("[data-reason]")).toHaveLength(1);
+    expect(jam.textContent).toContain("他 2 件が待機中");
 
     // The other product's train is untouched by the jam.
     const running = trainOf(TWO);
@@ -118,7 +124,28 @@ describe("MergeTrains", () => {
     expect(running.textContent).not.toContain("待機中");
   });
 
-  it("omits the waiting caption when the blocked head has no follower", () => {
+  it("puts the merge that holds the product before the ones that wait", () => {
+    render(MergeTrains, {
+      props: {
+        pending: [
+          merge("m-1", ONE),
+          merge("m-3", ONE, "blocked", "check failed"),
+          merge("m-5", ONE),
+        ],
+      },
+    });
+
+    const cards = cardsOf(trainOf(ONE));
+    expect(cards[0].textContent).toContain("m-3");
+    for (const behind of cards.slice(1)) {
+      expect(
+        cards[0].compareDocumentPosition(behind) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    }
+  });
+
+  it("omits the waiting caption when nothing waits on the stopped merge", () => {
     render(MergeTrains, {
       props: { pending: [merge("m-1", ONE, "blocked", "check failed")] },
     });
@@ -127,7 +154,7 @@ describe("MergeTrains", () => {
     expect(trainOf(ONE).textContent).not.toContain("待機中");
   });
 
-  it("shows no reason while the head is running, even if one is on the row", () => {
+  it("shows no reason while the holder is running, even if one is on the row", () => {
     render(MergeTrains, {
       props: {
         pending: [

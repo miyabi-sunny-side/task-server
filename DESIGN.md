@@ -555,22 +555,41 @@ counterpart to carry, so it earns no token pair.
   **Merge trains.** The outstanding merge tasks, **grouped by product**,
   because the train is per product — one product's jam never holds
   another's, and a single flat list would say the opposite. Each group is
-  captioned by its product id with its count pill, and its cards sit in
-  issue order, so the first card is the head: the merge that is or will
-  be claimed. **The panel writes no caption that duplicates a status** —
-  the head wears its status badge like every other readout card — so the
-  old "merge 進行中" caption is gone. It was true only while nothing was
-  blocked.
+  captioned by its product id with its count pill. **The panel writes no
+  caption that duplicates a status** — every card wears its status badge
+  like every other readout card — so the old "merge 進行中" caption is
+  gone. It was true only while nothing was blocked.
 
-  A head in `blocked` is the one thing that must not read as mere
-  slowness. Its card carries, under the title, **the reason as body-sm
-  text** with `white-space: pre-line`, and the group adds **one muted
-  caption naming how many tasks wait behind it** ("後続 2 件が待機中"),
-  rendered only when at least one card follows the head. A named cause
-  and a named cost are what separate a stuck train from a quiet one. It
-  stays **neutral**: a rebase conflict or a failing check is an ordinary
-  outcome of landing work, not a failure of the app — exactly as a
-  review's `request_changes` is — so the danger tokens do not enter here.
+  **Position says state, not sequence.** The server no longer promises
+  which of a product's outstanding merges is handed out next: any merge
+  that is `ready` may be the one a claim takes, and the decision is not
+  made until a worker asks. So a group is drawn **the merges that are
+  holding it up first — the ones that are `wip` or `blocked` — then the
+  rest**. What is left is a **set, not a line**: its order is stable, so
+  the list does not shuffle under the eye between reloads, and that
+  stability is a property of the drawing, never a claim about
+  distribution. Nothing in a train may say otherwise: **no ordinals, no
+  "次", no arrow, no card marked as coming first**. The old head — "the
+  first card is the merge that is or will be claimed" — is retired with
+  the ordering it read off, and the word "head" with it. A screen that
+  keeps a promise the server dropped is worse than one that never made
+  it.
+
+  **The holder** is the merge that is stopping the group: at most one per
+  product, `wip` while it runs, `blocked` when it stopped and is waiting
+  for a human. A holder in `wip` is an ordinary running train and says
+  nothing extra — the badge already says it. **A holder in `blocked` is
+  the one thing that must not read as mere slowness.** Its card carries,
+  under the title, **the reason as body-sm text** with `white-space:
+  pre-line` — on that card, wherever the card sits, because the reason
+  belongs to the merge that has it and not to a position. The group adds
+  **one muted caption naming how many of that product's merges are
+  waiting on it** ("他 2 件が待機中"), rendered only when at least one
+  other merge is there to wait. A named cause and a named cost are what
+  separate a stuck train from a quiet one. It stays **neutral**: a rebase
+  conflict or a failing check is an ordinary outcome of landing work, not
+  a failure of the app — exactly as a review's `request_changes` is — so
+  the danger tokens do not enter here.
 
   **Reconciliation.** The work the automation should be carrying and is
   not: tasks that are `done` with no live review, and tasks that are
@@ -917,17 +936,31 @@ counterpart to carry, so it earns no token pair.
   26. Merge trains are per product and a jam is legible. With merges
       outstanding on two products the panel renders one group per
       product, each captioned by its product id with a count pill equal
-      to its cards, cards in issue order. A head in `blocked` carries the
-      neutral outline status badge, its reason as body-sm text preserving
-      newlines (`white-space` is `pre-line`), and — when at least one
-      card follows it — a muted caption naming how many wait behind;
-      with no follower that caption is absent. Blocking one product's
-      head leaves the other product's group unchanged. No text color or
+      to its cards. A `blocked` merge carries the neutral outline status
+      badge and its reason as body-sm text preserving newlines
+      (`white-space` is `pre-line`) on its own card; no other card in
+      that group renders a reason element. When the group holds at least
+      one `ready` merge besides it, the group also renders exactly one
+      muted caption naming how many wait, whose number equals the count
+      of `ready` cards in that group; with none the caption is absent. A
+      group whose merges are all `ready`, and one whose holder is `wip`,
+      render no reason and no waiting caption. Blocking one product's
+      merge leaves the other product's group unchanged. No text color or
       background inside a train computes to the danger pair, and no
       caption in a train has a status name as its text. At 375px a reason
       holding a 40-character unbroken token still leaves
       `document.documentElement.scrollWidth` within the viewport.
-  27. Reconciliation is framed as the anomaly it is. With nothing
+  27. A train's order says state and promises no sequence. In every
+      product group, each card whose status is `wip` or `blocked`
+      precedes every card that is neither
+      (`compareDocumentPosition`). No card in a train carries an
+      ordinal, a position number, an arrow, or the text 次: within a
+      group the only numeral rendered outside a card's own title and
+      status badge is the caption's count pill. Loading the page twice
+      against unchanged server state yields the same card order in
+      every group, and moving a group's `blocked` merge to `cancelled`
+      leaves the remaining cards in the order they already had.
+  28. Reconciliation is framed as the anomaly it is. With nothing
       stranded the block is absent from the DOM. With a `done` task
       holding no live review, or an `approved` task holding no live
       merge, it renders once, computes danger text on a `danger-subtle`
@@ -958,8 +991,11 @@ counterpart to carry, so it earns no token pair.
   `blocked` merge or a `request_changes` review — those are ordinary
   outcomes of the work.
 - Do show a stalled merge train's cause and what it is holding — the
-  reason text and the count waiting behind the head; don't let a jam read
-  as ordinary slowness.
+  reason on the stopped merge's own card and the count of the merges
+  waiting on it; don't let a jam read as ordinary slowness.
+- Do let a train's order say which merge is holding it up and nothing
+  more, drawing the holder first; don't number the cards, mark one as
+  next, or otherwise promise an order the server stopped keeping.
 - Do let the panel say what is true; don't put procedure on the screen —
   what an operator should do about a stranded task belongs in the README.
 - Do name in text, beside the control, why a disabled control is

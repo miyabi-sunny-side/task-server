@@ -48,7 +48,7 @@
   }
 
   // One request draws the whole panel, jam reasons included: `pending_merges`
-  // carries each merge's own `verification`. A second request per blocked head
+  // carries each merge's own `verification`. A second request per stopped merge
   // would be a second thing to fail and a second generation to race, and this
   // region has neither.
   async function loadControl() {

@@ -196,26 +196,22 @@ JSON API, the MCP endpoints, and the compiled client.
   issuing works, and `POST /api/merges` is the handle for what is in it.
 - A merge task is `merge:<target_id>`; a retry whose id is already taken appends
   `~2`, `~3`, … so the id stays deterministic and one path segment.
-- **A product's merges run one at a time, in issue order.** Each merge rebases
-  its branch onto the main line, so the second of a product would otherwise
-  rebase onto a line the first has not written. `merge_sequence` is the train
-  position, taken as `max(merge_sequence) + 1` over the whole table inside the
-  issuing transaction — one counter for every product, which is enough because a
-  train is only ever compared with itself. A merge is claimable only while no
-  merge of the *same* `product_id` with a lower `merge_sequence` is still live,
-  where live is `ready`, `wip`, or `blocked`; `done`, `cancelled`, and `dropped`
-  release the ones behind them. The product is compared with `IS`, so two merges
-  carrying no product are still each other's train. A merge whose lease expired
-  is `wip` and blocks the train, but it does not block itself, so a stalled head
+- **A product's merges run one at a time, and which one goes first is not
+  promised.** Each merge rebases its branch onto the main line, so the second of
+  a product would otherwise rebase onto a line the first has not written. A
+  merge is claimable only while no *other* merge of the same `product_id` is
+  `wip` or `blocked` — running, or stopped and waiting for a person. `ready`
+  merges do **not** wait on each other: if they did, each would see the other
+  and the product would never move again. Serialising them is the claim's own
+  job, since it takes one row in one transaction and leaves it `wip`. `done`,
+  `cancelled`, and `dropped` release the rest. The product is compared with
+  `IS`, so two merges carrying no product are still each other's train, and the
+  candidate is excluded from its own test by id, so a merge whose lease expired
   is retaken rather than overtaken.
-- The order is `merge_sequence` and nothing else. Merge ids sort alphabetically
-  by their target's name and timestamps are whole seconds, so neither can order
-  two merges of the same product. `task::pending_merges` lists in that same
-  order, so a screen showing it is showing the distribution order.
-- A merge written by hand, or by anything other than `task::issue_merge`, has a
-  NULL `merge_sequence` and holds no place in any train: every comparison
-  against it is NULL, so it neither waits nor blocks. That is a non-normal state
-  the schema does not currently forbid.
+- **No order is stored and none is guaranteed.** `task::pending_merges` lists
+  oldest first with ties broken by id; that is a stable order for reading, not a
+  distribution order. Nothing decides in advance which of a product's `ready`
+  merges a claim will take.
 - Nothing lands untested. A **successful** report on an `instant:merge` task is
   refused unless it carries `checks` and every `exit_code` is `0`, whatever the
   merge's current status — so the answer never depends on the order the reports
@@ -383,8 +379,8 @@ button is live while `releasable` carries the product, and `mergeable` and
 `unreviewed` are reconciliation windows — both stay empty while the automatic
 issuing works.
 
-`pending_merges` is in `merge_sequence` order, and each row is the ordinary
-summary plus `verification`: the reason that merge stopped, or `null` while it
+`pending_merges` is in a stable reading order — oldest first, ties broken by id
+— and each row is the ordinary summary plus `verification`: the reason that merge stopped, or `null` while it
 is running. That is what lets a screen name a jammed train from this one
 payload, with no per-task request behind it. The MCP `task_set_status` tool and
 `POST /api/tasks/{id}/status` both refuse `ready` on a `blocked` merge, so a

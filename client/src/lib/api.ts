@@ -48,8 +48,6 @@ export interface TaskCard {
   commit_sha: string | null;
   verification: string | null;
   release_tag: string | null;
-  // Only a merge task carries one: the position the server will claim it in.
-  merge_sequence: number | null;
   created_at: string;
   updated_at: string;
   available_transitions: string[];

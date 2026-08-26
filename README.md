@@ -432,14 +432,20 @@ its own id: `merge:<id>` first, then `merge:<id>~2`, `~3`, and so on.
 
 A merge rebases its branch onto the main line, so two merges of the same product
 cannot run at once — the second would be rebasing onto a line the first has not
-written yet. Merges are therefore handed out **one product at a time, in the
-order they were issued**, tracked by each merge task's `merge_sequence`. A merge
-waits while any earlier merge of the same product is still `ready`, `wip`, or
-`blocked`; `done`, `cancelled`, and `dropped` release the ones behind it.
-Different products run side by side: one product's queue never holds another's.
+written yet. So a merge waits while another merge of the same product is `wip`
+or `blocked`: one that is running, or one that stopped and is waiting for a
+person. `done`, `cancelled`, and `dropped` release the rest.
 
-`GET /api/control` reports the outstanding merges under `pending_merges`, in
-that same order, so what you read is the order they will actually go out in.
+**Which of a product's merges goes first is not promised.** Two merges that are
+both `ready` do not wait on each other — if they did, each would see the other
+and the product would never move. What keeps them from running together is the
+claim itself: it takes one row in one transaction, and from that moment the row
+is `wip` and the rest of the product waits on it. Different products run side by
+side: one product's jam never holds another's.
+
+`GET /api/control` reports the outstanding merges under `pending_merges`. The
+order is stable — oldest first, ties broken by id — and it is only that: it
+tells you what is outstanding, not which one goes out next.
 
 The worker that claims it rebases the branch onto the main line and reports back
 with the checks it ran:
