@@ -208,6 +208,27 @@ PRAGMA user_version = 7;
 COMMIT;
 ";
 
+/// Version 8 remembers successful idempotent claim requests.
+///
+/// A worker may lose the HTTP response after the task has already moved to
+/// `wip`. The receipt lets a retry recover that same lease instead of consuming
+/// another task. Empty-queue answers are not stored: they changed no state and
+/// workers poll often, so recording them would grow this table without a lease
+/// to recover.
+const SCHEMA_V8: &str = "\
+BEGIN;
+CREATE TABLE claim_receipts (
+  idempotency_key TEXT PRIMARY KEY,
+  worker          TEXT NOT NULL,
+  kinds           TEXT NOT NULL,
+  task_id         TEXT NOT NULL REFERENCES tasks(id),
+  claim_id        TEXT NOT NULL UNIQUE,
+  created_at      TEXT NOT NULL
+);
+PRAGMA user_version = 8;
+COMMIT;
+";
+
 /// How long a writer waits for a lock before giving up, in milliseconds.
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -370,6 +391,9 @@ fn migrate(conn: &Connection) -> Result<(), Error> {
     if version < 7 {
         conn.execute_batch(SCHEMA_V7)?;
     }
+    if version < 8 {
+        conn.execute_batch(SCHEMA_V8)?;
+    }
     Ok(())
 }
 
@@ -512,11 +536,11 @@ mod tests {
         let named = Db::open(":memory:").unwrap();
         assert_eq!(pragma_string(&named, "journal_mode"), "memory");
         assert_eq!(pragma_int(&named, "busy_timeout"), 5000);
-        assert_eq!(user_version(&named), 7);
+        assert_eq!(user_version(&named), 8);
 
         let private = Db::open_in_memory().unwrap();
         assert_eq!(pragma_int(&private, "busy_timeout"), 5000);
-        assert_eq!(user_version(&private), 7);
+        assert_eq!(user_version(&private), 8);
 
         // A URI spelling is not one of them. Only the exact `:memory:` is
         // exempt, so a URI is an ordinary filename: it lands on disk in WAL,
@@ -599,17 +623,18 @@ mod tests {
     #[test]
     fn migration_creates_the_current_schema() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(user_version(&db), 7);
+        assert_eq!(user_version(&db), 8);
         let tables: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row(
-                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('products', 'tasks')",
+                    "SELECT count(*) FROM sqlite_master
+                     WHERE type = 'table' AND name IN ('products', 'tasks', 'claim_receipts')",
                     [],
                     |row| row.get(0),
                 )?)
             })
             .unwrap();
-        assert_eq!(tables, 2);
+        assert_eq!(tables, 3);
     }
 
     #[test]
@@ -630,7 +655,7 @@ mod tests {
         drop(db);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 7);
+        assert_eq!(user_version(&db), 8);
         let products: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row("SELECT count(*) FROM products", [], |row| row.get(0))?)
@@ -665,7 +690,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 7);
+        assert_eq!(user_version(&db), 8);
 
         let (title, status, priority, merge_target, checks): (
             String,
@@ -761,7 +786,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 7);
+        assert_eq!(user_version(&db), 8);
 
         db.with_conn(|conn| {
             let rows_after = rebuilt_rows(conn, ["t-target", "merge:t-target", "t-plain"]);
@@ -865,7 +890,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 7);
+        assert_eq!(user_version(&db), 8);
         let archived = |db: &Db| -> (usize, Option<String>) {
             db.with_conn(|conn| {
                 let columns = column_names(conn, "products");
@@ -890,7 +915,7 @@ mod tests {
         // column is not added twice and the row is not re-marked.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 7);
+        assert_eq!(user_version(&db), 8);
         assert_eq!(archived(&db), (1, None), "a second open changes nothing");
         let tasks: i64 = db
             .with_conn(|conn| {
@@ -1093,7 +1118,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 7);
+        assert_eq!(user_version(&db), 8);
         db.with_conn(|conn| {
             let columns = column_names(conn, "tasks");
             for added in ["review_target_task_id", "review_verdict"] {
@@ -1121,7 +1146,7 @@ mod tests {
         // Reopening runs the step again and must change nothing.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 7);
+        assert_eq!(user_version(&db), 8);
         let tasks: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?)
@@ -1179,7 +1204,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 7);
+        assert_eq!(user_version(&db), 8);
 
         let upgraded = Connection::open(&path).unwrap();
         assert!(
@@ -1210,7 +1235,7 @@ mod tests {
         // Reopening runs nothing again.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 7);
+        assert_eq!(user_version(&db), 8);
     }
 
     /// The step on its own: a database that already reached version 6 loses the
@@ -1257,7 +1282,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 7);
+        assert_eq!(user_version(&db), 8);
         let upgraded = Connection::open(&path).unwrap();
         assert!(
             !column_names(&upgraded, "tasks").contains(&"merge_sequence".to_owned()),

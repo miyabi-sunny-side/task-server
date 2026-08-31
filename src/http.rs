@@ -89,6 +89,10 @@ pub struct ClaimBody {
     /// so a worker written before roles existed keeps working.
     #[serde(default)]
     pub kinds: Vec<String>,
+    /// A fresh key for one logical claim attempt. Retrying it recovers the same
+    /// live lease when the first response was lost.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -459,13 +463,23 @@ pub async fn worker_claim(
         .iter()
         .map(|raw| TaskKind::parse(raw))
         .collect::<Result<Vec<TaskKind>, Error>>()?;
-    let leased = task::claim(
-        &state.db,
-        &body.worker,
-        &kinds,
-        state.clock.now(),
-        state.claim_ttl_secs,
-    )?;
+    let leased = match body.idempotency_key.as_deref() {
+        Some(key) => task::claim_idempotently(
+            &state.db,
+            &body.worker,
+            &kinds,
+            key,
+            state.clock.now(),
+            state.claim_ttl_secs,
+        ),
+        None => task::claim(
+            &state.db,
+            &body.worker,
+            &kinds,
+            state.clock.now(),
+            state.claim_ttl_secs,
+        ),
+    }?;
     match leased {
         Some(task) => Ok(Json(card(&state.db, task)?).into_response()),
         None => Ok((

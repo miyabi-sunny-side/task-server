@@ -935,6 +935,33 @@ mod tests {
         assert_eq!(skips(&report), [("org/broken", "not_a_repository")]);
     }
 
+    /// A disposable worker keeps the bare repository inside the product root and
+    /// makes the root itself a worktree pointer. Both metadata paths remain under
+    /// `APP_PROJECTS_DIR`, so this exact layout is a catalogue product too.
+    #[test]
+    fn a_bare_repository_inside_the_product_root_is_scanned() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let checkout = root.join("org/portable");
+        let bare = checkout.join(".bare");
+        git_dir(&bare);
+        write(
+            bare.join("config"),
+            "[remote \"origin\"]\n\turl = git@github.com:org/portable.git\n",
+        );
+        write(checkout.join(".git"), "gitdir: ./.bare\n");
+        write(checkout.join("README.md"), "# portable checkout\n");
+
+        let report = scan(root).unwrap();
+        assert_eq!(ids(&report), ["org/portable"]);
+        assert_eq!(
+            report.products[0].repository,
+            "https://github.com/org/portable"
+        );
+        assert_eq!(report.products[0].description, "portable checkout");
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    }
+
     /// Nothing outside the root is opened, however the tree asks for it. A `.git`
     /// pointer may be absolute, may climb out with `..`, may be a symlink, and a
     /// worktree's `commondir` may name anything — each is a way to make the walk

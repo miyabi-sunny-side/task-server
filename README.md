@@ -47,7 +47,7 @@ creates the database (and its parent directory) on first start.
 | GET | `/api/products` | product list |
 | GET | `/api/products/{id}` | one product |
 | PUT | `/api/products/{id}` | create or replace a product |
-| POST | `/worker/claim` | lease the next ready task; optional `kinds` takes only that work |
+| POST | `/worker/claim` | lease the next ready task; optional `kinds` routes by role and optional `idempotency_key` makes an uncertain response retryable |
 | POST | `/worker/report` | report a commit, and `checks`, against a lease; `"outcome": "blocked"` records why the work could not be finished |
 | POST | `/worker/review-report` | answer a claimed review with a verdict and findings |
 | POST | `/mcp` | MCP over Streamable HTTP: the catalogue and the task lifecycle |
@@ -98,11 +98,18 @@ field() {   # field <json> <name> -> the value, or a non-zero exit
 }
 
 # 1. Claim. `normal` only: review tasks answer on /worker/review-report, so a
-# claim that took every kind would report a review to the wrong route.
+# claim that took every kind would report a review to the wrong route. The key
+# names this logical attempt. If the response is lost, retry this exact body;
+# do not mint another key and accidentally take a second task.
+claim_key=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+claim_body=$(jq -nc \
+  --arg worker "$WORKER_NAME" \
+  --arg key "$claim_key" \
+  '{worker: $worker, kinds: ["normal"], idempotency_key: $key}')
 # `curl -f` turns a refusal — 401 on a bad capability — into a non-zero exit,
-# and because this is a plain assignment, `set -e` ends the run on it.
+# and because this is a plain assignment, `set -e` ends the reference run.
 card=$(curl -fsS "$TASK_SERVER_URL/worker/claim" -H "$auth" -H "$json" \
-  -d "$(jq -nc --arg worker "$WORKER_NAME" '{worker: $worker, kinds: ["normal"]}')")
+  -d "$claim_body")
 
 # 2. An empty queue is an answer, not an error. There is no long poll.
 card_status=$(printf '%s' "$card" | jq -r '.status // ""')
@@ -163,6 +170,15 @@ review is claimed with `{"kinds": ["review"]}` and answered with a verdict on
 bodies are in
 [Reviewing, merging and releasing](#reviewing-merging-and-releasing).
 
+`idempotency_key` makes a transport-uncertain claim recoverable. Generate a
+fresh key for one logical attempt and, until a definitive response arrives,
+retry the same `worker`, `kinds`, and key. A successful retry returns the same
+live task and `claim_id`; it never consumes another task. Only successful
+claims leave receipts. `no-work` leaves none, so that same key may claim work
+that becomes ready later. Reusing a key with another worker or set of kinds, or
+after its lease expires, answers 409 with code
+`claim_idempotency_conflict`. The key does not renew the lease.
+
 ### Where the clone is, the worker decides
 
 A card names a `product_id` and a `branch` and says nothing else about any
@@ -173,21 +189,40 @@ than a path — and the server keeps no path for it: the `products` table carrie
 when the row changed and when it was archived. No path is among them.
 
 `APP_PROJECTS_DIR` is not the missing half of that path. It is where *this*
-process walks to derive product identity, and the server treats that tree as a
-read-only catalogue source: the scanner opens directories and reads `.git`
-metadata, and writes nothing back into it. It is also a path in the *server's*
-own filesystem namespace, resolved by the server against its own mounts, so
-another process on another machine can assume neither that the path exists there
-nor that it may be written to — and a worker has to create worktrees, rebase and
-commit. So the two sides share one convention, `<root>/<org>/<repo>`, and each
-applies it to the root it owns. A worker that took its checkout path from the
-server would be applying the server's namespace to its own filesystem.
+process walks to derive product identity, in the server's own filesystem
+namespace. The scanner reads that tree and never writes to it. A worker on
+another machine cannot use its paths, and the server cannot use the worker's.
+
+In the split deployment — task-server on the long-lived host, disposable
+workers elsewhere — leave `APP_PROJECTS_DIR` unset. The SQLite `products` table,
+curated through the HTTP API, is the catalogue authority. Each worker's
+`<root>/<org>/<repo>` tree is only a checkout cache and working set. The two
+sides share `product_id`; they do not share a mount or keep a second server-side
+clone merely to feed the scanner. A worker must preflight its own checkout and
+either obtain it or report the task blocked.
+
+When a deployment does choose a derived catalogue, the scanner accepts this
+in-root bare-backed checkout:
+
+```text
+<APP_PROJECTS_DIR>/<org>/<repo>/
+├── .git       # gitdir: ./.bare
+└── .bare/
+```
+
+The `gitdir:` target stays inside the product root, so it passes the same
+boundary checks as an ordinary checkout. That scanner support does not make a
+remote worker cache the split deployment's catalogue authority.
 
 ### What the protocol leaves to the worker
 
 - **There is no long poll.** A claim answers immediately, and an empty queue is
   `200 {"status":"no-work"}`. A loop has to poll, and to poll with jitter so
   that several workers do not wake in step.
+- **An uncertain claim is retried, not abandoned.** A worker keeps its logical
+  attempt's `idempotency_key` and exact claim payload until it receives a
+  definitive answer. A fresh key would be a fresh attempt and could consume a
+  second task. Omitting the key retains the legacy, non-idempotent behaviour.
 - **There is no heartbeat.** The deadline is on the card: a claim answers with
   `claim_expires_at`, the instant the claim was granted plus `CLAIM_TTL_SECS`
   (3600 seconds by default), written as UTC `YYYY-MM-DDThh:mm:ssZ`. It is
@@ -200,7 +235,9 @@ server would be applying the server's namespace to its own filesystem.
   against the longest task, or lose the report at the end of it. That is not the
   only refusal a late report meets: a task moved out from under the lease by
   hand — pressed `cancelled`, say — still matches its `claim_id`, and the report
-  is refused as `invalid` for the status it now sits in.
+  is refused as `invalid` for the status it now sits in. A renew or heartbeat
+  route is the next protocol priority: it would let short leases recover crashed
+  machines promptly without making long tasks race their deadline.
 - **There is no nack.** `outcome: "blocked"` is not one: it records a stop, with
   the reason in `verification` and the evidence in `checks`. On the `normal`
   task above it leaves the task in `blocked` for a person to press back to
@@ -208,15 +245,17 @@ server would be applying the server's namespace to its own filesystem.
   refused on it, and the attempt is called off and reissued instead; see
   [Reviewing, merging and releasing](#reviewing-merging-and-releasing). Either
   way, a worker that only wants to put the work back down has nothing but the
-  lease running out.
+  lease running out. A nack or release route follows renew in priority: it helps
+  graceful shutdown and checkout preflight failures, but a disposable machine
+  that has already vanished cannot call it.
 - **A claim filters by kind, never by product.** `kinds` is the only filter the
-  queue offers, so a worker can be handed work for a product it has no clone
-  of — and there is no product-shaped refusal any more than there is a nack. Its
-  choices are the ones above: get itself a checkout and carry on, or report
-  `outcome: "blocked"` with the reason. Only for a worker that does neither is
-  expiry what takes the row back. Returning a path would not change any of that
-  — the clone is missing from that machine either way — so which worker is
-  offered which product is still an open question.
+  queue offers, so each role must name its work explicitly. A normal worker uses
+  `["normal"]`; otherwise an unrestricted claim may take an `instant:merge`,
+  which is ranked ahead of ordinary work. The filter is routing, not
+  authorization. A worker can still be handed a product it has no clone of. Its
+  choices are to obtain the checkout or report `outcome: "blocked"` with the
+  reason. Returning a server path would not help: the clone is missing from the
+  worker's machine either way.
 
 ## The product catalogue
 
@@ -250,14 +289,15 @@ rather than on the prose:
 
 ```json
 {
-  "error": "product 'org/repo' is not in the product catalogue, so task t-1 cannot become ready; the catalogue follows the project tree, so put a clone at org/repo or correct the product_id (with no project tree configured, add it with PUT /api/products/org/repo)",
+  "error": "product 'org/repo' is not in the product catalogue, so task t-1 cannot become ready; correct the product_id, or register the product through the configured catalogue source: put a clone at org/repo and restart when APP_PROJECTS_DIR is set, otherwise use PUT /api/products/org/repo",
   "code": "product_not_catalogued"
 }
 ```
 
 The codes are `unauthorized`, `forbidden`, `not_found`, `claim_mismatch`,
-`invalid`, `conflict`, `product_required`, `product_not_catalogued`,
-`product_archived`, `frontmatter`, `io`, and `db`. An unknown `/api/*` path
+`claim_idempotency_conflict`, `invalid`, `conflict`, `product_required`,
+`product_not_catalogued`, `product_archived`, `frontmatter`, `io`, and `db`.
+An unknown `/api/*` path
 answers in the same shape, as a 404 with code `not_found`.
 
 One kind of failure is outside that contract: a request body that is not valid
@@ -561,13 +601,13 @@ other's endpoint. A request that presents the wrong capability, or none, is
 answered `401` with the usual `{"error", "code"}` body and never reaches
 JSON-RPC: a caller that did not get past the door has no session to answer in.
 
-Curating the catalogue, issuing a merge, and cutting a release stay off MCP on
-purpose — they are the human decisions the rest of this README describes, and
-they are made over HTTP. There is no delete tool either, for the same reason
-there is no delete route. `task_create` therefore files ordinary work and takes
-no `kind`, and `task_set_status` refuses `merged` and `released` with the same
-code and for the same reason the HTTP status route does — one domain function
-answers both, so neither transport can become a way around the other.
+Catalogue writes and releases stay off MCP and are made over HTTP. Review and
+merge issuance remains owned by the control plane; their HTTP routes are
+reconciliation handles, not worker tools. There is no delete tool, just as there
+is no delete route. `task_create` therefore files ordinary work and takes no
+`kind`, and `task_set_status` refuses `merged` and `released` with the same code
+and for the same reason the HTTP status route does — one domain function answers
+both, so neither transport can become a way around the other.
 
 A refusal the domain owns is not a protocol failure, so it comes back as a tool
 result with `isError: true`. Its `structuredContent` is the same
@@ -578,7 +618,7 @@ text content, so a client branches on the code rather than on the prose:
 {
   "isError": true,
   "structuredContent": {
-    "error": "product 'org/repo' is not in the product catalogue, so task t-1 cannot become ready; the catalogue follows the project tree, so put a clone at org/repo or correct the product_id (with no project tree configured, add it with PUT /api/products/org/repo)",
+    "error": "product 'org/repo' is not in the product catalogue, so task t-1 cannot become ready; correct the product_id, or register the product through the configured catalogue source: put a clone at org/repo and restart when APP_PROJECTS_DIR is set, otherwise use PUT /api/products/org/repo",
     "code": "product_not_catalogued"
   }
 }
@@ -831,6 +871,21 @@ With `TASK_SERVER_ENV=production` the process refuses to start unless
 are the secrets, and secrets are all this server configures: which identities,
 origins, and hostnames may reach it is decided by the ingress in front of it,
 which is the only thing positioned to know.
+
+### Network boundary
+
+`APP_BIND_ADDR` only chooses an interface; it does not add encryption. Both
+worker authentication forms send `WORKER_CAPABILITY` as a bearer secret, and
+plain HTTP exposes it to any host or network link that can observe the traffic.
+For remote workers, terminate TLS at a trusted reverse proxy or carry the
+connection through an authenticated VPN or tailnet, then restrict the listener
+with firewall or ingress policy to those workers. Plain HTTP is suitable only
+on a strictly trusted LAN where every host and link on the path is trusted.
+Never expose the process directly to the public Internet.
+
+The binary defaults to `127.0.0.1:3000`. The container image binds
+`0.0.0.0:3000`; `EXPOSE` does not publish the port, so the container runtime's
+port mapping, ingress, and firewall define who can reach it.
 
 ## Repository structure
 

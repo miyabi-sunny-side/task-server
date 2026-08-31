@@ -46,7 +46,12 @@ JSON API, the MCP endpoints, and the compiled client.
   matching the tree is not rewritten, so `updated_at` is not stamped by a restart.
   An empty walk changes nothing and warns — including on an empty catalogue, since
   the warning is about the walk; an unreadable root fails the startup. Unset means
-  nothing is walked. The retired `APP_PRODUCTS_SEED` refuses the start.
+  nothing is walked and the SQLite `products` table, curated over HTTP, is the
+  catalogue authority. The retired `APP_PRODUCTS_SEED` refuses the start.
+- In a split deployment the task-server host leaves `APP_PROJECTS_DIR` unset.
+  Remote workers own `<root>/<org>/<repo>` checkout caches and working sets; the
+  server owns catalogue identity in SQLite. Only `product_id` crosses that
+  boundary. No server-side clone is maintained merely to mirror a worker cache.
 - A git repository is git's own definition, not "it has a config": `HEAD` reading
   as a ref or an object name, an object store, and `refs`. `releases` is whether
   the clone has a `.github/workflows` **directory** — no name is read and an empty
@@ -56,7 +61,9 @@ JSON API, the MCP endpoints, and the compiled client.
   has to stay under the root: a `.git` symlink, a `gitdir:` pointer, or a
   `commondir` leading out is skipped as `outside_root` and counted, and README,
   workflow, and refs paths that resolve out are read as absent. Worktree and
-  submodule pointers are still followed while they stay inside.
+  submodule pointers are still followed while they stay inside. This includes a
+  product root whose `.git` says `gitdir: ./.bare` and whose `.bare/` repository
+  stays inside that root.
 - A product whose working copy left the tree is **archived, never deleted**:
   `products.archived_at` is set, the row stays so the tasks that named it keep
   resolving, and `ready` is refused with code `product_archived` — distinct from
@@ -286,15 +293,31 @@ JSON API, the MCP endpoints, and the compiled client.
   `ready`, so two workers never hold the same task. An optional `kinds` narrows the
   candidates to the work one loop handles; empty or absent takes anything, so a
   loop written before roles existed keeps working. It is routing, not
-  authorization: a worker that asks for everything is still given everything.
+  authorization. Every role should pass an explicit list; a normal worker passes
+  `["normal"]` so merge work cannot win its claim.
+- An optional non-blank `idempotency_key` identifies one logical claim attempt.
+  The first successful claim and its lease receipt are written in the same
+  `IMMEDIATE` transaction. Replaying the same worker and semantic `kinds` while
+  that lease is live returns the same task and `claim_id`; it consumes no other
+  task. A payload mismatch or expired lease is 409 with code
+  `claim_idempotency_conflict`. `no-work` writes no receipt, and omitting the key
+  retains legacy claim behaviour. The key never renews a lease.
 - One task, one branch. A claim on a task without a `branch` sets
   `task/<id>`; an existing branch is never rewritten.
 - A report is matched by `claim_id`. A stale or unknown `claim_id` is
   rejected with 409. Reporting the same `commit_sha` twice is idempotent.
 - Clock is injectable. Default claim TTL is 3600 seconds (`CLAIM_TTL_SECS`).
-- Listen on `127.0.0.1` by default (`APP_BIND_ADDR` may override).
+  There is no renew or heartbeat route, so the TTL must exceed the longest task.
+  Renew is the next protocol priority; nack/release follows because it helps a
+  graceful worker but cannot recover a disposable machine that already vanished.
+- Listen on `127.0.0.1` by default (`APP_BIND_ADDR` may override). Binding a LAN
+  interface adds reachability, not TLS. The container image binds
+  `0.0.0.0:3000`; runtime port publishing and ingress remain the boundary.
 - Worker routes require `X-Worker-Capability` equal to the configured secret.
-  An identity header alone does not authenticate.
+  An identity header alone does not authenticate. HTTP carries that bearer in
+  plaintext, so remote access requires a trusted TLS ingress or authenticated
+  VPN/tailnet plus firewall policy. Plain HTTP is only for a strictly trusted
+  LAN and the service is never exposed directly to the public Internet.
 - Human identity comes from ingress (`X-Auth-User` or `Tailscale-User-Login`).
   The browser does not mint identity.
 - Human mutation requires an ingress identity and `X-CSRF-Token`. The identity
@@ -316,11 +339,11 @@ JSON API, the MCP endpoints, and the compiled client.
   the name that proxy forwards.
 - `/mcp` carries `product_list`, `task_create`, `task_get`, `task_list`,
   `task_update`, and `task_set_status`; `/worker/mcp` carries `task_claim`,
-  `task_report`, and `task_review_report`. Catalogue writes, reviews, merges,
-  and releases are human decisions and have no tool; `task_create` files
-  ordinary work and takes no `kind`, and `task_set_status` refuses `approved`,
-  `merged`, and `released` with code `invalid` through the same domain function
-  the HTTP status route calls.
+  `task_report`, and `task_review_report`. Catalogue writes and releases remain
+  HTTP-only; review and merge reconciliation handles remain HTTP-only control
+  plane operations. `task_create` files ordinary work and takes no `kind`, and
+  `task_set_status` refuses `approved`, `merged`, and `released` with code
+  `invalid` through the same domain function the HTTP status route calls.
 - A refusal the domain owns is not a protocol failure: it is a tool result with
   `isError: true` whose `structuredContent` is the same `{"error", "code"}` pair
   HTTP answers with, repeated in the text content. Arguments that fail to

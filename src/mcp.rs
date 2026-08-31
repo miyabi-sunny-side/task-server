@@ -108,6 +108,10 @@ pub struct TaskClaimArgs {
     /// `review`. Left out, anything claimable.
     #[serde(default)]
     pub kinds: Option<Vec<String>>,
+    /// A fresh key for one logical claim attempt. Retrying it recovers the same
+    /// live lease when the first response was lost.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -287,11 +291,10 @@ impl Admin {
         description = "Move a task to another status. A task cannot be promoted to `ready` while \
                        its product is not in the product catalogue: that refusal comes back with \
                        code `product_not_catalogued` (or `product_required` when the task names \
-                       no product at all). The catalogue follows the project tree on disk, so the \
-                       remedy is the tree, not the catalogue: no clone sits at that `org/repo`, so \
-                       either the id is wrong or the clone has to be placed there. Code \
-                       `product_archived` is a different refusal: the product is catalogued and \
-                       its clone left the tree, so the remedy is restoring that one clone. \
+                       no product at all). Correct the id or register the product through the \
+                       configured catalogue source: the project tree when APP_PROJECTS_DIR is set, \
+                       otherwise PUT /api/products/{id}. Code `product_archived` is different: the \
+                       derived catalogue remembers a clone that left its tree, so restore it. \
                        `approved`, `merged` and `released` are granted by the review, merge and \
                        release control plane and are refused here. `done` on a review task is \
                        refused too: a review is finished by its verdict \
@@ -314,12 +317,11 @@ impl ServerHandler for Admin {
             .with_server_info(identity())
             .with_instructions(
             "Task control plane. File work with task_create, groom it with task_update, and move \
-             it with task_set_status. The product catalogue is derived from the project tree on \
-             disk rather than curated, so a refused promotion is answered in the tree, never by \
-             inventing a catalogue entry: code `product_not_catalogued` means no clone sits at \
-             that `org/repo`, so correct the `product_id` or ask for the clone to be placed there, \
-             and code `product_archived` means the clone left the tree, so ask for that clone to \
-             be restored.",
+             it with task_set_status. The product catalogue is either curated through the HTTP \
+             API or derived from APP_PROJECTS_DIR. Code `product_not_catalogued` means the id is \
+             absent from the configured source: correct the product_id, add it through PUT \
+             /api/products/{id} in curated mode, or place its clone in the project tree in derived \
+             mode. Code `product_archived` means a clone left a derived tree, so restore it.",
         )
     }
 }
@@ -347,11 +349,11 @@ impl Worker {
         description = "Claim the next ready task for `worker` and move it to `wip`. Answers \
                        {\"status\":\"no-work\"} when nothing is claimable — that is an answer, \
                        not a failure. A claimed task carries the `claim_id` task_report needs \
-                       and the branch the work belongs on. Pass `kinds` to take only the work \
-                       this loop handles, such as [\"review\"] for a reviewer; left out, \
-                       anything claimable. Merges of one product run one at a time, because \
-                       each rebases onto what the one before it landed — but which of a \
-                       product's ready merges is handed out first is not promised."
+                       and the branch the work belongs on. Give each logical attempt a fresh \
+                       `idempotency_key`; retrying it recovers the same live lease after an \
+                       uncertain response. Pass `kinds` to take only the work this loop handles, \
+                       such as [\"review\"] for a reviewer; left out, anything claimable. Merges \
+                       of one product run one at a time, but their ready order is not promised."
     )]
     fn task_claim(&self, Parameters(args): Parameters<TaskClaimArgs>) -> CallToolResult {
         let kinds = match args.kinds.as_deref() {
@@ -362,19 +364,27 @@ impl Worker {
             Ok(kinds) => kinds,
             Err(error) => return answer(Err(error)),
         };
-        answer(
-            task::claim(
+        let leased = match args.idempotency_key.as_deref() {
+            Some(key) => task::claim_idempotently(
+                &self.state.db,
+                &args.worker,
+                &kinds,
+                key,
+                self.state.clock.now(),
+                self.state.claim_ttl_secs,
+            ),
+            None => task::claim(
                 &self.state.db,
                 &args.worker,
                 &kinds,
                 self.state.clock.now(),
                 self.state.claim_ttl_secs,
-            )
-            .map(|leased| match leased {
-                Some(task) => json!({ "status": "claimed", "task": task }),
-                None => json!({ "status": "no-work" }),
-            }),
-        )
+            ),
+        };
+        answer(leased.map(|leased| match leased {
+            Some(task) => json!({ "status": "claimed", "task": task }),
+            None => json!({ "status": "no-work" }),
+        }))
     }
 
     #[tool(

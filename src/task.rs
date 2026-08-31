@@ -626,18 +626,17 @@ fn check_catalogued(conn: &Connection, task: &Task) -> Result<(), Error> {
             ),
         }),
         Ok(_) => Ok(()),
-        // The catalogue is derived from the project tree wherever one is
-        // configured, so "add the product" is the wrong instruction there: no
-        // clone sits at this id, and a row typed in by hand would be archived by
-        // the next walk. The remedy is the tree, with the API named only for the
-        // deployment that has no tree at all.
+        // The server does not retain the startup catalogue mode in AppState, so
+        // name both remedies. With a derived catalogue a hand-written row is
+        // archived by the next walk; with a curated one there is no tree to fix.
         Err(Error::NotFound) => Err(Error::Precondition {
             code: "product_not_catalogued",
             message: format!(
                 "product '{product_id}' is not in the product catalogue, \
-                 so task {} cannot become ready; the catalogue follows the project tree, \
-                 so put a clone at {product_id} or correct the product_id \
-                 (with no project tree configured, add it with PUT /api/products/{product_id})",
+                 so task {} cannot become ready; correct the product_id, or register \
+                 the product through the configured catalogue source: put a clone at \
+                 {product_id} and restart when APP_PROJECTS_DIR is set, otherwise use \
+                 PUT /api/products/{product_id}",
                 task.id
             ),
         }),
@@ -776,9 +775,45 @@ pub fn claim(
     now: OffsetDateTime,
     ttl_secs: u64,
 ) -> Result<Option<Task>, Error> {
+    claim_request(db, worker, kinds, None, now, ttl_secs)
+}
+
+/// Claim with a retry key that recovers the same live lease after an uncertain
+/// response. A key records only a successful claim; `no-work` changed no state
+/// and is safe to ask again.
+pub fn claim_idempotently(
+    db: &Db,
+    worker: &str,
+    kinds: &[TaskKind],
+    idempotency_key: &str,
+    now: OffsetDateTime,
+    ttl_secs: u64,
+) -> Result<Option<Task>, Error> {
+    if idempotency_key.trim().is_empty() {
+        return Err(Error::Invalid("idempotency_key must not be blank".into()));
+    }
+    claim_request(db, worker, kinds, Some(idempotency_key), now, ttl_secs)
+}
+
+struct ClaimReceipt {
+    worker: String,
+    kinds: String,
+    task_id: String,
+    claim_id: String,
+}
+
+fn claim_request(
+    db: &Db,
+    worker: &str,
+    kinds: &[TaskKind],
+    idempotency_key: Option<&str>,
+    now: OffsetDateTime,
+    ttl_secs: u64,
+) -> Result<Option<Task>, Error> {
     if worker.trim().is_empty() {
         return Err(Error::Invalid("worker is required".into()));
     }
+    let kinds_signature = kinds_signature(kinds);
     let ttl = i64::try_from(ttl_secs).unwrap_or(i64::MAX);
     let claimed_at = format_z(now);
     let claim_expires_at = format_z(now + time::Duration::seconds(ttl));
@@ -799,6 +834,12 @@ pub fn claim(
         CLAIMABLE.replace("{now}", "?4")
     );
     db.with_tx(|tx| {
+        if let Some(key) = idempotency_key
+            && let Some(receipt) = claim_receipt(tx, key)?
+        {
+            return replay_claim(tx, key, &receipt, worker, &kinds_signature, &claimed_at)
+                .map(Some);
+        }
         loop {
             let Some(task) = query_all(tx, &select_sql, &[&claimed_at])?.pop() else {
                 return Ok(None);
@@ -815,10 +856,84 @@ pub fn claim(
                     "UPDATE tasks SET branch = ?2 WHERE id = ?1 AND branch IS NULL",
                     rusqlite::params![task.id, format!("task/{}", task.id)],
                 )?;
+                if let Some(key) = idempotency_key {
+                    tx.execute(
+                        "INSERT INTO claim_receipts
+                           (idempotency_key, worker, kinds, task_id, claim_id, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![
+                            key,
+                            worker,
+                            kinds_signature,
+                            task.id,
+                            claim_id,
+                            claimed_at,
+                        ],
+                    )?;
+                }
                 return read(tx, &task.id).map(Some);
             }
         }
     })
+}
+
+fn claim_receipt(conn: &Connection, key: &str) -> Result<Option<ClaimReceipt>, Error> {
+    let mut statement = conn.prepare(
+        "SELECT worker, kinds, task_id, claim_id
+         FROM claim_receipts WHERE idempotency_key = ?1",
+    )?;
+    let mut rows = statement.query([key])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    Ok(Some(ClaimReceipt {
+        worker: row.get(0)?,
+        kinds: row.get(1)?,
+        task_id: row.get(2)?,
+        claim_id: row.get(3)?,
+    }))
+}
+
+fn replay_claim(
+    conn: &Connection,
+    key: &str,
+    receipt: &ClaimReceipt,
+    worker: &str,
+    kinds: &str,
+    now: &str,
+) -> Result<Task, Error> {
+    if receipt.worker != worker || receipt.kinds != kinds {
+        return Err(claim_idempotency_conflict(format!(
+            "idempotency_key {key:?} was already used with another worker or kinds filter"
+        )));
+    }
+    let task = read(conn, &receipt.task_id)?;
+    let lease_is_live = task.status == TaskStatus::Wip
+        && task.claim_id.as_deref() == Some(receipt.claim_id.as_str())
+        && task
+            .claim_expires_at
+            .as_deref()
+            .is_some_and(|expires| expires > now);
+    if !lease_is_live {
+        return Err(claim_idempotency_conflict(format!(
+            "idempotency_key {key:?} no longer names a live lease; retry with a new key"
+        )));
+    }
+    Ok(task)
+}
+
+fn claim_idempotency_conflict(message: String) -> Error {
+    Error::Precondition {
+        code: "claim_idempotency_conflict",
+        message,
+    }
+}
+
+fn kinds_signature(kinds: &[TaskKind]) -> String {
+    let mut names: Vec<&str> = kinds.iter().map(|kind| kind.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    names.join(",")
 }
 
 /// The `AND kind IN (…)` a claim adds when it asks for particular kinds of work.

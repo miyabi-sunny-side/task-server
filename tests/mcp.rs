@@ -769,6 +769,75 @@ async fn mcp_status_change_refuses_approved_merged_and_released() {
     }
 }
 
+/// MCP exposes the same retry key and the same lease replay as HTTP; it is a
+/// second transport over one claim contract, not a weaker path around it.
+#[tokio::test]
+async fn an_mcp_claim_retries_the_same_live_lease() {
+    let (_dir, state) = file_backed_state();
+    let router = task_server::app(state);
+    catalogue(&router, "sunny-side/task-server").await;
+
+    let mut admin = McpClient::new(&router, "/mcp", MCP_CAPABILITY);
+    admin.initialize().await;
+    admin
+        .call(
+            "task_create",
+            json!({
+                "id": "t-idempotent",
+                "title": "retry me",
+                "product_id": "sunny-side/task-server",
+            }),
+        )
+        .await;
+    admin
+        .call(
+            "task_set_status",
+            json!({ "id": "t-idempotent", "status": "ready" }),
+        )
+        .await;
+
+    let mut worker = McpClient::new(&router, "/worker/mcp", WORKER_CAPABILITY);
+    worker.initialize().await;
+    let schema = worker.tool_schema("task_claim").await;
+    assert!(
+        schema["properties"].get("idempotency_key").is_some(),
+        "task_claim must declare its retry key: {schema}"
+    );
+
+    let arguments = json!({
+        "worker": "opus",
+        "kinds": ["normal"],
+        "idempotency_key": "mcp-claim-attempt-1",
+    });
+    let first = worker.call("task_claim", arguments.clone()).await;
+    let replayed = worker.call("task_claim", arguments).await;
+    assert_eq!(
+        first["structuredContent"]["task"]["id"], "t-idempotent",
+        "{first}"
+    );
+    assert_eq!(
+        first["structuredContent"]["task"]["claim_id"],
+        replayed["structuredContent"]["task"]["claim_id"],
+        "{replayed}"
+    );
+
+    let reused = worker
+        .call(
+            "task_claim",
+            json!({
+                "worker": "another-worker",
+                "kinds": ["normal"],
+                "idempotency_key": "mcp-claim-attempt-1",
+            }),
+        )
+        .await;
+    assert_eq!(reused["isError"], json!(true), "{reused}");
+    assert_eq!(
+        reused["structuredContent"]["code"], "claim_idempotency_conflict",
+        "{reused}"
+    );
+}
+
 /// File `id` for the catalogued product and take it to `done` over MCP, the way
 /// an implementing loop does.
 async fn work_to_done_over_mcp(router: &Router, id: &str) {

@@ -1521,14 +1521,69 @@ async fn an_expired_lease_is_reclaimed_and_the_abandoned_lease_conflicts() {
     assert_eq!(done["commit_sha"], "def5678");
 }
 
+/// A retry key turns an uncertain claim response back into the same live lease.
+/// The receipt and the task move in one transaction, so even concurrent retries
+/// consume one task; reusing the key for another request or after expiry is an
+/// explicit conflict rather than a chance to take a second task.
+#[tokio::test]
+async fn an_idempotent_claim_replays_one_live_lease() {
+    let (_dir, state, clock) = clocked_state(60);
+    put_product(&state, PRODUCT, true).await;
+    ready_task(&state, "t-first", 10).await;
+    ready_task(&state, "t-second", 0).await;
+
+    let body = || {
+        json!({
+            "worker": "grok",
+            "kinds": ["normal"],
+            "idempotency_key": "claim-attempt-1",
+        })
+    };
+    let (left, right) = tokio::join!(
+        send(&state, worker("/worker/claim", &body())),
+        send(&state, worker("/worker/claim", &body())),
+    );
+    for (status, lease) in [&left, &right] {
+        assert_eq!(*status, StatusCode::OK, "claim retry: {lease}");
+        assert_eq!(lease["id"], "t-first", "claim retry: {lease}");
+    }
+    assert_eq!(left.1["claim_id"], right.1["claim_id"]);
+
+    let (status, second) = send(&state, worker("/worker/claim", &json!({"worker": "codex"}))).await;
+    assert_eq!(status, StatusCode::OK, "second task: {second}");
+    assert_eq!(second["id"], "t-second", "the retry consumed one task");
+
+    let (status, reused) = send(
+        &state,
+        worker(
+            "/worker/claim",
+            &json!({
+                "worker": "another-worker",
+                "kinds": ["normal"],
+                "idempotency_key": "claim-attempt-1",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "key reuse: {reused}");
+    assert_eq!(reused["code"], "claim_idempotency_conflict", "{reused}");
+
+    clock.advance_secs(61);
+    let (status, expired) = send(&state, worker("/worker/claim", &body())).await;
+    assert_eq!(status, StatusCode::CONFLICT, "expired replay: {expired}");
+    assert_eq!(expired["code"], "claim_idempotency_conflict", "{expired}");
+}
+
 /// The no-work answer is a success with an exact body, not an error and not an
-/// empty response: workers poll on it.
+/// empty response: workers poll on it. It has no side effect to remember, so a
+/// retry key may claim work that appeared after the empty answer.
 #[tokio::test]
 async fn a_claim_with_nothing_to_hand_out_answers_no_work() {
     let (_dir, state) = file_backed_state();
     put_product(&state, PRODUCT, true).await;
 
-    let (status, empty) = send(&state, worker("/worker/claim", &json!({"worker": "grok"}))).await;
+    let retry = json!({"worker": "grok", "idempotency_key": "idle-attempt"});
+    let (status, empty) = send(&state, worker("/worker/claim", &retry)).await;
     assert_eq!(status, StatusCode::OK, "an idle claim is not an error");
     assert_eq!(
         empty,
@@ -1548,7 +1603,7 @@ async fn a_claim_with_nothing_to_hand_out_answers_no_work() {
     assert_eq!(drafted, json!({"status": "no-work"}), "{drafted}");
 
     set_status(&state, "t-only", "ready").await;
-    let (status, lease) = send(&state, worker("/worker/claim", &json!({"worker": "grok"}))).await;
+    let (status, lease) = send(&state, worker("/worker/claim", &retry)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(lease["id"], "t-only");
 
