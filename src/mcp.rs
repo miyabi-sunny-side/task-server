@@ -1,10 +1,10 @@
 //! The MCP face of the same control plane the HTTP API serves.
 //!
-//! Two endpoints, two capabilities, one database. `/mcp` is the administrative
-//! surface a chat agent uses to file and groom work; `/worker/mcp` is the two
-//! calls a worker loop needs. Both are thin adapters: every tool decodes its
-//! arguments, calls [`crate::task`] or [`crate::product`], and encodes the
-//! answer. No rule lives here that does not also hold for HTTP.
+//! Two endpoints, one administrative capability, one database. `/mcp` is the
+//! protected surface a chat agent uses to file and groom work; `/worker/mcp` is
+//! open to the trusted worker network. Both are thin adapters: every tool
+//! decodes its arguments, calls [`crate::task`] or [`crate::product`], and
+//! encodes the answer. No rule lives here that does not also hold for HTTP.
 //!
 //! A refusal from the domain is not a protocol failure — the request was well
 //! formed and the server understood it — so it comes back as a tool result with
@@ -464,32 +464,27 @@ impl ServerHandler for Worker {
     }
 }
 
-/// Both MCP endpoints, each behind its own bearer capability.
+/// The administrative MCP endpoint keeps its bearer; the worker endpoint is
+/// bounded by the trusted network, like the worker HTTP routes.
 pub fn endpoints<S>(state: &AppState) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    endpoint(
+    protected_endpoint(
         "/mcp",
         Admin::new(state.clone()),
         state.mcp_capability.clone(),
     )
-    .merge(endpoint(
-        "/worker/mcp",
-        Worker::new(state.clone()),
-        state.worker_capability.clone(),
-    ))
+    .merge(endpoint("/worker/mcp", Worker::new(state.clone())))
 }
 
-/// One Streamable HTTP endpoint, refusing anything that does not present
-/// `capability` before the MCP service ever sees the request.
+/// One Streamable HTTP endpoint.
 ///
 /// rmcp answers loopback `Host` values alone unless told otherwise, as a guard
 /// against a page that re-resolves its own name to `127.0.0.1`. That guard is
-/// off here: this server is reached through a reverse proxy that already
-/// decides which names it serves, and the default would refuse the proxy's own
-/// name. The bearer capability remains the gate on the endpoint itself.
-fn endpoint<S, H>(path: &str, handler: H, capability: String) -> Router<S>
+/// off here: the trusted ingress and firewall decide which names and clients
+/// can reach the service, and the default would refuse the proxy's own name.
+fn endpoint<S, H>(path: &str, handler: H) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
     H: ServerHandler + Clone + Send + Sync + 'static,
@@ -499,12 +494,19 @@ where
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default().disable_allowed_hosts(),
     );
-    Router::new()
-        .nest_service(path, service)
-        .route_layer(middleware::from_fn(move |request: Request, next: Next| {
-            let capability = capability.clone();
-            async move { authorize(&capability, request, next).await }
-        }))
+    Router::new().nest_service(path, service)
+}
+
+/// Protect an MCP endpoint before the service sees the request.
+fn protected_endpoint<S, H>(path: &str, handler: H, capability: String) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    H: ServerHandler + Clone + Send + Sync + 'static,
+{
+    endpoint(path, handler).route_layer(middleware::from_fn(move |request: Request, next: Next| {
+        let capability = capability.clone();
+        async move { authorize(&capability, request, next).await }
+    }))
 }
 
 /// `Authorization: Bearer <capability>` or nothing at all. The refusal is the

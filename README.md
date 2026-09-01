@@ -57,32 +57,30 @@ Reads need an `X-Auth-User` (or `Tailscale-User-Login`) from the ingress, and
 the name it carries is taken as given: which clients reach this server at all
 is settled in front of it. Mutations additionally need `X-CSRF-Token`, which is
 the one thing a cross-site page cannot produce. `Origin` is not read. Worker
-routes need `X-Worker-Capability` instead,
-and nothing else grants them. The two MCP endpoints are opened by a bearer
-capability alone — see [MCP](#mcp). Tasks are never physically deleted; discard
-one by moving it to `cancelled` or `dropped`.
+HTTP routes and `/worker/mcp` deliberately add no application-layer
+authentication; bind address and firewall decide who reaches them, while each
+report still has to match its lease's `claim_id`. The administrative `/mcp`
+endpoint keeps its bearer — see [MCP](#mcp). Tasks are never physically deleted;
+discard one by moving it to `cancelled` or `dropped`.
 
 ## A worker in curl
 
-The worker side of this server is three routes and one header, so the whole
-protocol fits in a shell script. This is the reference for the wire, not a
-worker: it claims once, does one task, reports, and exits. Everything a real
-worker adds — the poll loop, the build, the git plumbing — is its own business,
-because this server starts no subprocess. It decides; the worker runs.
+The worker side of this server is three routes, so the whole protocol fits in a
+shell script. This is the reference for the wire, not a worker: it claims once,
+does one task, reports, and exits. Everything a real worker adds — the poll
+loop, the build, the git plumbing — is its own business, because this server
+starts no subprocess. It decides; the worker runs.
 
-Nothing below carries a literal value. The URL, the capability and the worker's
-name come from the environment, and the capability is a secret that belongs
-nowhere but there.
+The URL, worker name, and checkout root come from the environment. There is no
+worker secret to distribute; reachability is restricted outside the process.
 
 ```sh
 set -eu   # a refused call is the end of the run, never a step it walks past
 
-: "${TASK_SERVER_URL:?}"     # where this server is reached
-: "${WORKER_CAPABILITY:?}"   # the secret the server was started with
-: "${WORKER_NAME:?}"         # this loop's name, recorded on the lease
-: "${PROJECTS_ROOT:?}"       # where this worker keeps its clones
+: "${TASK_SERVER_URL:?}"   # where this server is reached
+: "${WORKER_NAME:?}"       # this loop's name, recorded on the lease
+: "${PROJECTS_ROOT:?}"     # where this worker keeps its clones
 
-auth="X-Worker-Capability: $WORKER_CAPABILITY"
 json='Content-Type: application/json'
 
 # Every field read out of a body below has to be a non-empty string, and
@@ -106,10 +104,9 @@ claim_body=$(jq -nc \
   --arg worker "$WORKER_NAME" \
   --arg key "$claim_key" \
   '{worker: $worker, kinds: ["normal"], idempotency_key: $key}')
-# `curl -f` turns a refusal — 401 on a bad capability — into a non-zero exit,
-# and because this is a plain assignment, `set -e` ends the reference run.
-card=$(curl -fsS "$TASK_SERVER_URL/worker/claim" -H "$auth" -H "$json" \
-  -d "$claim_body")
+# `curl -f` turns a domain refusal into a non-zero exit, and because this is a
+# plain assignment, `set -e` ends the reference run.
+card=$(curl -fsS "$TASK_SERVER_URL/worker/claim" -H "$json" -d "$claim_body")
 
 # 2. An empty queue is an answer, not an error. There is no long poll.
 card_status=$(printf '%s' "$card" | jq -r '.status // ""')
@@ -138,7 +135,7 @@ commit_sha=$(git -C "$repo" rev-parse HEAD)
 # it is spelled out here because "blocked" is the other answer this route takes.
 # The body is captured before it is read: behind a pipe into jq, curl's exit
 # status is discarded and a 409 `claim_mismatch` would read as a finished task.
-report=$(curl -fsS "$TASK_SERVER_URL/worker/report" -H "$auth" -H "$json" \
+report=$(curl -fsS "$TASK_SERVER_URL/worker/report" -H "$json" \
   -d "$(jq -nc \
         --arg claim_id "$claim_id" \
         --arg commit_sha "$commit_sha" \
@@ -583,23 +580,25 @@ Stop the service with <kbd>Ctrl</kbd>+<kbd>C</kbd>.
 ## MCP
 
 The same control plane also speaks MCP, over Streamable HTTP, from the same
-process and against the same sqlite. Two endpoints, each opened by its own
-bearer capability:
+process and against the same sqlite. The administrative endpoint keeps a
+bearer; the worker endpoint uses the trusted network boundary:
 
 | Endpoint | Authorization | Tools |
 | --- | --- | --- |
 | `POST /mcp` | `Bearer $MCP_CAPABILITY` | `product_list`, `task_create`, `task_get`, `task_list`, `task_update`, `task_set_status` |
-| `POST /worker/mcp` | `Bearer $WORKER_CAPABILITY` | `task_claim`, `task_report`, `task_review_report` |
+| `POST /worker/mcp` | none at the application layer | `task_claim`, `task_report`, `task_review_report` |
 
-Point a client at `http://127.0.0.1:3000/mcp` with that `Authorization` header;
-the `initialize` handshake hands back an `Mcp-Session-Id` the client carries on
-every later request.
+Point an administrative client at `http://127.0.0.1:3000/mcp` with that
+`Authorization` header. A worker MCP client sends no bearer. The `initialize`
+handshake hands back an `Mcp-Session-Id` the client carries on every later
+request.
 
-The bearer is the whole gate. The ingress identity, `Origin`, and CSRF checks
-the human API applies are not run for MCP, and neither capability opens the
-other's endpoint. A request that presents the wrong capability, or none, is
-answered `401` with the usual `{"error", "code"}` body and never reaches
-JSON-RPC: a caller that did not get past the door has no session to answer in.
+The bearer is the whole gate for `/mcp`; ingress identity, `Origin`, and CSRF
+checks do not run there. A missing or wrong bearer answers `401` with the usual
+`{"error", "code"}` body and never reaches JSON-RPC. `/worker/mcp` deliberately
+has no equivalent gate. An obsolete `Authorization` header is ignored so old
+and new workers can overlap during rollout; `claim_id` still binds every report
+to its lease.
 
 Catalogue writes and releases stay off MCP and are made over HTTP. Review and
 merge issuance remains owned by the control plane; their HTTP routes are
@@ -633,10 +632,11 @@ alone by default — a guard against a page that re-resolves its own name to
 `127.0.0.1` — and that default is switched off here, because a deployment is
 reached through a reverse proxy under a name the proxy chooses, and the default
 would refuse exactly that name. Deciding which names and which clients arrive is
-the proxy's job; the bearer capability is this server's.
+the proxy's job.
 
-So treat `MCP_CAPABILITY` and `WORKER_CAPABILITY` as secrets, and put the MCP
-endpoints behind an ingress you trust.
+Treat `MCP_CAPABILITY` as a secret and put both MCP endpoints behind an ingress
+you trust. Restrict `/worker/mcp` to the trusted LAN or an equivalent network
+boundary; do not expose it directly to the public Internet.
 
 ## Importing the markdown queue
 
@@ -858,30 +858,30 @@ cargo build --locked --release
 | `APP_DB_PATH` | `data/task-server.db` | SQLite database, for the server and for `import-markdown` alike. Created with its parent directory on first use. |
 | `APP_BIND_ADDR` | `127.0.0.1:3000` | HTTP listener. Keep loopback unless you are sure you want otherwise. |
 | `CLAIM_TTL_SECS` | `3600` | Lease lifetime for a claim. |
-| `WORKER_CAPABILITY` | `dev-worker-capability` | Shared secret for `/worker/*`, including `/worker/mcp`. Identity headers never substitute. |
-| `MCP_CAPABILITY` | `dev-mcp-capability` | Bearer secret for `/mcp`. Kept apart from the worker capability so a worker credential never opens task CRUD. |
+| `MCP_CAPABILITY` | `dev-mcp-capability` | Bearer secret for the administrative `/mcp` endpoint. |
 | `APP_CSRF_TOKEN` | `dev-csrf` | Required on human mutation as `X-CSRF-Token`. |
 | `APP_STATIC_DIR` | `client/dist` | Directory of the production frontend. |
 | `APP_PROJECTS_DIR` | (unset) | Root of the `<org>/<repo>` project tree the catalogue is derived from at startup. Unset means nothing is walked and the catalogue is curated over the API alone; set and unreadable refuses the start. |
-| `TASK_SERVER_ENV` | (unset) | Set to `production` to require the three secrets listed below and drop the development identity. |
+| `TASK_SERVER_ENV` | (unset) | Set to `production` to require the two secrets listed below and drop the development identity. |
 | `RUST_LOG` | `info` | `tracing-subscriber` filter, for example `task_server=debug,tower_http=debug`. |
 
 With `TASK_SERVER_ENV=production` the process refuses to start unless
-`WORKER_CAPABILITY`, `MCP_CAPABILITY`, and `APP_CSRF_TOKEN` are all set. Those
-are the secrets, and secrets are all this server configures: which identities,
-origins, and hostnames may reach it is decided by the ingress in front of it,
-which is the only thing positioned to know.
+`MCP_CAPABILITY` and `APP_CSRF_TOKEN` are both set. Which identities, origins,
+and hostnames may reach it is decided by the ingress in front of it, which is
+the only thing positioned to know.
 
 ### Network boundary
 
-`APP_BIND_ADDR` only chooses an interface; it does not add encryption. Both
-worker authentication forms send `WORKER_CAPABILITY` as a bearer secret, and
-plain HTTP exposes it to any host or network link that can observe the traffic.
-For remote workers, terminate TLS at a trusted reverse proxy or carry the
-connection through an authenticated VPN or tailnet, then restrict the listener
-with firewall or ingress policy to those workers. Plain HTTP is suitable only
-on a strictly trusted LAN where every host and link on the path is trusted.
-Never expose the process directly to the public Internet.
+`APP_BIND_ADDR` only chooses an interface; it does not add encryption or
+application-layer authentication. Worker HTTP routes and `/worker/mcp` accept
+requests from any client that reaches them. Restrict that surface with firewall
+or ingress policy to the trusted LAN or equivalent worker network. Use TLS, an
+authenticated VPN, or a tailnet when the path itself is not trusted. Never
+expose the process directly to the public Internet.
+
+A worker report is still scoped to the leased task by its `claim_id`. That
+ownership check does not replace the network boundary: it rejects stale or
+unknown leases, but it does not decide who may ask for new work.
 
 The binary defaults to `127.0.0.1:3000`. The container image binds
 `0.0.0.0:3000`; `EXPOSE` does not publish the port, so the container runtime's

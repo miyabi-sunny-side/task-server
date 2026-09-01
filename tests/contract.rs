@@ -18,7 +18,7 @@ use task_server::{AppState, SharedClock};
 const USER: &str = "miyabi";
 const ORIGIN: &str = "https://task-server.test";
 const CSRF: &str = "test-csrf";
-const CAPABILITY: &str = "test-capability";
+const STALE_WORKER_CAPABILITY: &str = "old-test-capability";
 const PRODUCT: &str = "sunny-side/task-server";
 const KEEPER: &str = "sunny-side/workers";
 
@@ -125,9 +125,37 @@ fn human(method: &str, uri: &str, body: &Value) -> Request<Body> {
 
 fn worker(uri: &str, body: &Value) -> Request<Body> {
     request("POST", uri)
-        .header("x-worker-capability", CAPABILITY)
         .body(Body::from(body.to_string()))
         .expect("worker request")
+}
+
+async fn assert_worker_routes_ignore_obsolete_capability(state: &AppState) {
+    for (route, body, expected) in [
+        ("/worker/claim", json!({"worker": "probe"}), StatusCode::OK),
+        (
+            "/worker/report",
+            report_body("no-such-claim", "abc1234"),
+            StatusCode::CONFLICT,
+        ),
+        (
+            "/worker/review-report",
+            review_report_body("no-such-claim", "abc1234", "approve", "read it"),
+            StatusCode::CONFLICT,
+        ),
+    ] {
+        for stale_header in [false, true] {
+            let mut probe = request("POST", route);
+            if stale_header {
+                probe = probe.header("x-worker-capability", STALE_WORKER_CAPABILITY);
+            }
+            let probe = probe.body(Body::from(body.to_string())).unwrap();
+            let (status, response) = send(state, probe).await;
+            assert_eq!(
+                status, expected,
+                "{route} must reach the domain with stale_header={stale_header}: {response}"
+            );
+        }
+    }
 }
 
 async fn put_product(state: &AppState, id: &str, releases: bool) -> Value {
@@ -1189,7 +1217,7 @@ async fn creating_an_instant_merge_task_by_hand_is_refused() {
 }
 
 #[tokio::test]
-async fn mutation_requires_identity_and_csrf_while_worker_requires_capability() {
+async fn human_mutation_requires_identity_and_csrf_while_worker_routes_need_no_secret() {
     let (_dir, state) = file_backed_state();
     put_product(&state, PRODUCT, true).await;
 
@@ -1226,15 +1254,15 @@ async fn mutation_requires_identity_and_csrf_while_worker_requires_capability() 
     let (status, _) = send(&state, no_csrf).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "CSRF token is required");
 
-    let capability_only = request("POST", "/api/tasks")
-        .header("x-worker-capability", CAPABILITY)
+    let obsolete_worker_header_only = request("POST", "/api/tasks")
+        .header("x-worker-capability", STALE_WORKER_CAPABILITY)
         .body(Body::from(denied.to_string()))
         .unwrap();
-    let (status, _) = send(&state, capability_only).await;
+    let (status, _) = send(&state, obsolete_worker_header_only).await;
     assert_eq!(
         status,
         StatusCode::UNAUTHORIZED,
-        "worker capability is not a human identity"
+        "an obsolete worker header is not a human identity"
     );
 
     let (status, missing) = send(&state, read("/api/tasks/t-denied")).await;
@@ -1245,24 +1273,7 @@ async fn mutation_requires_identity_and_csrf_while_worker_requires_capability() 
     );
     assert_eq!(missing["code"], "not_found", "{missing}");
 
-    for (route, body) in [
-        ("/worker/claim", json!({"worker": "grok"})),
-        ("/worker/report", report_body("no-such-claim", "abc1234")),
-        (
-            "/worker/review-report",
-            review_report_body("no-such-claim", "abc1234", "approve", "read it"),
-        ),
-    ] {
-        let no_capability = request("POST", route)
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let (status, _) = send(&state, no_capability).await;
-        assert_eq!(
-            status,
-            StatusCode::UNAUTHORIZED,
-            "{route} needs a worker capability"
-        );
-    }
+    assert_worker_routes_ignore_obsolete_capability(&state).await;
 
     // Issuing a review is a human decision, on the same terms as a merge.
     let review_without_csrf = request("POST", "/api/reviews")
@@ -1278,8 +1289,44 @@ async fn mutation_requires_identity_and_csrf_while_worker_requires_capability() 
 
     set_status(&state, "t-auth", "ready").await;
     let (status, lease) = send(&state, worker("/worker/claim", &json!({"worker": "grok"}))).await;
-    assert_eq!(status, StatusCode::OK, "capability claims: {lease}");
+    assert_eq!(status, StatusCode::OK, "headerless claim: {lease}");
     assert_eq!(lease["id"], "t-auth");
+
+    let claim_id = claim_id_of(&lease);
+    let (status, reported) = send(
+        &state,
+        worker("/worker/report", &report_body(&claim_id, "abc1234")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "headerless report: {reported}");
+    assert_eq!(reported["status"], "done");
+
+    let (status, review) = send(
+        &state,
+        worker(
+            "/worker/claim",
+            &json!({"worker": "reviewer", "kinds": ["review"]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "headerless review claim: {review}");
+    assert_eq!(review["id"], "review:t-auth");
+
+    let review_claim_id = claim_id_of(&review);
+    let (status, reviewed) = send(
+        &state,
+        worker(
+            "/worker/review-report",
+            &review_report_body(&review_claim_id, "abc1234", "approve", "read it"),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "headerless review report: {reviewed}"
+    );
+    assert_eq!(reviewed["status"], "done");
 }
 
 #[tokio::test]
@@ -1747,23 +1794,21 @@ fn production_startup_is_fail_closed_without_secrets() {
     };
     let message = err.to_string();
     assert!(
-        message.contains("required") || message.contains("WORKER_CAPABILITY"),
+        message.contains("MCP_CAPABILITY"),
         "missing production secrets must fail closed: {message}"
     );
 
     let ok = AppState::from_vars(|key| match key {
         "TASK_SERVER_ENV" => Some("production".into()),
-        "WORKER_CAPABILITY" => Some("secret-cap".into()),
         // The MCP admin endpoint opens task CRUD to an agent, so production
-        // demands its own capability for it too.
+        // demands its own capability for it.
         "MCP_CAPABILITY" => Some("secret-mcp-cap".into()),
         "APP_CSRF_TOKEN" => Some("secret-csrf".into()),
         "APP_DB_PATH" => Some(db_path.to_string_lossy().into_owned()),
         _ => None,
     })
-    .expect("production with secrets");
+    .expect("production with its remaining secrets");
     assert!(ok.dev_identity.is_none());
-    assert_eq!(ok.worker_capability, "secret-cap");
     assert_eq!(ok.mcp_capability, "secret-mcp-cap");
     assert!(db_path.is_file(), "APP_DB_PATH must be opened at startup");
 }

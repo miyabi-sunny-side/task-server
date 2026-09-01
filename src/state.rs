@@ -14,9 +14,8 @@ pub const DEFAULT_DB_PATH: &str = "data/task-server.db";
 pub struct AppState {
     pub db: Arc<Db>,
     pub static_dir: PathBuf,
-    pub worker_capability: String,
-    /// Bearer capability for the administrative MCP endpoint. Kept apart from
-    /// `worker_capability` on purpose: a worker credential never opens CRUD.
+    /// Bearer capability for the administrative MCP endpoint. The worker
+    /// surface is deliberately bounded by the trusted network instead.
     pub mcp_capability: String,
     pub csrf_token: String,
     pub dev_identity: Option<String>,
@@ -30,7 +29,6 @@ impl AppState {
         Self {
             db: Arc::new(Db::open_in_memory().expect("in-memory database")),
             static_dir: PathBuf::from("client"),
-            worker_capability: "test-capability".into(),
             mcp_capability: "test-mcp-capability".into(),
             csrf_token: "test-csrf".into(),
             dev_identity: None,
@@ -56,11 +54,6 @@ impl AppState {
         };
         let static_dir =
             get("APP_STATIC_DIR").map_or_else(|| PathBuf::from("client/dist"), PathBuf::from);
-        let worker_capability = if production {
-            require("WORKER_CAPABILITY")?
-        } else {
-            get("WORKER_CAPABILITY").unwrap_or_else(|| "dev-worker-capability".into())
-        };
         let mcp_capability = if production {
             require("MCP_CAPABILITY")?
         } else {
@@ -71,10 +64,8 @@ impl AppState {
         } else {
             get("APP_CSRF_TOKEN").unwrap_or_else(|| "dev-csrf".into())
         };
-        if worker_capability.is_empty() || csrf_token.is_empty() {
-            return Err(Error::Invalid(
-                "WORKER_CAPABILITY and APP_CSRF_TOKEN must be non-empty".into(),
-            ));
+        if csrf_token.is_empty() {
+            return Err(Error::Invalid("APP_CSRF_TOKEN must be non-empty".into()));
         }
         if mcp_capability.is_empty() {
             return Err(Error::Invalid("MCP_CAPABILITY must be non-empty".into()));
@@ -96,7 +87,6 @@ impl AppState {
         Ok(Self {
             db,
             static_dir,
-            worker_capability,
             mcp_capability,
             csrf_token,
             dev_identity,
@@ -137,26 +127,24 @@ mod tests {
     use super::AppState;
     use crate::error::Error;
 
-    /// Everything a production start needs. What used to sit beside these —
-    /// an allowlist of identities, of origins, of `Host` authorities — is the
-    /// reverse proxy's to decide, so all that is left is the secrets no proxy
-    /// can supply.
+    /// Everything a production start needs. Worker access is bounded by the
+    /// trusted network; the remaining secrets protect human mutation and the
+    /// administrative MCP surface.
     fn production() -> HashMap<&'static str, &'static str> {
         HashMap::from([
             ("TASK_SERVER_ENV", "production"),
-            ("WORKER_CAPABILITY", "worker-secret"),
             ("MCP_CAPABILITY", "mcp-secret"),
             ("APP_CSRF_TOKEN", "csrf-secret"),
             ("APP_DB_PATH", ":memory:"),
         ])
     }
 
-    /// Each secret is required on its own, and the refusal names the one that
-    /// is missing: a deployment that forgets one is told which, instead of
-    /// starting on a default this README publishes.
+    /// Each remaining secret is required on its own, and the refusal names the
+    /// one that is missing instead of starting on a published development
+    /// default.
     #[test]
     fn production_names_the_secret_it_is_missing() {
-        for missing in ["WORKER_CAPABILITY", "MCP_CAPABILITY", "APP_CSRF_TOKEN"] {
+        for missing in ["MCP_CAPABILITY", "APP_CSRF_TOKEN"] {
             let mut vars = production();
             vars.remove(missing);
             let error = AppState::from_vars(|key| vars.get(key).map(|value| (*value).to_owned()))
@@ -170,14 +158,13 @@ mod tests {
     }
 
     /// Those secrets are the whole production contract. A start holding them
-    /// needs nothing further declared — no identities, origins, or hosts, all
-    /// of which the reverse proxy in front decides.
+    /// needs no worker secret, identities, origins, or hosts declared in the
+    /// process.
     #[test]
     fn production_starts_on_its_secrets_alone() {
         let vars = production();
         let state = AppState::from_vars(|key| vars.get(key).map(|value| (*value).to_owned()))
-            .expect("the secrets are the whole contract");
-        assert_eq!(state.worker_capability, "worker-secret");
+            .expect("the remaining secrets are the whole process contract");
         assert_eq!(state.mcp_capability, "mcp-secret");
         assert_eq!(state.csrf_token, "csrf-secret");
         assert!(
@@ -186,16 +173,15 @@ mod tests {
         );
     }
 
-    /// Development gets a default so a local run needs no secrets at all, and
-    /// the two capabilities stay distinct: one never opens the other's tools.
+    /// Development gets defaults so a local run needs no secrets at all.
     #[test]
-    fn development_defaults_the_capabilities_apart() {
+    fn development_defaults_the_remaining_secrets() {
         let state = AppState::from_vars(|key| match key {
             "APP_DB_PATH" => Some(":memory:".to_owned()),
             _ => None,
         })
         .expect("a development start needs no secrets");
         assert_eq!(state.mcp_capability, "dev-mcp-capability");
-        assert_ne!(state.mcp_capability, state.worker_capability);
+        assert_eq!(state.csrf_token, "dev-csrf");
     }
 }

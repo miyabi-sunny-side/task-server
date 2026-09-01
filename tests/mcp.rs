@@ -22,7 +22,7 @@ use task_server::{AppState, SharedClock};
 const USER: &str = "miyabi";
 const ORIGIN: &str = "https://task-server.test";
 const CSRF: &str = "test-csrf";
-const WORKER_CAPABILITY: &str = "test-capability";
+const STALE_WORKER_CAPABILITY: &str = "old-test-capability";
 const MCP_CAPABILITY: &str = "test-mcp-capability";
 const PROTOCOL: &str = "2025-06-18";
 
@@ -37,12 +37,12 @@ fn file_backed_state() -> (TempDir, AppState) {
     (dir, state)
 }
 
-/// One MCP connection: an endpoint, a bearer capability, and the session the
-/// handshake handed back.
+/// One MCP connection: an endpoint, optional bearer authorization, and the
+/// session the handshake handed back.
 struct McpClient {
     router: Router,
     path: &'static str,
-    capability: String,
+    capability: Option<String>,
     session: Option<String>,
     next_id: i64,
 }
@@ -52,7 +52,17 @@ impl McpClient {
         Self {
             router: router.clone(),
             path,
-            capability: capability.to_owned(),
+            capability: Some(capability.to_owned()),
+            session: None,
+            next_id: 0,
+        }
+    }
+
+    fn without_capability(router: &Router, path: &'static str) -> Self {
+        Self {
+            router: router.clone(),
+            path,
+            capability: None,
             session: None,
             next_id: 0,
         }
@@ -105,8 +115,10 @@ impl McpClient {
             .uri(self.path)
             .header("host", "localhost")
             .header("content-type", "application/json")
-            .header("accept", "application/json, text/event-stream")
-            .header("authorization", format!("Bearer {}", self.capability));
+            .header("accept", "application/json, text/event-stream");
+        if let Some(capability) = &self.capability {
+            request = request.header("authorization", format!("Bearer {capability}"));
+        }
         if let Some(session) = &self.session {
             request = request
                 .header("mcp-session-id", session)
@@ -151,7 +163,7 @@ impl McpClient {
     async fn notify(&self, method: &str) {
         let (status, text) = self
             .post(
-                Some(&self.capability),
+                self.capability.as_deref(),
                 json!({ "jsonrpc": "2.0", "method": method }),
             )
             .await;
@@ -362,12 +374,12 @@ async fn both_endpoints_handshake_and_expose_only_their_own_tools() {
         "the admin endpoint owns the catalogue-and-task surface"
     );
 
-    let mut worker = McpClient::new(&router, "/worker/mcp", WORKER_CAPABILITY);
+    let mut worker = McpClient::without_capability(&router, "/worker/mcp");
     worker.initialize().await;
     assert_eq!(
         worker.tool_names().await,
         ["task_claim", "task_report", "task_review_report"],
-        "a worker capability never reaches task CRUD"
+        "the open worker endpoint never exposes task CRUD"
     );
 
     for (name, description) in admin.tool_descriptions().await {
@@ -406,7 +418,7 @@ async fn both_endpoints_handshake_and_expose_only_their_own_tools() {
         "the endpoint answers SSE frames: {framed}"
     );
 
-    for capability in [None, Some("wrong"), Some(WORKER_CAPABILITY)] {
+    for capability in [None, Some("wrong"), Some(STALE_WORKER_CAPABILITY)] {
         let (status, body) = anonymous.post(capability, handshake.clone()).await;
         assert_eq!(
             status,
@@ -419,15 +431,23 @@ async fn both_endpoints_handshake_and_expose_only_their_own_tools() {
         );
     }
 
-    let anonymous_worker = McpClient::new(&router, "/worker/mcp", WORKER_CAPABILITY);
-    for capability in [None, Some("wrong"), Some(MCP_CAPABILITY)] {
+    let anonymous_worker = McpClient::without_capability(&router, "/worker/mcp");
+    for capability in [
+        None,
+        Some("wrong"),
+        Some(MCP_CAPABILITY),
+        Some(STALE_WORKER_CAPABILITY),
+    ] {
         let (status, body) = anonymous_worker.post(capability, handshake.clone()).await;
         assert_eq!(
             status,
-            StatusCode::UNAUTHORIZED,
-            "/worker/mcp with {capability:?} must be refused: {body}"
+            StatusCode::OK,
+            "/worker/mcp ignores obsolete authorization during rollout: {body}"
         );
-        assert!(!body.contains("jsonrpc"), "{body}");
+        assert!(
+            body.contains("data:"),
+            "accepted MCP is framed as SSE: {body}"
+        );
     }
 }
 
@@ -531,7 +551,7 @@ async fn a_worker_drives_a_task_over_mcp_and_http_sees_the_same_row() {
         .await;
     assert_eq!(ready["structuredContent"]["task"]["status"], "ready");
 
-    let mut worker = McpClient::new(&router, "/worker/mcp", WORKER_CAPABILITY);
+    let mut worker = McpClient::new(&router, "/worker/mcp", STALE_WORKER_CAPABILITY);
     worker.initialize().await;
 
     let claimed = worker
@@ -615,7 +635,7 @@ async fn any_host_reaches_both_endpoints() {
         let capability = if path == "/mcp" {
             MCP_CAPABILITY
         } else {
-            WORKER_CAPABILITY
+            STALE_WORKER_CAPABILITY
         };
         for host in [
             "tasks.example.test",
@@ -719,7 +739,7 @@ async fn mcp_status_change_refuses_approved_merged_and_released() {
         .call("task_set_status", json!({ "id": "t-1", "status": "ready" }))
         .await;
 
-    let mut worker = McpClient::new(&router, "/worker/mcp", WORKER_CAPABILITY);
+    let mut worker = McpClient::new(&router, "/worker/mcp", STALE_WORKER_CAPABILITY);
     worker.initialize().await;
     let claimed = worker
         .call("task_claim", json!({ "worker": "loop-1" }))
@@ -796,7 +816,7 @@ async fn an_mcp_claim_retries_the_same_live_lease() {
         )
         .await;
 
-    let mut worker = McpClient::new(&router, "/worker/mcp", WORKER_CAPABILITY);
+    let mut worker = McpClient::new(&router, "/worker/mcp", STALE_WORKER_CAPABILITY);
     worker.initialize().await;
     let schema = worker.tool_schema("task_claim").await;
     assert!(
@@ -857,7 +877,7 @@ async fn work_to_done_over_mcp(router: &Router, id: &str) {
         .call("task_set_status", json!({ "id": id, "status": "ready" }))
         .await;
 
-    let mut worker = McpClient::new(router, "/worker/mcp", WORKER_CAPABILITY);
+    let mut worker = McpClient::new(router, "/worker/mcp", STALE_WORKER_CAPABILITY);
     worker.initialize().await;
     let claimed = worker
         .call(
@@ -893,7 +913,7 @@ async fn a_reviewer_answers_over_mcp_and_http_sees_the_same_row() {
     work_to_done_over_mcp(&router, "t-1").await;
     let mut admin = McpClient::new(&router, "/mcp", MCP_CAPABILITY);
     admin.initialize().await;
-    let mut worker = McpClient::new(&router, "/worker/mcp", WORKER_CAPABILITY);
+    let mut worker = McpClient::new(&router, "/worker/mcp", STALE_WORKER_CAPABILITY);
     worker.initialize().await;
 
     // The report of t-1 issued the review; nobody files it by hand.
@@ -999,7 +1019,7 @@ async fn a_reviewer_answers_over_mcp_and_http_sees_the_same_row() {
 /// Answer the review `t-1`'s report issued with an approval, which is what
 /// issues `merge:t-1`. `t-1` must already be `done`.
 async fn merge_issued_over_mcp(router: &Router) {
-    let mut worker = McpClient::new(router, "/worker/mcp", WORKER_CAPABILITY);
+    let mut worker = McpClient::new(router, "/worker/mcp", STALE_WORKER_CAPABILITY);
     worker.initialize().await;
     let claimed = worker
         .call(
@@ -1027,7 +1047,7 @@ async fn merge_issued_over_mcp(router: &Router) {
 /// Claim `merge:t-1` the way a merge worker does, and hand back the lease it
 /// has to report against.
 async fn merge_claimed_over_mcp(router: &Router) -> String {
-    let mut worker = McpClient::new(router, "/worker/mcp", WORKER_CAPABILITY);
+    let mut worker = McpClient::new(router, "/worker/mcp", STALE_WORKER_CAPABILITY);
     worker.initialize().await;
     let claimed = worker
         .call(
@@ -1051,7 +1071,7 @@ async fn merge_claimed_over_mcp(router: &Router) -> String {
 async fn merge_blocked_over_mcp(router: &Router) {
     merge_issued_over_mcp(router).await;
     let claim_id = merge_claimed_over_mcp(router).await;
-    let mut worker = McpClient::new(router, "/worker/mcp", WORKER_CAPABILITY);
+    let mut worker = McpClient::new(router, "/worker/mcp", STALE_WORKER_CAPABILITY);
     worker.initialize().await;
     let blocked = worker
         .call(
@@ -1154,7 +1174,7 @@ async fn mcp_status_change_cannot_write_the_outcome_of_a_merge() {
         "the target has not moved: {target}"
     );
 
-    let mut worker = McpClient::new(&router, "/worker/mcp", WORKER_CAPABILITY);
+    let mut worker = McpClient::new(&router, "/worker/mcp", STALE_WORKER_CAPABILITY);
     worker.initialize().await;
     // The same `outcome` contract HTTP holds: a name nobody defined is refused
     // rather than read as the success that would land this merge.
@@ -1288,7 +1308,7 @@ async fn mcp_status_change_cannot_finish_a_review() {
     work_to_done_over_mcp(&router, "t-1").await;
     let mut admin = McpClient::new(&router, "/mcp", MCP_CAPABILITY);
     admin.initialize().await;
-    let mut worker = McpClient::new(&router, "/worker/mcp", WORKER_CAPABILITY);
+    let mut worker = McpClient::new(&router, "/worker/mcp", STALE_WORKER_CAPABILITY);
     worker.initialize().await;
 
     let (status, review) = http(&router, "GET", "/api/tasks/review:t-1", None).await;

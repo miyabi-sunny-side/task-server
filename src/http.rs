@@ -200,18 +200,6 @@ fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
-fn require_worker(headers: &HeaderMap, state: &AppState) -> Result<(), Error> {
-    let provided = header_value(headers, "x-worker-capability");
-    if state.worker_capability.is_empty() {
-        return Err(Error::Unauthorized);
-    }
-    if provided == Some(state.worker_capability.as_str()) {
-        Ok(())
-    } else {
-        Err(Error::Unauthorized)
-    }
-}
-
 fn ingress_identity<'a>(headers: &'a HeaderMap, state: &'a AppState) -> Option<&'a str> {
     header_value(headers, "x-auth-user")
         .or_else(|| header_value(headers, "tailscale-user-login"))
@@ -454,10 +442,8 @@ pub async fn api_put_product(
 
 pub async fn worker_claim(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<ClaimBody>,
 ) -> Result<Response, Error> {
-    require_worker(&headers, &state)?;
     let kinds = body
         .kinds
         .iter()
@@ -492,10 +478,8 @@ pub async fn worker_claim(
 
 pub async fn worker_report(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<ReportBody>,
 ) -> Result<Json<TaskCard>, Error> {
-    require_worker(&headers, &state)?;
     let outcome = ReportOutcome::parse_optional(body.outcome.as_deref())?;
     let reported = task::report(
         &state.db,
@@ -514,13 +498,11 @@ pub async fn worker_report(
 /// It is not `/worker/report` because the two contracts differ: a review answers
 /// with a verdict rather than a commit, carries no checks to gate on, and a
 /// `request_changes` is a success — the reviewer did their job and the answer is
-/// "not yet". The capability is the same one every worker route asks for.
+/// "not yet". The `claim_id` still binds the answer to the leased review.
 pub async fn worker_review_report(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<ReviewReportBody>,
 ) -> Result<Json<TaskCard>, Error> {
-    require_worker(&headers, &state)?;
     let verdict = ReviewVerdict::parse(&body.verdict)?;
     let reported = task::review_report(
         &state.db,

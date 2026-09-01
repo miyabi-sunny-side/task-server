@@ -313,27 +313,31 @@ JSON API, the MCP endpoints, and the compiled client.
 - Listen on `127.0.0.1` by default (`APP_BIND_ADDR` may override). Binding a LAN
   interface adds reachability, not TLS. The container image binds
   `0.0.0.0:3000`; runtime port publishing and ingress remain the boundary.
-- Worker routes require `X-Worker-Capability` equal to the configured secret.
-  An identity header alone does not authenticate. HTTP carries that bearer in
-  plaintext, so remote access requires a trusted TLS ingress or authenticated
-  VPN/tailnet plus firewall policy. Plain HTTP is only for a strictly trusted
-  LAN and the service is never exposed directly to the public Internet.
+- Worker HTTP routes and `/worker/mcp` have no application-layer authentication.
+  Every client that reaches them may ask for work; `claim_id` and the lease bind
+  later reports to the claimed task, not the caller to a worker identity.
+  Restrict the worker surface with firewall or ingress policy to a trusted LAN
+  or equivalent network. Use TLS, an authenticated VPN, or a tailnet when the
+  path is not trusted, and never expose the process directly to the public
+  Internet.
 - Human identity comes from ingress (`X-Auth-User` or `Tailscale-User-Login`).
   The browser does not mint identity.
 - Human mutation requires an ingress identity and `X-CSRF-Token`. The identity
   is taken at face value and `Origin` is not read: which clients reach this
   server is the reverse proxy's decision, and the token is what a cross-site
-  page cannot produce. Worker capability is not sufficient.
+  page cannot produce. An obsolete `X-Worker-Capability` header is ignored and
+  never substitutes for either requirement.
 - MCP is a second transport, not a second domain. `/mcp` and `/worker/mcp` are
   Streamable HTTP endpoints in the same process, and every tool decodes its
   arguments and calls `src/task.rs` or `src/product.rs`. The transition table,
   the catalogue gate, and the SQL are never duplicated there.
-- Each MCP endpoint has its own bearer: `MCP_CAPABILITY` for `/mcp`,
-  `WORKER_CAPABILITY` for `/worker/mcp`. A worker credential never opens task
-  CRUD. The check runs before rmcp sees the request, so a missing or mismatched
-  bearer is 401 and gets no JSON-RPC answer at all.
-- Ingress identity, `Origin`, and CSRF are not applied to MCP; the bearer is the
-  whole gate. rmcp's loopback-only `Host` allowlist is switched off with
+- `MCP_CAPABILITY` protects the administrative `/mcp` endpoint. Its check runs
+  before rmcp sees the request, so a missing or mismatched bearer is 401 and
+  gets no JSON-RPC answer. `/worker/mcp` has no application-layer gate; an
+  obsolete bearer is ignored during rollout.
+- Ingress identity, `Origin`, and CSRF are not applied to MCP. The bearer is the
+  whole gate for `/mcp`; the trusted network is the gate for `/worker/mcp`.
+  rmcp's loopback-only `Host` allowlist is switched off with
   `disable_allowed_hosts()`, because this server is reached through a reverse
   proxy that already decides which names it serves and the default would refuse
   the name that proxy forwards.
@@ -349,9 +353,9 @@ JSON API, the MCP endpoints, and the compiled client.
   HTTP answers with, repeated in the text content. Arguments that fail to
   deserialize are also `isError: true` but carry text alone and no `code`; an
   unknown method or tool name is a JSON-RPC error.
-- `TASK_SERVER_ENV=production` is fail-closed without `WORKER_CAPABILITY`,
-  `MCP_CAPABILITY`, and `APP_CSRF_TOKEN`. Nothing a reverse proxy can decide is
-  configured here.
+- `TASK_SERVER_ENV=production` is fail-closed without `MCP_CAPABILITY` and
+  `APP_CSRF_TOKEN`. Worker reachability is configured at the bind, firewall, and
+  ingress boundary rather than through a process secret.
 - Unknown `/api/*` paths return the 404 JSON refusal, code `not_found`. Every
   other unknown path falls back to `client/dist/index.html` so the client router
   can restore a deep link.
@@ -386,9 +390,9 @@ and `dropped`.
 | POST | `/api/reviews`, `/api/merges`, `/api/releases` | human mutation |
 | GET | `/api/products`, `/api/products/{id}` | read |
 | PUT | `/api/products/{id}` | human mutation |
-| POST | `/worker/claim`, `/worker/report`, `/worker/review-report` | worker capability |
+| POST | `/worker/claim`, `/worker/report`, `/worker/review-report` | trusted network; no application auth |
 | POST | `/mcp` | bearer `MCP_CAPABILITY` |
-| POST | `/worker/mcp` | bearer `WORKER_CAPABILITY` |
+| POST | `/worker/mcp` | trusted network; no application auth |
 
 `GET /api/tasks` returns summaries and hides `released` unless `?status=` asks
 for a status explicitly; an unknown status is a 400. Single-task responses are
