@@ -331,16 +331,14 @@ JSON API, the MCP endpoints, and the compiled client.
   Streamable HTTP endpoints in the same process, and every tool decodes its
   arguments and calls `src/task.rs` or `src/product.rs`. The transition table,
   the catalogue gate, and the SQL are never duplicated there.
-- `MCP_CAPABILITY` protects the administrative `/mcp` endpoint. Its check runs
-  before rmcp sees the request, so a missing or mismatched bearer is 401 and
-  gets no JSON-RPC answer. `/worker/mcp` has no application-layer gate; an
-  obsolete bearer is ignored during rollout.
-- Ingress identity, `Origin`, and CSRF are not applied to MCP. The bearer is the
-  whole gate for `/mcp`; the trusted network is the gate for `/worker/mcp`.
-  rmcp's loopback-only `Host` allowlist is switched off with
-  `disable_allowed_hosts()`, because this server is reached through a reverse
-  proxy that already decides which names it serves and the default would refuse
-  the name that proxy forwards.
+- Neither `/mcp` nor `/worker/mcp` has an application-layer gate. An obsolete
+  bearer is ignored during rollout; bind address, firewall, and trusted ingress
+  decide which clients can reach either endpoint.
+- Ingress identity, `Origin`, and CSRF are not applied to MCP. rmcp's
+  loopback-only `Host` allowlist is switched off with `disable_allowed_hosts()`,
+  because this server is reached through a reverse proxy that already decides
+  which names it serves and the default would refuse the name that proxy
+  forwards.
 - `/mcp` carries `product_list`, `task_create`, `task_get`, `task_list`,
   `task_update`, and `task_set_status`; `/worker/mcp` carries `task_claim`,
   `task_report`, and `task_review_report`. Catalogue writes and releases remain
@@ -353,9 +351,9 @@ JSON API, the MCP endpoints, and the compiled client.
   HTTP answers with, repeated in the text content. Arguments that fail to
   deserialize are also `isError: true` but carry text alone and no `code`; an
   unknown method or tool name is a JSON-RPC error.
-- `TASK_SERVER_ENV=production` is fail-closed without `MCP_CAPABILITY` and
-  `APP_CSRF_TOKEN`. Worker reachability is configured at the bind, firewall, and
-  ingress boundary rather than through a process secret.
+- `TASK_SERVER_ENV=production` is fail-closed without `APP_CSRF_TOKEN`. MCP and
+  worker reachability is configured at the bind, firewall, and ingress boundary
+  rather than through a process secret.
 - Unknown `/api/*` paths return the 404 JSON refusal, code `not_found`. Every
   other unknown path falls back to `client/dist/index.html` so the client router
   can restore a deep link.
@@ -391,8 +389,7 @@ and `dropped`.
 | GET | `/api/products`, `/api/products/{id}` | read |
 | PUT | `/api/products/{id}` | human mutation |
 | POST | `/worker/claim`, `/worker/report`, `/worker/review-report` | trusted network; no application auth |
-| POST | `/mcp` | bearer `MCP_CAPABILITY` |
-| POST | `/worker/mcp` | trusted network; no application auth |
+| POST | `/mcp`, `/worker/mcp` | trusted network; no application auth |
 
 `GET /api/tasks` returns summaries and hides `released` unless `?status=` asks
 for a status explicitly; an unknown status is a 400. Single-task responses are

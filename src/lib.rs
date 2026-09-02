@@ -62,8 +62,8 @@ pub fn app(state: AppState) -> Router {
         .route("/worker/claim", post(http::worker_claim))
         .route("/worker/report", post(http::worker_report))
         .route("/worker/review-report", post(http::worker_review_report))
-        // Same domain layer, second transport: admin MCP keeps its bearer while
-        // worker MCP shares the worker HTTP routes' trusted-network boundary.
+        // Same domain layer, second transport. Both MCP faces share the worker
+        // HTTP routes' trusted-network boundary.
         .merge(mcp::endpoints(&state))
         .nest("/api", api)
         .fallback_service(

@@ -57,11 +57,10 @@ Reads need an `X-Auth-User` (or `Tailscale-User-Login`) from the ingress, and
 the name it carries is taken as given: which clients reach this server at all
 is settled in front of it. Mutations additionally need `X-CSRF-Token`, which is
 the one thing a cross-site page cannot produce. `Origin` is not read. Worker
-HTTP routes and `/worker/mcp` deliberately add no application-layer
-authentication; bind address and firewall decide who reaches them, while each
-report still has to match its lease's `claim_id`. The administrative `/mcp`
-endpoint keeps its bearer — see [MCP](#mcp). Tasks are never physically deleted;
-discard one by moving it to `cancelled` or `dropped`.
+HTTP routes and both MCP endpoints deliberately add no application-layer
+authentication; bind address and firewall decide who reaches them. Each worker
+report still has to match its lease's `claim_id`. Tasks are never physically
+deleted; discard one by moving it to `cancelled` or `dropped`.
 
 ## A worker in curl
 
@@ -580,25 +579,21 @@ Stop the service with <kbd>Ctrl</kbd>+<kbd>C</kbd>.
 ## MCP
 
 The same control plane also speaks MCP, over Streamable HTTP, from the same
-process and against the same sqlite. The administrative endpoint keeps a
-bearer; the worker endpoint uses the trusted network boundary:
+process and against the same sqlite. Both endpoints use the trusted network
+boundary and have no application-layer authorization:
 
 | Endpoint | Authorization | Tools |
 | --- | --- | --- |
-| `POST /mcp` | `Bearer $MCP_CAPABILITY` | `product_list`, `task_create`, `task_get`, `task_list`, `task_update`, `task_set_status` |
+| `POST /mcp` | none at the application layer | `product_list`, `task_create`, `task_get`, `task_list`, `task_update`, `task_set_status` |
 | `POST /worker/mcp` | none at the application layer | `task_claim`, `task_report`, `task_review_report` |
 
-Point an administrative client at `http://127.0.0.1:3000/mcp` with that
-`Authorization` header. A worker MCP client sends no bearer. The `initialize`
+Point clients at `http://127.0.0.1:3000/mcp` or `/worker/mcp`. The `initialize`
 handshake hands back an `Mcp-Session-Id` the client carries on every later
 request.
 
-The bearer is the whole gate for `/mcp`; ingress identity, `Origin`, and CSRF
-checks do not run there. A missing or wrong bearer answers `401` with the usual
-`{"error", "code"}` body and never reaches JSON-RPC. `/worker/mcp` deliberately
-has no equivalent gate. An obsolete `Authorization` header is ignored so old
-and new workers can overlap during rollout; `claim_id` still binds every report
-to its lease.
+Ingress identity, `Origin`, and CSRF checks do not run on MCP. An obsolete
+`Authorization` header is ignored so old and new clients can overlap during
+rollout. Worker reports remain bound to their leases by `claim_id`.
 
 Catalogue writes and releases stay off MCP and are made over HTTP. Review and
 merge issuance remains owned by the control plane; their HTTP routes are
@@ -634,9 +629,9 @@ reached through a reverse proxy under a name the proxy chooses, and the default
 would refuse exactly that name. Deciding which names and which clients arrive is
 the proxy's job.
 
-Treat `MCP_CAPABILITY` as a secret and put both MCP endpoints behind an ingress
-you trust. Restrict `/worker/mcp` to the trusted LAN or an equivalent network
-boundary; do not expose it directly to the public Internet.
+Put both MCP endpoints behind an ingress you trust. Restrict them to the trusted
+LAN or an equivalent network boundary; do not expose them directly to the
+public Internet.
 
 ## Importing the markdown queue
 
@@ -858,25 +853,24 @@ cargo build --locked --release
 | `APP_DB_PATH` | `data/task-server.db` | SQLite database, for the server and for `import-markdown` alike. Created with its parent directory on first use. |
 | `APP_BIND_ADDR` | `127.0.0.1:3000` | HTTP listener. Keep loopback unless you are sure you want otherwise. |
 | `CLAIM_TTL_SECS` | `3600` | Lease lifetime for a claim. |
-| `MCP_CAPABILITY` | `dev-mcp-capability` | Bearer secret for the administrative `/mcp` endpoint. |
 | `APP_CSRF_TOKEN` | `dev-csrf` | Required on human mutation as `X-CSRF-Token`. |
 | `APP_STATIC_DIR` | `client/dist` | Directory of the production frontend. |
 | `APP_PROJECTS_DIR` | (unset) | Root of the `<org>/<repo>` project tree the catalogue is derived from at startup. Unset means nothing is walked and the catalogue is curated over the API alone; set and unreadable refuses the start. |
-| `TASK_SERVER_ENV` | (unset) | Set to `production` to require the two secrets listed below and drop the development identity. |
+| `TASK_SERVER_ENV` | (unset) | Set to `production` to require `APP_CSRF_TOKEN` and drop the development identity. |
 | `RUST_LOG` | `info` | `tracing-subscriber` filter, for example `task_server=debug,tower_http=debug`. |
 
 With `TASK_SERVER_ENV=production` the process refuses to start unless
-`MCP_CAPABILITY` and `APP_CSRF_TOKEN` are both set. Which identities, origins,
-and hostnames may reach it is decided by the ingress in front of it, which is
-the only thing positioned to know.
+`APP_CSRF_TOKEN` is set. Which identities, origins, and hostnames may reach it
+is decided by the ingress in front of it, which is the only thing positioned
+to know.
 
 ### Network boundary
 
 `APP_BIND_ADDR` only chooses an interface; it does not add encryption or
-application-layer authentication. Worker HTTP routes and `/worker/mcp` accept
-requests from any client that reaches them. Restrict that surface with firewall
-or ingress policy to the trusted LAN or equivalent worker network. Use TLS, an
-authenticated VPN, or a tailnet when the path itself is not trusted. Never
+application-layer authentication. The MCP endpoints and worker HTTP routes
+accept requests from any client that reaches them. Restrict those surfaces with
+firewall or ingress policy to the trusted LAN or an equivalent network. Use TLS,
+an authenticated VPN, or a tailnet when the path itself is not trusted. Never
 expose the process directly to the public Internet.
 
 A worker report is still scoped to the leased task by its `claim_id`. That

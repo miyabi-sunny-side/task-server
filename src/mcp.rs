@@ -1,8 +1,8 @@
 //! The MCP face of the same control plane the HTTP API serves.
 //!
-//! Two endpoints, one administrative capability, one database. `/mcp` is the
-//! protected surface a chat agent uses to file and groom work; `/worker/mcp` is
-//! open to the trusted worker network. Both are thin adapters: every tool
+//! Two endpoints, one trusted-network boundary, one database. `/mcp` is the
+//! surface a chat agent uses to file and groom work; `/worker/mcp` serves
+//! workers. Both are thin adapters: every tool
 //! decodes its arguments, calls [`crate::task`] or [`crate::product`], and
 //! encodes the answer. No rule lives here that does not also hold for HTTP.
 //!
@@ -15,10 +15,6 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::Request;
-use axum::http::header::AUTHORIZATION;
-use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
@@ -464,18 +460,14 @@ impl ServerHandler for Worker {
     }
 }
 
-/// The administrative MCP endpoint keeps its bearer; the worker endpoint is
-/// bounded by the trusted network, like the worker HTTP routes.
+/// Both MCP endpoints are bounded by the trusted network, like the worker HTTP
+/// routes.
 pub fn endpoints<S>(state: &AppState) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    protected_endpoint(
-        "/mcp",
-        Admin::new(state.clone()),
-        state.mcp_capability.clone(),
-    )
-    .merge(endpoint("/worker/mcp", Worker::new(state.clone())))
+    endpoint("/mcp", Admin::new(state.clone()))
+        .merge(endpoint("/worker/mcp", Worker::new(state.clone())))
 }
 
 /// One Streamable HTTP endpoint.
@@ -495,36 +487,4 @@ where
         StreamableHttpServerConfig::default().disable_allowed_hosts(),
     );
     Router::new().nest_service(path, service)
-}
-
-/// Protect an MCP endpoint before the service sees the request.
-fn protected_endpoint<S, H>(path: &str, handler: H, capability: String) -> Router<S>
-where
-    S: Clone + Send + Sync + 'static,
-    H: ServerHandler + Clone + Send + Sync + 'static,
-{
-    endpoint(path, handler).route_layer(middleware::from_fn(move |request: Request, next: Next| {
-        let capability = capability.clone();
-        async move { authorize(&capability, request, next).await }
-    }))
-}
-
-/// `Authorization: Bearer <capability>` or nothing at all. The refusal is the
-/// server's own shape, never a JSON-RPC body: a client that never got past this
-/// has no session and no protocol to answer in.
-async fn authorize(capability: &str, request: Request, next: Next) -> Response {
-    let presented = request
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| {
-            let (scheme, token) = value.split_once(' ')?;
-            scheme
-                .eq_ignore_ascii_case("bearer")
-                .then(|| token.trim_start())
-        });
-    if capability.is_empty() || presented != Some(capability) {
-        return Error::Unauthorized.into_response();
-    }
-    next.run(request).await
 }

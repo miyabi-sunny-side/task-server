@@ -1794,22 +1794,19 @@ fn production_startup_is_fail_closed_without_secrets() {
     };
     let message = err.to_string();
     assert!(
-        message.contains("MCP_CAPABILITY"),
+        message.contains("APP_CSRF_TOKEN"),
         "missing production secrets must fail closed: {message}"
     );
 
     let ok = AppState::from_vars(|key| match key {
         "TASK_SERVER_ENV" => Some("production".into()),
-        // The MCP admin endpoint opens task CRUD to an agent, so production
-        // demands its own capability for it.
-        "MCP_CAPABILITY" => Some("secret-mcp-cap".into()),
         "APP_CSRF_TOKEN" => Some("secret-csrf".into()),
         "APP_DB_PATH" => Some(db_path.to_string_lossy().into_owned()),
         _ => None,
     })
-    .expect("production with its remaining secrets");
+    .expect("production with its remaining secret");
     assert!(ok.dev_identity.is_none());
-    assert_eq!(ok.mcp_capability, "secret-mcp-cap");
+    assert_eq!(ok.csrf_token, "secret-csrf");
     assert!(db_path.is_file(), "APP_DB_PATH must be opened at startup");
 }
 
