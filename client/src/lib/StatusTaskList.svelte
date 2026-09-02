@@ -31,17 +31,18 @@
     onretry?: () => void;
   } = $props();
 
-  // The list hides exactly one thing: work another region of this same page
-  // already draws, because one object drawn twice on one screen reads as two.
-  // The panel draws pending `review` tasks as its queue, `instant:merge` as
-  // the merge trains, and stranded work as reconciliation. A `review` task
-  // the panel has stopped drawing falls back into its status group like any
-  // other task — the rule decides that, not taste.
+  // A subtask (kind other than `normal`) exists on this page only while the
+  // panel is drawing it in a readout — the review queue, the merge trains, or
+  // reconciliation. It never falls into a status group, finished or not: a
+  // `review` verdict lives on its target's `latest_review`, so a husk card
+  // once the panel stops drawing it would carry no information the detail
+  // page does not already have. A `normal` task hides only while another
+  // region of this same page already draws it, because one object drawn
+  // twice on one screen reads as two; it falls back into its status group
+  // the moment the panel stops.
   let elsewhere = $derived(new Set(drawnElsewhere));
   let open = $derived(
-    items.filter(
-      (item) => item.kind !== "instant:merge" && !elsewhere.has(item.id),
-    ),
+    items.filter((item) => item.kind === "normal" && !elsewhere.has(item.id)),
   );
 
   let groups = $derived(
@@ -87,11 +88,6 @@
               <a class="card" href={`/tasks/${item.id}`}>
                 <span class="name">{item.title}</span>
                 <span class="tail">
-                  <!-- Plain spans: the kind must never add a second focus
-                       stop inside the card link (DESIGN.md, Task list). -->
-                  {#if item.kind !== "normal"}
-                    <span class="badge">{item.kind}</span>
-                  {/if}
                   <span class="product">{item.product_id}</span>
                 </span>
               </a>

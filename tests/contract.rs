@@ -1124,16 +1124,15 @@ async fn claim_prefers_instant_merge_and_listing_hides_released() {
     let (status, released) = post_release(&state, PRODUCT, "v0.2.0").await;
     assert_eq!(status, StatusCode::OK, "release: {released}");
 
+    // The review and the landed retry both finished reading or landing
+    // `t-merged`, so release carries them to `released` with it, and the
+    // default listing hides them the same way it hides `t-merged` itself.
+    // The dropped first attempt never finished, so it stays.
     let (status, listing) = send(&state, read("/api/tasks")).await;
     assert_eq!(status, StatusCode::OK);
     let mut listed = ids_of(&listing);
     listed.sort_unstable();
-    let mut expected = vec![
-        "t-normal",
-        "review:t-merged",
-        merge_id.as_str(),
-        retry_id.as_str(),
-    ];
+    let mut expected = vec!["t-normal", merge_id.as_str()];
     expected.sort_unstable();
     assert_eq!(listed, expected, "the default listing hides released");
     let summary = listing
@@ -1146,7 +1145,11 @@ async fn claim_prefers_instant_merge_and_listing_hides_released() {
 
     let (status, released) = send(&state, read("/api/tasks?status=released")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(ids_of(&released), ["t-merged"]);
+    let mut released_ids = ids_of(&released);
+    released_ids.sort_unstable();
+    let mut expected_released = vec!["t-merged", "review:t-merged", retry_id.as_str()];
+    expected_released.sort_unstable();
+    assert_eq!(released_ids, expected_released);
 
     let (status, _) = send(&state, read("/api/tasks?status=not-a-status")).await;
     assert_eq!(

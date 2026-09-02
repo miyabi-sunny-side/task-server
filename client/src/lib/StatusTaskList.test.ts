@@ -24,7 +24,7 @@ function summary(
 }
 
 // Deliberately unordered, and carrying what the list must never show: a
-// released task and an instant:merge task (DESIGN.md, Task list).
+// released task and two subtasks (review, instant:merge) (DESIGN.md, Task list).
 const ITEMS: TaskSummary[] = [
   summary("t-merged", "merged"),
   summary("t-draft", "draft"),
@@ -95,37 +95,43 @@ describe("StatusTaskList", () => {
       const pill = group.querySelector<HTMLElement>("[data-count]");
       expect(pill?.textContent?.trim()).toBe(String(cardsOf(group).length));
     }
-    // ready holds the plain task and the review, but not the merge.
+    // ready holds the plain task, but not the review or the merge.
     const ready = groups().find((group) => group.dataset.status === "ready")!;
-    expect(cardsOf(ready)).toHaveLength(2);
+    expect(cardsOf(ready)).toHaveLength(1);
   });
 
-  it("keeps a review task in its status group and marks it with a kind badge", () => {
-    render(StatusTaskList, { props: { fetchState: "ready", items: ITEMS } });
-
-    const ready = groups().find((group) => group.dataset.status === "ready")!;
-    const review = ready.querySelector<HTMLElement>('a[href="/tasks/r-1"]');
-    expect(review).not.toBeNull();
-    expect(
-      [...review!.querySelectorAll(".badge")].map((badge) =>
-        badge.textContent?.trim(),
-      ),
-    ).toEqual(["review"]);
-
-    const plain = ready.querySelector<HTMLElement>('a[href="/tasks/t-ready"]');
-    expect(plain).not.toBeNull();
-    expect(plain!.querySelectorAll(".badge")).toHaveLength(0);
-  });
-
-  it("hides instant:merge tasks, which the control panel already draws", () => {
+  it("hides every task whose kind is not normal, whatever its status", () => {
     render(StatusTaskList, { props: { fetchState: "ready", items: ITEMS } });
 
     expect(document.querySelector('a[href="/tasks/m-1"]')).toBeNull();
+    expect(document.querySelector('a[href="/tasks/r-1"]')).toBeNull();
     for (const group of groups()) {
       for (const card of cardsOf(group)) {
         expect(card.textContent).not.toContain("instant:merge");
+        expect(card.textContent).not.toContain("review");
       }
     }
+  });
+
+  it("hides a done review task and a done instant:merge task from every group", () => {
+    // A verdict finishes a review, and a landed merge finishes itself, but
+    // neither leaves the top page's status groups: the review's verdict lives
+    // on its target's `latest_review`, and a husk card would say nothing the
+    // detail page does not already say.
+    render(StatusTaskList, {
+      props: {
+        fetchState: "ready",
+        items: [
+          summary("r-1", "done", "review", "レビュー: t-done"),
+          summary("m-1", "done", "instant:merge", "merge: t-done"),
+        ],
+        drawnElsewhere: [],
+      },
+    });
+
+    expect(document.querySelector('a[href="/tasks/r-1"]')).toBeNull();
+    expect(document.querySelector('a[href="/tasks/m-1"]')).toBeNull();
+    expect(groups()).toHaveLength(0);
   });
 
   it("hides the tasks the panel draws in its readouts, and nothing more", () => {
@@ -160,21 +166,21 @@ describe("StatusTaskList", () => {
     ).toBe("1");
   });
 
-  it("keeps a review the panel no longer draws in its status group", () => {
-    // Same rule, other way round: once the review is not pending, the review
-    // queue is not drawing it, so it falls back into its group with its badge.
+  it("keeps a normal task the panel no longer draws in its status group", () => {
+    // Only `normal` tasks fall back into a status group once the panel stops
+    // drawing them; that part of the rule is unchanged.
     render(StatusTaskList, {
       props: {
         fetchState: "ready",
-        items: [summary("r-1", "done", "review", "レビュー: t-done")],
+        items: [summary("t-done", "done")],
         drawnElsewhere: [],
       },
     });
 
     const done = groups().find((group) => group.dataset.status === "done")!;
-    const card = done.querySelector<HTMLElement>('a[href="/tasks/r-1"]')!;
-    expect(card).not.toBeNull();
-    expect(card.querySelector(".badge")?.textContent?.trim()).toBe("review");
+    expect(
+      done.querySelector<HTMLElement>('a[href="/tasks/t-done"]'),
+    ).not.toBeNull();
   });
 
   it("gives a card exactly one focusable element, the link itself", () => {

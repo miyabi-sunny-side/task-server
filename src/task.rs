@@ -1743,7 +1743,15 @@ pub fn releasable(db: &Db) -> Result<Vec<Releasable>, Error> {
 }
 
 /// Stamp every merged task of `product_id` with `tag` and move it to
-/// `released`. All of them or none: one transaction, one tag.
+/// `released`, and with it every `review` and `instant:merge` subtask that
+/// finished reading or landing one of those tasks. All of them or none: one
+/// transaction, one tag.
+///
+/// A subtask left at `done` after its target ships is a husk: the review's
+/// verdict already lives on the target's `latest_review`, and the merge
+/// already landed, so neither carries information release withholds by
+/// staying behind. A migration sweeps the husks a database already has when
+/// it opens; this is what keeps a new one from forming.
 pub fn release_product(
     db: &Db,
     product_id: &str,
@@ -1775,6 +1783,21 @@ pub fn release_product(
         tx.execute(
             "UPDATE tasks SET status = 'released', release_tag = ?2, updated_at = ?3
              WHERE product_id = ?1 AND kind = 'normal' AND status = 'merged'",
+            rusqlite::params![product_id, tag, stamp],
+        )?;
+        tx.execute(
+            "UPDATE tasks SET status = 'released', release_tag = ?2, updated_at = ?3
+             WHERE status = 'done' AND kind IN ('review', 'instant:merge')
+               AND (
+                 review_target_task_id IN (
+                   SELECT id FROM tasks
+                   WHERE product_id = ?1 AND kind = 'normal' AND status = 'released' AND release_tag = ?2
+                 )
+                 OR merge_target_task_id IN (
+                   SELECT id FROM tasks
+                   WHERE product_id = ?1 AND kind = 'normal' AND status = 'released' AND release_tag = ?2
+                 )
+               )",
             rusqlite::params![product_id, tag, stamp],
         )?;
         targets.iter().map(|task| read(tx, &task.id)).collect()
@@ -3019,6 +3042,38 @@ mod tests {
             Some("v0.2.0"),
             "the refused release must not have restamped anything"
         );
+    }
+
+    /// A shipped task leaves behind a `review` and an `instant:merge` subtask
+    /// that already finished their job — the verdict is read, the merge is
+    /// landed. Release carries them to `released` too, so none of them is a
+    /// husk `done` card release forgot.
+    #[test]
+    fn release_also_releases_the_finished_review_and_merge_of_what_it_ships() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        work_to_approved(&db, "t-1");
+        let merge_id = issued_merge(&db, "t-1").id;
+        merge_into(&db, &merge_id, TaskStatus::Done);
+
+        let review_id = review_task_id("t-1");
+        assert_eq!(get(&db, &review_id).unwrap().status, TaskStatus::Done);
+        assert_eq!(get(&db, &merge_id).unwrap().status, TaskStatus::Done);
+        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Merged);
+
+        let released = release_product(&db, "a/b", "v1.0.0", later()).unwrap();
+        assert_eq!(
+            released.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+            ["t-1"]
+        );
+
+        let review = get(&db, &review_id).unwrap();
+        assert_eq!(review.status, TaskStatus::Released);
+        assert_eq!(review.release_tag.as_deref(), Some("v1.0.0"));
+
+        let merge = get(&db, &merge_id).unwrap();
+        assert_eq!(merge.status, TaskStatus::Released);
+        assert_eq!(merge.release_tag.as_deref(), Some("v1.0.0"));
     }
 
     /// An archived product releases nothing, whatever its stored `releases`

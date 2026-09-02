@@ -637,18 +637,20 @@ counterpart to carry, so it earns no token pair.
   yet landed. `released` is never shown — shipped work leaves this
   page.
 
-  **What the list hides, and why.** The list shows every task that is
-  waiting for someone to pick it up, and hides exactly one thing: work
-  another region of this same page already renders. That rule was written
-  to settle this question once, and it now settles it the other way than
-  it first did — the panel draws pending `review` tasks as the review
-  queue, `instant:merge` tasks as the merge trains, and stranded tasks in
-  reconciliation, so **none of those appear in a status group**. One
-  object drawn twice on one screen reads as two. Nothing else is hidden.
-  A `review` task the panel no longer draws, because it is no longer
-  pending, falls back into its status group like any other task and
-  carries its kind badge there. The rule decides this; taste does not
-  re-open it.
+  **What the list hides, and why.** The list shows `normal` tasks only,
+  and hides two things. A `normal` task hides while another region of
+  this same page already renders it — the panel draws stranded tasks in
+  reconciliation — because one object drawn twice on one screen reads as
+  two; it falls back into its status group the moment the panel stops
+  drawing it. A task whose `kind` is not `normal` hides always, whatever
+  its status: a `review` or `instant:merge` task exists on this page only
+  through the panel's own readout — the review queue or the merge trains
+  — while it is in flight, and once it finishes it leaves the page rather
+  than falling into a status group. A review's verdict already lives on
+  its target's `latest_review`, and a landed merge's target already
+  carries the fact, so a finished subtask left behind here would be a
+  husk telling nothing the target's own card does not already tell. The
+  rule decides this; taste does not re-open it.
 
   Each group is a section carrying its status as a data attribute,
   headed by a label-type heading naming the status with its count pill
@@ -656,14 +658,9 @@ counterpart to carry, so it earns no token pair.
   (surface-raised, 1px hairline, 8px radius, 10px padding) in a single
   column with 8px gaps. A card links to its Task Card and shows the
   task title (label) with the product id as a muted caption — the group
-  heading already carries the status, so the card does not repeat it. A
-  task whose kind is not `normal` adds the **outline kind badge** (the
-  Task Card's recipe — caption type, 1px border, muted text) beside the
-  product id, so a task the panel is not drawing is still told apart
-  from ordinary implementation work without parsing titles; a `normal`
-  task carries no badge, and the badge never adds a second focus stop
-  inside the card link. The list container keeps
-  `data-state="loading|empty|error|success"`:
+  heading already carries the status, so the card does not repeat it.
+  Every card here is a `normal` task, so none carries a kind badge. The
+  list container keeps `data-state="loading|empty|error|success"`:
   - _loading:_ centered muted body-sm text with the accent spinner
     (1.5px-stroke circle, 1.1rem);
   - _empty:_ centered muted body-sm message;
@@ -899,15 +896,17 @@ counterpart to carry, so it earns no token pair.
       clip (no ink lost) and the ink bounding box is at least 28px wide
       of the 48, so what remains is the whole check rather than a
       fragment.
-  22. Non-`normal` work has exactly one home on the top page. While a
-      `review` task is pending, a card for it exists in the review queue
-      and in no status group; once it is no longer pending it appears in
-      its status group carrying the outline kind badge `review`, while a
-      `normal` task's card carries no kind badge. No status group ever
-      contains a card for an `instant:merge` task. Tabbing through any
-      card — in a status group, the review queue, a merge train, or the
-      reconciliation block — reaches exactly one focusable element, the
-      card link itself.
+  22. Non-`normal` work never has a home in a status group, only in the
+      panel's own readout. While a `review` task is pending, a card for
+      it exists in the review queue and in no status group; once it is no
+      longer pending it leaves the top page entirely — no status group,
+      no card, whatever its status. No status group ever contains a card
+      for an `instant:merge` task either, pending or finished. No status
+      group card carries a kind badge, because every card in a status
+      group is a `normal` task. Tabbing through any card — in a status
+      group, the review queue, a merge train, or the reconciliation
+      block — reaches exactly one focusable element, the card link
+      itself.
   23. `approved` is a status the UI reads and never writes: on a `done`
       task's Task Card no transition button's text is `approved`, and
       across the top page and any open modal no control's text is

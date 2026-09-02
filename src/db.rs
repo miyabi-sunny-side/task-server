@@ -229,6 +229,26 @@ PRAGMA user_version = 8;
 COMMIT;
 ";
 
+/// Version 9 sweeps the husks a database already has: a `review` or
+/// `instant:merge` subtask left at `done` whose target already shipped, from
+/// before [`task::release_product`](crate::task::release_product) carried
+/// subtasks along with their target. The verdict already lives on the
+/// target's `latest_review` and the merge already landed, so a `done` husk
+/// says nothing the target's own row does not; this backfill leaves it
+/// `released` with the target's own tag and timestamp instead, so a database
+/// opened after the fix reads the same as one that never had the bug.
+const SCHEMA_V9: &str = "\
+BEGIN;
+UPDATE tasks
+SET status = 'released', release_tag = target.release_tag, updated_at = target.updated_at
+FROM tasks AS target
+WHERE tasks.kind IN ('review', 'instant:merge') AND tasks.status = 'done'
+  AND target.kind = 'normal' AND target.status = 'released'
+  AND target.id = COALESCE(tasks.review_target_task_id, tasks.merge_target_task_id);
+PRAGMA user_version = 9;
+COMMIT;
+";
+
 /// How long a writer waits for a lock before giving up, in milliseconds.
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -394,6 +414,9 @@ fn migrate(conn: &Connection) -> Result<(), Error> {
     if version < 8 {
         conn.execute_batch(SCHEMA_V8)?;
     }
+    if version < 9 {
+        conn.execute_batch(SCHEMA_V9)?;
+    }
     Ok(())
 }
 
@@ -536,11 +559,11 @@ mod tests {
         let named = Db::open(":memory:").unwrap();
         assert_eq!(pragma_string(&named, "journal_mode"), "memory");
         assert_eq!(pragma_int(&named, "busy_timeout"), 5000);
-        assert_eq!(user_version(&named), 8);
+        assert_eq!(user_version(&named), 9);
 
         let private = Db::open_in_memory().unwrap();
         assert_eq!(pragma_int(&private, "busy_timeout"), 5000);
-        assert_eq!(user_version(&private), 8);
+        assert_eq!(user_version(&private), 9);
 
         // A URI spelling is not one of them. Only the exact `:memory:` is
         // exempt, so a URI is an ordinary filename: it lands on disk in WAL,
@@ -623,7 +646,7 @@ mod tests {
     #[test]
     fn migration_creates_the_current_schema() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(user_version(&db), 8);
+        assert_eq!(user_version(&db), 9);
         let tables: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row(
@@ -655,7 +678,7 @@ mod tests {
         drop(db);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 8);
+        assert_eq!(user_version(&db), 9);
         let products: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row("SELECT count(*) FROM products", [], |row| row.get(0))?)
@@ -690,7 +713,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 8);
+        assert_eq!(user_version(&db), 9);
 
         let (title, status, priority, merge_target, checks): (
             String,
@@ -786,7 +809,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 8);
+        assert_eq!(user_version(&db), 9);
 
         db.with_conn(|conn| {
             let rows_after = rebuilt_rows(conn, ["t-target", "merge:t-target", "t-plain"]);
@@ -890,7 +913,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 8);
+        assert_eq!(user_version(&db), 9);
         let archived = |db: &Db| -> (usize, Option<String>) {
             db.with_conn(|conn| {
                 let columns = column_names(conn, "products");
@@ -915,7 +938,7 @@ mod tests {
         // column is not added twice and the row is not re-marked.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 8);
+        assert_eq!(user_version(&db), 9);
         assert_eq!(archived(&db), (1, None), "a second open changes nothing");
         let tasks: i64 = db
             .with_conn(|conn| {
@@ -1118,7 +1141,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 8);
+        assert_eq!(user_version(&db), 9);
         db.with_conn(|conn| {
             let columns = column_names(conn, "tasks");
             for added in ["review_target_task_id", "review_verdict"] {
@@ -1146,7 +1169,7 @@ mod tests {
         // Reopening runs the step again and must change nothing.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 8);
+        assert_eq!(user_version(&db), 9);
         let tasks: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?)
@@ -1204,7 +1227,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 8);
+        assert_eq!(user_version(&db), 9);
 
         let upgraded = Connection::open(&path).unwrap();
         assert!(
@@ -1235,7 +1258,7 @@ mod tests {
         // Reopening runs nothing again.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 8);
+        assert_eq!(user_version(&db), 9);
     }
 
     /// The step on its own: a database that already reached version 6 loses the
@@ -1282,7 +1305,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 8);
+        assert_eq!(user_version(&db), 9);
         let upgraded = Connection::open(&path).unwrap();
         assert!(
             !column_names(&upgraded, "tasks").contains(&"merge_sequence".to_owned()),
@@ -1294,6 +1317,88 @@ mod tests {
             "and nothing else moved"
         );
     }
+
+    /// A `review` or `instant:merge` task left at `done` after its target
+    /// shipped is a husk from before release carried subtasks along with
+    /// their target. The version 9 migration sweeps it: `released`, with the
+    /// target's own tag and timestamp. A subtask of a task that has not
+    /// shipped yet is left exactly as it was.
+    #[test]
+    fn a_version_five_database_sweeps_the_husks_release_left_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sqlite.db");
+
+        let legacy = Connection::open(&path).unwrap();
+        legacy.execute_batch(SCHEMA_V1).unwrap();
+        legacy.execute_batch(SCHEMA_V2).unwrap();
+        super::rebuild_tasks_without_the_product_key(&legacy).unwrap();
+        legacy.execute_batch(SCHEMA_V4).unwrap();
+        legacy.execute_batch(SCHEMA_V5).unwrap();
+        legacy
+            .execute_batch(
+                "INSERT INTO tasks (id, title, body, status, kind, product_id, release_tag,
+                                    created_at, updated_at)
+                 VALUES ('t-1', 'shipped work', 'body', 'released', 'normal', 'a/b', 'v1.0.0',
+                         'early', 'late');
+                 INSERT INTO tasks (id, title, body, status, kind, product_id,
+                                    review_target_task_id, commit_sha, verification,
+                                    created_at, updated_at)
+                 VALUES ('review:t-1', 'reading it', 'body', 'done', 'review', 'a/b', 't-1',
+                         'abc1234', 'read the diff', 'early', 'earlyish');
+                 INSERT INTO tasks (id, title, body, status, kind, product_id,
+                                    merge_target_task_id, commit_sha, verification,
+                                    created_at, updated_at)
+                 VALUES ('merge:t-1', 'landing it', 'body', 'done', 'instant:merge', 'a/b', 't-1',
+                         'abc1234', 'merged onto main', 'early', 'earlyish2');
+                 INSERT INTO tasks (id, title, body, status, kind, product_id,
+                                    created_at, updated_at)
+                 VALUES ('t-2', 'still shipping', 'body', 'merged', 'normal', 'a/b',
+                         'early', 'late');
+                 INSERT INTO tasks (id, title, body, status, kind, product_id,
+                                    review_target_task_id, commit_sha, verification,
+                                    created_at, updated_at)
+                 VALUES ('review:t-2', 'reading it', 'body', 'done', 'review', 'a/b', 't-2',
+                         'def5678', 'read the diff', 'early', 'early');",
+            )
+            .unwrap();
+        let before: i64 = legacy
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, 5, "the fixture must start at version 5");
+        drop(legacy);
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(user_version(&db), 9);
+        db.with_conn(|conn| {
+            let husk = |id: &str| -> (String, Option<String>, String) {
+                conn.query_row(
+                    "SELECT status, release_tag, updated_at FROM tasks WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                husk("review:t-1"),
+                ("released".into(), Some("v1.0.0".into()), "late".into()),
+                "a done review of a released task follows it to released, \
+                 with its tag and timestamp"
+            );
+            assert_eq!(
+                husk("merge:t-1"),
+                ("released".into(), Some("v1.0.0".into()), "late".into()),
+                "a landed merge of a released task follows it the same way"
+            );
+            assert_eq!(
+                husk("review:t-2"),
+                ("done".into(), None, "early".into()),
+                "a review of a task that has not shipped yet is left alone"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
     /// A review that finished — approved, or sent back for changes — is over,
     /// and must not keep the next review of the same task out. That is exactly
     /// where the review index parts company with the merge index, which is why
