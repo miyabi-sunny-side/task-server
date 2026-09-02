@@ -207,8 +207,10 @@ in-root bare-backed checkout:
 ```
 
 The `gitdir:` target stays inside the product root, so it passes the same
-boundary checks as an ordinary checkout. That scanner support does not make a
-remote worker cache the split deployment's catalogue authority.
+boundary checks as an ordinary checkout. With no working tree, `description` and
+`releases` are read from the commit tree at `HEAD`; loose and packed objects both
+work. That scanner support does not make a remote worker cache the split
+deployment's catalogue authority.
 
 ### What the protocol leaves to the worker
 
@@ -315,15 +317,16 @@ detached object name), an object store, and a `refs` directory. A stray
 `.git/config` with a remote in it is not a clone, and minting a product from one
 would give an id nobody can check out.
 
-Every field comes from a file the clone already has, and no `git` binary is ever
-run:
+Every field comes from repository data already on disk, and no `git` binary is
+ever run. Normal clones use their working tree, including uncommitted changes.
+Bare repositories use the clean tree at `HEAD`, from loose or packed objects.
 
 | Field | Derived from |
 | --- | --- |
 | `id` | Where it sits locally, `<org>/<repo>`. Never the remote's owner: `sunny-side/5ch-viewer` keeps that id even though it pushes to `miyabisun`. |
 | `repository` | The `origin` URL in `.git/config`, normalised to its browsable `https://` form. |
-| `description` | The first non-empty line of `README.md`, without its leading `#`. Absent is empty. |
-| `releases` | Whether `.github/workflows` is there as a directory. Nothing in it is read and an empty one still counts: a product that releases has its artefacts built for it — a binary compiled by CI, an image CI pushes — and that is a workflow whatever the files are called. A tag is not evidence, because a version can be cut by hand; a `.github/workflows` that is a plain file, or that resolves out of the tree, is not the directory. |
+| `description` | The first non-empty line of working-tree `README.md`, or its blob at bare `HEAD`, without its leading `#`. Absent is empty. |
+| `releases` | For a normal clone, whether working-tree `.github/workflows` is a directory; an empty one counts. For a bare repository, whether `.github/workflows` is a tree at `HEAD`; Git cannot store an empty directory, so at least one tracked path must be below it. Nothing in the directory is interpreted. A tag is not evidence because a version can be cut by hand. |
 
 A worktree and a submodule keep `.git` as a file naming the real git directory,
 and that pointer is followed — including a worktree's `commondir` — because git
@@ -332,10 +335,10 @@ keeps those directories inside the superproject, which is inside the tree.
 The tree is also the boundary: every path the walk opens is resolved through its
 symlinks and has to land under `APP_PROJECTS_DIR`. A `.git` that is a symlink out,
 a `gitdir:` pointer that is absolute or climbs out with `..`, and a `commondir`
-naming somewhere else are all skipped rather than followed; a `README.md`,
-`.github/workflows`, or `refs` that resolves out of the tree is read as absent, so
-a file the operator never placed can neither describe a product nor turn its
-release control on.
+naming somewhere else are all skipped rather than followed. Working-tree
+metadata that resolves out is absent. A bare repository whose refs, loose or
+packed objects, or alternate object stores resolve out is skipped as
+`outside_root`.
 
 Each entry that is not a product is named in the startup log with its reason, and
 the summary line counts them per reason: `not_a_repository`,

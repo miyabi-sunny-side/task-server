@@ -5,20 +5,18 @@
 //! this reads them instead — the directories under `APP_PROJECTS_DIR`, two levels
 //! deep, as `<org>/<repo>`.
 //!
-//! Read-only, and git-binary-free. Everything derived here comes out of files a
-//! clone already has: `.git/config` for the remote, `README.md` for the
-//! description, and a `.github/workflows` directory for whether the product
-//! releases. Shelling out to `git` would need a writable `HOME` and a git binary,
-//! neither of which a read-only container mount has.
+//! Read-only, and git-binary-free. The remote comes from `.git/config`. A normal
+//! clone keeps the working-tree `README.md` and `.github/workflows` authoritative;
+//! a bare repository has no working tree, so the same metadata comes from its
+//! clean tree at `HEAD`. Shelling out to `git` would need a writable `HOME` and a
+//! git binary, neither of which a read-only container mount has.
 //!
 //! The tree is also the boundary. Every path this opens is canonicalised and has
-//! to sit under the canonical root: a `.git` that is a symlink, a `gitdir:`
-//! pointer that is absolute or climbs out with `..`, a worktree `commondir`, a
-//! linked `README.md`, a linked `.github/workflows` — each of those is a way to
-//! make the walk read a file the operator never put in the tree. What leaves the
-//! root is skipped and counted, not followed.
+//! to sit under the canonical root: git directories, worktree pointers, refs,
+//! loose and packed objects, alternate object stores, and working-tree metadata.
+//! What leaves the root is skipped and counted, not followed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -51,8 +49,8 @@ pub enum SkipReason {
     /// A `.git` that is not a git directory: no `HEAD` that reads as a ref, no
     /// object store, or no `refs`. A stray `config` is not a clone.
     IncompleteRepository,
-    /// A `.git`, a `gitdir:` pointer, or a `commondir` that resolves outside the
-    /// root. The tree the catalogue is derived from is the only thing read.
+    /// A git directory or worktree pointer resolves outside the root, or a bare
+    /// repository reaches an outside ref, object, pack, or alternate store.
     OutsideRoot,
     /// A repository whose config names no `origin` remote.
     NoOrigin,
@@ -172,6 +170,23 @@ struct Dirs {
     common: PathBuf,
 }
 
+#[derive(Default)]
+struct Metadata {
+    readme: Option<String>,
+    releases: bool,
+}
+
+enum BareMetadata {
+    /// The repository has a working tree, so the existing filesystem path stays
+    /// authoritative.
+    NotBare,
+    /// A ref, object, pack, or alternate object store resolves outside the
+    /// catalogue root.
+    Outside,
+    /// Metadata read from the clean tree at HEAD.
+    Head(Metadata),
+}
+
 /// What `.git` turned out to name.
 enum Located {
     At(Dirs),
@@ -253,15 +268,23 @@ impl Walk {
         let Some(url) = origin_url(&config) else {
             return Ok(Outcome::Skip(SkipReason::NoOrigin));
         };
-        let readme = self.read_within(&entry.path.join("README.md"))?;
+        let metadata = match self.bare_metadata(&dirs, &config)? {
+            BareMetadata::NotBare => Metadata {
+                readme: self.read_within(&entry.path.join("README.md"))?,
+                releases: self.releases(&entry.path)?,
+            },
+            BareMetadata::Outside => return Ok(Outcome::Skip(SkipReason::OutsideRoot)),
+            BareMetadata::Head(metadata) => metadata,
+        };
         Ok(Outcome::Product(Product {
             id: id.to_owned(),
             repository: normalize_remote_url(url),
-            description: readme
+            description: metadata
+                .readme
                 .as_deref()
                 .map(first_heading_line)
                 .unwrap_or_default(),
-            releases: self.releases(&entry.path)?,
+            releases: metadata.releases,
             // On disk is what the walk means, so nothing it finds is archived.
             archived: false,
         }))
@@ -351,6 +374,197 @@ impl Walk {
         for shared in ["objects", "refs"] {
             if !matches!(self.dir_within(&dirs.common.join(shared))?, Hop::Dir(_)) {
                 return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Read catalogue metadata from HEAD only for a repository Git marks bare.
+    /// Normal clones never fall back to HEAD: their working tree remains the
+    /// source of truth, including uncommitted changes and empty directories.
+    fn bare_metadata(&self, dirs: &Dirs, config: &str) -> Result<BareMetadata, Error> {
+        if !config_says_bare(config) {
+            return Ok(BareMetadata::NotBare);
+        }
+        for path in [
+            dirs.git.join("HEAD"),
+            dirs.common.join("refs"),
+            dirs.common.join("packed-refs"),
+        ] {
+            if !self.tree_within(&path)? {
+                return Ok(BareMetadata::Outside);
+            }
+        }
+        let Some(object_dirs) = self.object_directories(&dirs.common.join("objects"))? else {
+            return Ok(BareMetadata::Outside);
+        };
+
+        let repo = gix::open::Options::isolated()
+            // Replacement refs can redirect a pre-checked object id to another
+            // loose object. Catalogue metadata is the literal HEAD tree, so keep
+            // the ids we validate identical to the ids gix reads.
+            .config_overrides(["core.useReplaceRefs=true"])
+            .open_path_as_is(true)
+            .strict_config(true)
+            .open(&dirs.git)
+            .map_err(|err| git_error(&dirs.git, &err))?
+            .to_thread_local();
+        if !repo.is_bare() {
+            return Ok(BareMetadata::NotBare);
+        }
+
+        let head = repo.head().map_err(|err| git_error(&dirs.git, &err))?;
+        let Some(commit_id) = head.id().map(gix::Id::detach) else {
+            return Ok(BareMetadata::Head(Metadata::default()));
+        };
+        if !self.object_is_within(&object_dirs, &commit_id)? {
+            return Ok(BareMetadata::Outside);
+        }
+        let commit = repo
+            .find_commit(commit_id)
+            .map_err(|err| git_error(&dirs.git, &err))?;
+        let tree_id = commit
+            .tree_id()
+            .map_err(|err| git_error(&dirs.git, &err))?
+            .detach();
+        if !self.object_is_within(&object_dirs, &tree_id)? {
+            return Ok(BareMetadata::Outside);
+        }
+        let tree = repo
+            .find_tree(tree_id)
+            .map_err(|err| git_error(&dirs.git, &err))?;
+        tree.decode().map_err(|err| git_error(&dirs.git, &err))?;
+
+        let readme = if let Some(entry) = tree
+            .find_entry("README.md")
+            .filter(|entry| entry.mode().is_blob())
+        {
+            let id = entry.object_id();
+            if !self.object_is_within(&object_dirs, &id)? {
+                return Ok(BareMetadata::Outside);
+            }
+            let mut blob = repo
+                .find_blob(id)
+                .map_err(|err| git_error(&dirs.git, &err))?;
+            Some(String::from_utf8(blob.take_data()).map_err(|err| {
+                Error::Io(format!("{}: README.md at HEAD: {err}", dirs.git.display()))
+            })?)
+        } else {
+            None
+        };
+
+        let releases = if let Some(entry) = tree
+            .find_entry(".github")
+            .filter(|entry| entry.mode().is_tree())
+        {
+            let id = entry.object_id();
+            if !self.object_is_within(&object_dirs, &id)? {
+                return Ok(BareMetadata::Outside);
+            }
+            let github = repo
+                .find_tree(id)
+                .map_err(|err| git_error(&dirs.git, &err))?;
+            github.decode().map_err(|err| git_error(&dirs.git, &err))?;
+            if let Some(entry) = github
+                .find_entry("workflows")
+                .filter(|entry| entry.mode().is_tree())
+            {
+                let id = entry.object_id();
+                if !self.object_is_within(&object_dirs, &id)? {
+                    return Ok(BareMetadata::Outside);
+                }
+                let workflows = repo
+                    .find_tree(id)
+                    .map_err(|err| git_error(&dirs.git, &err))?;
+                workflows
+                    .decode()
+                    .map_err(|err| git_error(&dirs.git, &err))?;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        Ok(BareMetadata::Head(Metadata { readme, releases }))
+    }
+
+    /// Resolve the primary object directory and every alternate without ever
+    /// opening a path before it has been shown to remain under the catalogue
+    /// root. Pack files are checked once; loose objects are checked by id before
+    /// each read.
+    fn object_directories(&self, primary: &Path) -> Result<Option<Vec<PathBuf>>, Error> {
+        let mut pending = vec![primary.to_owned()];
+        let mut seen = BTreeSet::new();
+        let mut found = Vec::new();
+        while let Some(candidate) = pending.pop() {
+            let directory = match self.dir_within(&candidate)? {
+                Hop::Dir(directory) => directory,
+                Hop::Absent => {
+                    return Err(Error::Io(format!(
+                        "{}: object directory is missing",
+                        candidate.display()
+                    )));
+                }
+                Hop::Outside => return Ok(None),
+            };
+            if !seen.insert(directory.clone()) {
+                continue;
+            }
+            if !self.tree_within(&directory.join("pack"))? {
+                return Ok(None);
+            }
+
+            let alternates = directory.join("info/alternates");
+            match self.resolve(&alternates)? {
+                Inside::Missing => {}
+                Inside::No => return Ok(None),
+                Inside::Yes(real) => {
+                    let input = fs::read(&real).map_err(|err| io_error(&real, &err))?;
+                    let paths =
+                        gix::odb::alternate::parse(&input).map_err(|err| git_error(&real, &err))?;
+                    // Match gix's resolution: relative alternate paths are based
+                    // on the primary object directory.
+                    pending.extend(paths.into_iter().map(|path| primary.join(path)));
+                }
+            }
+            found.push(directory);
+        }
+        Ok(Some(found))
+    }
+
+    /// Prove that a loose object path stays under the root. If it is absent, gix
+    /// may use a pack; every pack tree was already checked above.
+    fn object_is_within(&self, object_dirs: &[PathBuf], id: &gix::oid) -> Result<bool, Error> {
+        let hex = id.to_string();
+        for directory in object_dirs {
+            let path = directory.join(&hex[..2]).join(&hex[2..]);
+            if matches!(self.resolve(&path)?, Inside::No) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether every existing path below `path` resolves inside the root. This is
+    /// used for refs and pack directories, whose entry counts are small; scanning
+    /// every loose object would make startup proportional to repository history.
+    fn tree_within(&self, path: &Path) -> Result<bool, Error> {
+        let mut pending = vec![path.to_owned()];
+        let mut seen = BTreeSet::new();
+        while let Some(candidate) = pending.pop() {
+            let real = match self.resolve(&candidate)? {
+                Inside::Yes(real) => real,
+                Inside::No => return Ok(false),
+                Inside::Missing => continue,
+            };
+            if !seen.insert(real.clone()) || !real.is_dir() {
+                continue;
+            }
+            for entry in fs::read_dir(&real).map_err(|err| io_error(&real, &err))? {
+                let entry = entry.map_err(|err| io_error(&real, &err))?;
+                pending.push(entry.path());
             }
         }
         Ok(true)
@@ -456,6 +670,16 @@ fn gitdir_pointer(text: &str) -> Option<&str> {
         .filter(|pointer| !pointer.is_empty())
 }
 
+/// Parse only the local config already admitted by the root boundary. A parse
+/// failure remains a normal-clone answer so malformed config cannot change the
+/// existing working-tree path into a new failure.
+fn config_says_bare(config: &str) -> bool {
+    gix::config::File::try_from(config)
+        .ok()
+        .and_then(|config| config.boolean_by("core", None, "bare").ok().flatten())
+        .unwrap_or(false)
+}
+
 /// Whether `HEAD` reads as git writes it: a symbolic ref into `refs/`, or a
 /// detached object name. A `.git` whose `HEAD` says anything else was not made
 /// by git.
@@ -537,6 +761,10 @@ fn io_error(path: &Path, err: &io::Error) -> Error {
     Error::Io(format!("{}: {err}", path.display()))
 }
 
+fn git_error(path: &Path, err: &impl std::fmt::Display) -> Error {
+    Error::Io(format!("{}: {err}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -576,6 +804,68 @@ mod tests {
     fn write(path: PathBuf, body: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, body).unwrap();
+    }
+
+    fn bare_repo(root: &Path, id: &str, origin: &str) -> (PathBuf, gix::Repository) {
+        let checkout = root.join(id);
+        fs::create_dir_all(&checkout).unwrap();
+        let bare = checkout.join(".bare");
+        let repo = gix::init_bare(&bare).unwrap();
+        write(
+            bare.join("config"),
+            &format!("[core]\n\tbare = true\n[remote \"origin\"]\n\turl = {origin}\n"),
+        );
+        write(checkout.join(".git"), "gitdir: ./.bare\n");
+        (checkout, repo)
+    }
+
+    /// Put catalogue metadata in a real HEAD commit without invoking git. The
+    /// scanner must be able to read the same object graph a clone stores loose.
+    fn commit_metadata(
+        repo: &gix::Repository,
+        readme: Option<&str>,
+        with_workflow: bool,
+    ) -> gix::ObjectId {
+        use gix::objs::tree::EntryKind;
+
+        let mut tree = repo.edit_tree(repo.empty_tree().id()).unwrap();
+        if let Some(readme) = readme {
+            let readme = repo.write_blob(readme).unwrap().detach();
+            tree.upsert("README.md", EntryKind::Blob, readme).unwrap();
+        }
+        if with_workflow {
+            let workflow = repo.write_blob("on: push\n").unwrap().detach();
+            tree.upsert(".github/workflows/release.yml", EntryKind::Blob, workflow)
+                .unwrap();
+        }
+        let tree = tree.write().unwrap().detach();
+        let signature = gix::actor::SignatureRef {
+            name: "fixture".into(),
+            email: "fixture@example.com".into(),
+            time: "0 +0000",
+        };
+        let commit = repo
+            .new_commit_as(
+                signature,
+                signature,
+                "fixture",
+                tree,
+                gix::commit::NO_PARENT_IDS,
+            )
+            .unwrap();
+        write(
+            repo.git_dir().join("refs/heads/main"),
+            &format!("{}\n", commit.id),
+        );
+        commit.id
+    }
+
+    fn loose_object_path(repo: &gix::Repository, id: gix::ObjectId) -> PathBuf {
+        let hex = id.to_string();
+        repo.git_dir()
+            .join("objects")
+            .join(&hex[..2])
+            .join(&hex[2..])
     }
 
     fn ids(report: &Report) -> Vec<&str> {
@@ -935,31 +1225,248 @@ mod tests {
         assert_eq!(skips(&report), [("org/broken", "not_a_repository")]);
     }
 
-    /// A disposable worker keeps the bare repository inside the product root and
-    /// makes the root itself a worktree pointer. Both metadata paths remain under
-    /// `APP_PROJECTS_DIR`, so this exact layout is a catalogue product too.
+    /// A disposable worker keeps a bare repository inside the product root and
+    /// points `.git` at it. There is no working tree: catalogue metadata exists
+    /// only as real commit, tree, and blob objects reachable from HEAD.
     #[test]
-    fn a_bare_repository_inside_the_product_root_is_scanned() {
+    fn a_bare_repository_reads_catalogue_metadata_from_head() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path();
-        let checkout = root.join("org/portable");
-        let bare = checkout.join(".bare");
-        git_dir(&bare);
-        write(
-            bare.join("config"),
-            "[remote \"origin\"]\n\turl = git@github.com:org/portable.git\n",
-        );
-        write(checkout.join(".git"), "gitdir: ./.bare\n");
-        write(checkout.join("README.md"), "# portable checkout\n");
+        let (checkout, repo) = bare_repo(root, "org/portable", "git@github.com:org/portable.git");
+        commit_metadata(&repo, Some("# portable checkout\n"), true);
+
+        assert!(!checkout.join("README.md").exists());
+        assert!(!checkout.join(".github").exists());
 
         let report = scan(root).unwrap();
         assert_eq!(ids(&report), ["org/portable"]);
-        assert_eq!(
-            report.products[0].repository,
-            "https://github.com/org/portable"
-        );
-        assert_eq!(report.products[0].description, "portable checkout");
+        let product = &report.products[0];
+        assert_eq!(product.repository, "https://github.com/org/portable");
+        assert_eq!(product.description, "portable checkout");
+        assert!(product.releases, "HEAD contains a workflows tree");
         assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    }
+
+    #[test]
+    fn a_bare_repository_reads_catalogue_metadata_from_packed_objects() {
+        const PACK: &str = "pack-30a8bd9a9e267a4c5e791bbd05f4231d9d91687a";
+
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let (_checkout, repo) = bare_repo(root, "org/packed", "git@github.com:org/packed.git");
+        let pack = repo.git_dir().join("objects/pack").join(PACK);
+        fs::write(
+            pack.with_extension("pack"),
+            include_bytes!("../tests/fixtures/bare-metadata.pack"),
+        )
+        .unwrap();
+        fs::write(
+            pack.with_extension("idx"),
+            include_bytes!("../tests/fixtures/bare-metadata.idx"),
+        )
+        .unwrap();
+        write(
+            repo.git_dir().join("packed-refs"),
+            &format!(
+                "# pack-refs with: peeled fully-peeled sorted\n{} refs/heads/main\n",
+                include_str!("../tests/fixtures/bare-metadata.head").trim()
+            ),
+        );
+
+        let report = scan(root).unwrap();
+        assert_eq!(ids(&report), ["org/packed"]);
+        let product = &report.products[0];
+        assert_eq!(product.description, "packed catalogue");
+        assert!(product.releases);
+    }
+
+    #[test]
+    fn an_empty_bare_repository_uses_empty_catalogue_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        bare_repo(root, "org/unborn", "git@github.com:org/unborn.git");
+
+        let report = scan(root).unwrap();
+        assert_eq!(ids(&report), ["org/unborn"]);
+        let product = &report.products[0];
+        assert_eq!(product.description, "");
+        assert!(!product.releases);
+    }
+
+    #[test]
+    fn a_bare_repository_without_catalogue_metadata_uses_empty_defaults() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let (_checkout, repo) = bare_repo(root, "org/empty", "git@github.com:org/empty.git");
+        commit_metadata(&repo, None, false);
+
+        let report = scan(root).unwrap();
+        assert_eq!(ids(&report), ["org/empty"]);
+        let product = &report.products[0];
+        assert_eq!(product.description, "");
+        assert!(!product.releases);
+    }
+
+    #[test]
+    fn a_broken_bare_head_object_is_a_scan_error() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let (_checkout, repo) = bare_repo(root, "org/broken", "git@github.com:org/broken.git");
+        let commit = commit_metadata(&repo, Some("# broken\n"), true);
+        let object = loose_object_path(&repo, commit);
+        fs::remove_file(&object).unwrap();
+        fs::write(object, "not a git object\n").unwrap();
+
+        assert!(
+            matches!(scan(root), Err(Error::Io(_))),
+            "corrupt bare metadata must not silently become empty"
+        );
+    }
+
+    #[test]
+    fn a_bare_alternate_inside_the_root_is_read() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let (checkout, repo) = bare_repo(root, "org/alternate", "git@github.com:org/alternate.git");
+        commit_metadata(&repo, Some("# alternate\n"), true);
+        let git = repo.git_dir().to_owned();
+        drop(repo);
+
+        fs::rename(git.join("objects"), checkout.join(".objects")).unwrap();
+        fs::create_dir_all(git.join("objects/info")).unwrap();
+        fs::create_dir_all(git.join("objects/pack")).unwrap();
+        write(git.join("objects/info/alternates"), "../../.objects\n");
+
+        let report = scan(root).unwrap();
+        assert_eq!(ids(&report), ["org/alternate"]);
+        let product = &report.products[0];
+        assert_eq!(product.description, "alternate");
+        assert!(product.releases);
+    }
+
+    #[test]
+    fn a_bare_alternate_outside_the_root_is_skipped() {
+        let (_base, root, outside) = root_and_outside();
+        let (_checkout, repo) =
+            bare_repo(&root, "org/alternate", "git@github.com:org/alternate.git");
+        commit_metadata(&repo, Some("# alternate\n"), true);
+        let outside_objects = outside.join("objects");
+        fs::create_dir_all(&outside_objects).unwrap();
+        write(
+            repo.git_dir().join("objects/info/alternates"),
+            &format!("{}\n", outside_objects.display()),
+        );
+
+        let report = scan(&root).unwrap();
+        assert!(report.products.is_empty());
+        assert_eq!(skips(&report), [("org/alternate", "outside_root")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bare_replacement_object_outside_the_root_is_not_read() {
+        let (_base, root, outside) = root_and_outside();
+        let (_checkout, repo) = bare_repo(&root, "org/replaced", "git@github.com:org/replaced.git");
+        commit_metadata(&repo, Some("# original\n"), false);
+        let source = repo
+            .head_commit()
+            .unwrap()
+            .tree()
+            .unwrap()
+            .find_entry("README.md")
+            .unwrap()
+            .object_id();
+        let replacement = repo.write_blob("# outside replacement\n").unwrap().detach();
+        write(
+            repo.git_dir().join("refs/replace").join(source.to_string()),
+            &format!("{replacement}\n"),
+        );
+        write(
+            repo.git_dir().join("config"),
+            "[core]\n\tbare = true\n\tuseReplaceRefs = false\n\
+             [remote \"origin\"]\n\turl = git@github.com:org/replaced.git\n",
+        );
+
+        let replacement_object = loose_object_path(&repo, replacement);
+        let outside_object = outside.join("replacement-object");
+        fs::copy(&replacement_object, &outside_object).unwrap();
+        fs::remove_file(&replacement_object).unwrap();
+        std::os::unix::fs::symlink(&outside_object, &replacement_object).unwrap();
+
+        let report = scan(&root).unwrap();
+        assert_eq!(ids(&report), ["org/replaced"]);
+        assert_eq!(report.products[0].description, "original");
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bare_git_storage_linked_outside_the_root_is_skipped() {
+        let (_base, root, outside) = root_and_outside();
+
+        let (_checkout, ref_repo) = bare_repo(&root, "org/ref", "git@github.com:org/ref.git");
+        commit_metadata(&ref_repo, Some("# ref\n"), true);
+        let head_ref = ref_repo.git_dir().join("refs/heads/main");
+        let outside_ref = outside.join("main-ref");
+        fs::copy(&head_ref, &outside_ref).unwrap();
+        fs::remove_file(&head_ref).unwrap();
+        std::os::unix::fs::symlink(&outside_ref, &head_ref).unwrap();
+
+        let (_checkout, object_repo) =
+            bare_repo(&root, "org/object", "git@github.com:org/object.git");
+        let commit = commit_metadata(&object_repo, Some("# object\n"), true);
+        let object = loose_object_path(&object_repo, commit);
+        let outside_object = outside.join("commit-object");
+        fs::copy(&object, &outside_object).unwrap();
+        fs::remove_file(&object).unwrap();
+        std::os::unix::fs::symlink(&outside_object, &object).unwrap();
+
+        let (_checkout, pack_repo) = bare_repo(&root, "org/pack", "git@github.com:org/pack.git");
+        commit_metadata(&pack_repo, Some("# pack\n"), true);
+        let pack = pack_repo.git_dir().join("objects/pack");
+        fs::remove_dir_all(&pack).unwrap();
+        let outside_pack = outside.join("pack");
+        fs::create_dir_all(&outside_pack).unwrap();
+        std::os::unix::fs::symlink(&outside_pack, &pack).unwrap();
+
+        let report = scan(&root).unwrap();
+        assert!(report.products.is_empty());
+        assert_eq!(
+            skips(&report),
+            [
+                ("org/object", "outside_root"),
+                ("org/pack", "outside_root"),
+                ("org/ref", "outside_root"),
+            ]
+        );
+    }
+
+    /// A normal clone keeps the working tree as the source of catalogue metadata,
+    /// even when HEAD says something else. Uncommitted changes must remain visible
+    /// on the next scan, as they were before bare repositories were supported.
+    #[test]
+    fn a_normal_clone_still_reads_catalogue_metadata_from_the_working_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let checkout = root.join("org/working");
+        let repo = gix::init(&checkout).unwrap();
+        write(
+            checkout.join(".git/config"),
+            "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = git@github.com:org/working.git\n",
+        );
+        commit_metadata(&repo, Some("# committed description\n"), true);
+
+        write(checkout.join("README.md"), "# working description\n");
+        assert!(!checkout.join(".github").exists());
+
+        let report = scan(root).unwrap();
+        assert_eq!(ids(&report), ["org/working"]);
+        let product = &report.products[0];
+        assert_eq!(product.description, "working description");
+        assert!(
+            !product.releases,
+            "HEAD workflows do not override the worktree"
+        );
     }
 
     /// Nothing outside the root is opened, however the tree asks for it. A `.git`

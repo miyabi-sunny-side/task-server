@@ -53,17 +53,18 @@ JSON API, the MCP endpoints, and the compiled client.
   server owns catalogue identity in SQLite. Only `product_id` crosses that
   boundary. No server-side clone is maintained merely to mirror a worker cache.
 - A git repository is git's own definition, not "it has a config": `HEAD` reading
-  as a ref or an object name, an object store, and `refs`. `releases` is whether
-  the clone has a `.github/workflows` **directory** — no name is read and an empty
-  one counts, because a product that releases has its artefacts built by CI. A tag
-  is not evidence, and a plain file of that name is not the directory.
+  as a ref or an object name, an object store, and `refs`. Normal clones derive
+  description and `releases` from the working-tree README and workflows directory,
+  so uncommitted changes and an empty workflows directory count. Bare repositories
+  derive them from the clean tree at `HEAD`; Git cannot store an empty directory.
+  A tag is not release evidence.
 - The walk never reads outside `APP_PROJECTS_DIR`. Every path is canonicalised and
   has to stay under the root: a `.git` symlink, a `gitdir:` pointer, or a
-  `commondir` leading out is skipped as `outside_root` and counted, and README,
-  workflow, and refs paths that resolve out are read as absent. Worktree and
-  submodule pointers are still followed while they stay inside. This includes a
-  product root whose `.git` says `gitdir: ./.bare` and whose `.bare/` repository
-  stays inside that root.
+  `commondir` leading out is skipped as `outside_root` and counted. Worktree
+  metadata resolving out is absent. A bare repository is skipped as `outside_root`
+  if its refs, loose or packed objects, or alternate object stores resolve out.
+  Worktree and submodule pointers are followed while they stay inside. This
+  includes `.git` saying `gitdir: ./.bare` when `.bare/` stays inside the product.
 - A product whose working copy left the tree is **archived, never deleted**:
   `products.archived_at` is set, the row stays so the tasks that named it keep
   resolving, and `ready` is refused with code `product_archived` — distinct from
