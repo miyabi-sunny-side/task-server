@@ -248,14 +248,36 @@ JSON API, the MCP endpoints, and the compiled client.
   gate guards success only: a report that says it was **blocked** is reporting
   the red check, not claiming it as a pass, and is accepted with it (see below).
 - **A merge that could not be integrated is written down, not rolled back.**
-  `POST /worker/report` with `outcome: "blocked"` moves the task to `blocked`
-  and writes the reason to `verification` and the evidence to `checks_json`. The
-  target does not move — nothing landed — and `commit_sha` is not overwritten,
-  because on a merge it is the subject the merge was issued for. Rolling the
-  report back would put the merge straight back in the queue with nothing saying
-  why it failed. Re-sending the identical report (same reason) is idempotent; a
-  different reason on an already-blocked task is 400. `outcome` defaults to
-  `done`, so a worker written before this keeps working.
+  `POST /worker/report` with `outcome: "blocked"` writes the reason to
+  `verification` and the evidence to `checks_json`, and keeps `commit_sha`,
+  because on a merge it is the subject the merge was issued for. Which step
+  failed decides the rest, read from the checks (`task::is_rebase_conflict`),
+  never from the free text: a red check named `git rebase` is a conflict, and
+  the merge is `dropped` while the same transaction issues
+  `rework:<target>` (`merge-conflict`) — the train moves on and the rebased
+  commit is merged again as `merge:<target>~2` under the approval it has. Any
+  other red check moves the merge to `blocked` for a person, and the target
+  does not move — nothing landed. Re-sending the identical report is
+  idempotent (a repeated conflict finds its merge dropped); a different reason
+  on an already-blocked task is 400. `outcome` defaults to `done`, so a worker
+  written before this keeps working.
+- **A `rework` is issued by the control plane and finished by a report.** A
+  review that answers `request_changes` and a merge whose rebase conflicted
+  each issue `rework:<target>` (`~2`, `~3`, … per round) in their own
+  transaction, carrying `rework_target_task_id`, `rework_reason` (`review` or
+  `merge-conflict`), the target's branch, product, priority and release level,
+  and the findings or the conflict report as `body`. While it is open the
+  target is parked: `wip` with every lease column `NULL`, which is what keeps it
+  out of every queue (`CLAIMABLE` needs a lease on a `wip` row, a review needs
+  `done`, a merge needs `approved`), and `task::set_status_by_operator` refuses
+  `ready` and `done` on it with code `rework_in_flight` until the rework is
+  cancelled or dropped. A `done` report on the rework puts its commit on the
+  target and hands the target back to the step it came from — `done` and the
+  next review for `review`, `approved` and the next merge for `merge-conflict`
+  — with `done_at` unchanged; a `blocked` report blocks the rework and its
+  target with the same reason. `task::operator_refusal` refuses a pressed
+  `done` on a rework, like on a review. A finished rework is carried to
+  `released` with its target, like a review or a merge.
 - **How a merge ended is the worker's report, never a press.** `done` and
   `blocked` are outcomes, and `task::operator_refusal` refuses both on an
   `instant:merge` task, so `POST /api/tasks/{id}/status` and the MCP
@@ -395,6 +417,10 @@ JSON API, the MCP endpoints, and the compiled client.
 Sideways from any live status: `blocked`, `cancelled`, `dropped`.
 `blocked` returns to `ready`. `wip` may fall back to `ready`. `released`,
 `cancelled`, and `dropped` are terminal.
+
+A `normal` task with an open `rework` on its branch is `wip` without a lease
+and takes neither `ready` nor `done` by hand (code `rework_in_flight`); the
+rework's report moves it. A `rework` task takes no pressed `done`.
 
 On an `instant:merge` task an operator may press none of `done`, `blocked`, or
 `blocked → ready`: how an attempt ended is its worker's report, and an attempt

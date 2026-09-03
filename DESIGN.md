@@ -657,10 +657,12 @@ counterpart to carry, so it earns no token pair.
   reconciliation — because one object drawn twice on one screen reads as
   two; it falls back into its status group the moment the panel stops
   drawing it. A task whose `kind` is not `normal` hides always, whatever
-  its status: a `review` or `instant:merge` task exists on this page only
-  through the panel's own readout — the review queue or the merge trains
-  — while it is in flight, and once it finishes it leaves the page rather
-  than falling into a status group. A review's verdict already lives on
+  its status: a `review`, `instant:merge` or `rework` task exists on this
+  page only through the panel's own readout — the review queue or the
+  merge trains — while it is in flight, and once it finishes it leaves the
+  page rather than falling into a status group. A `rework` is the pass a
+  verdict or a conflicted merge sent the work back for; its target stays
+  in the `wip` group meanwhile, which is where that work is. A review's verdict already lives on
   its target's `latest_review`, and a landed merge's target already
   carries the fact, so a finished subtask left behind here would be a
   husk telling nothing the target's own card does not already tell. The
@@ -693,7 +695,7 @@ counterpart to carry, so it earns no token pair.
   product id first** (body-sm, on-surface), then a row of outline badges
   (caption type, 1px border, muted text; neutral chrome, not a data
   color) — the status, and for a task whose kind is not `normal`
-  (`instant:merge`, `review`) a second badge naming that kind. Below
+  (`instant:merge`, `review`, `rework`) a second badge naming that kind. Below
   the head, `commit_sha` and `verification` as muted captions when
   present, body text (body, 1.6, pre-line), and `available_transitions`
   as a row of default buttons, one per reachable status. The `ready` transition, when present,
@@ -747,7 +749,7 @@ counterpart to carry, so it earns no token pair.
   carried by the header's selected state alone, with no page heading of
   its own. It lists every `kind: normal` task whose status is `done`,
   `approved`, `merged`, or `released` — non-`normal` tasks (`review`,
-  `instant:merge`) never appear, matching the top page's own status
+  `instant:merge`, `rework`) never appear, matching the top page's own status
   groups. `released` is shown here on purpose: the top page drops a task
   the moment it ships, and this list is where shipped work keeps being
   readable. Rows sort by completion time, most recent first.

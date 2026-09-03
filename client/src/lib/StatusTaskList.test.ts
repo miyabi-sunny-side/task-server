@@ -35,6 +35,7 @@ const ITEMS: TaskSummary[] = [
   summary("t-ready", "ready"),
   summary("m-1", "ready", "instant:merge"),
   summary("r-1", "ready", "review", "レビュー: t-done"),
+  summary("w-1", "ready", "rework", "手直し: t-done"),
   summary("t-done", "done"),
   summary("t-cancelled", "cancelled"),
   summary("t-dropped", "dropped"),
@@ -109,6 +110,7 @@ describe("StatusTaskList", () => {
       for (const card of cardsOf(group)) {
         expect(card.textContent).not.toContain("instant:merge");
         expect(card.textContent).not.toContain("review");
+        expect(card.textContent).not.toContain("rework");
       }
     }
   });

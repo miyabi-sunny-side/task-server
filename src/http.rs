@@ -302,7 +302,7 @@ fn require_human_mutation(headers: &HeaderMap, state: &AppState) -> Result<(), E
 }
 
 fn card(db: &Db, task: Task) -> Result<TaskCard, Error> {
-    let available_transitions = task::available_transitions(&task);
+    let available_transitions = task::offered_transitions(db, &task)?;
     // Ordinary work is the only thing a review answers for, so nothing else
     // pays for the lookup.
     let latest_review = if task.kind == TaskKind::Normal {

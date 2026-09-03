@@ -11,7 +11,7 @@ const COLUMNS: &str = "id, title, body, status, kind, product_id, priority, bran
                        claim_id, claimed_at, claim_expires_at, commit_sha, verification, \
                        release_tag, created_at, updated_at, merge_target_task_id, checks_json, \
                        review_target_task_id, review_verdict, release_level, release_task_id, \
-                       depends_on, done_at";
+                       depends_on, done_at, rework_target_task_id, rework_reason";
 
 /// Every status, in vocabulary order. Used to enumerate legal transitions.
 pub(crate) const ALL_STATUSES: [TaskStatus; 10] = [
@@ -91,6 +91,12 @@ pub enum TaskKind {
     /// at the card's `release_level` and reports the tag it cut.
     #[serde(rename = "instant:release")]
     InstantRelease,
+    /// Another pass over finished work on its own branch: what a reviewer sent
+    /// back, or what a merge could not rebase. Issued by the verdict or the
+    /// merge report that found the work wanting, and finished like `normal`
+    /// work, with the commit it added.
+    #[serde(rename = "rework")]
+    Rework,
 }
 
 impl TaskKind {
@@ -101,6 +107,7 @@ impl TaskKind {
             Self::InstantMerge => "instant:merge",
             Self::Review => "review",
             Self::InstantRelease => "instant:release",
+            Self::Rework => "rework",
         }
     }
 
@@ -112,6 +119,7 @@ impl TaskKind {
             Self::InstantMerge => Some("POST /api/merges"),
             Self::Review => Some("POST /api/reviews"),
             Self::InstantRelease => Some("POST /api/releases"),
+            Self::Rework => Some("a request_changes verdict or a conflicted merge report"),
         }
     }
 
@@ -121,7 +129,40 @@ impl TaskKind {
             "instant:merge" => Ok(Self::InstantMerge),
             "review" => Ok(Self::Review),
             "instant:release" => Ok(Self::InstantRelease),
+            "rework" => Ok(Self::Rework),
             other => Err(Error::Invalid(format!("invalid kind: {other}"))),
+        }
+    }
+}
+
+/// Why a `rework` task was issued: the two findings that send finished work
+/// back to its branch. What the rework's `done` leads to follows from it — a
+/// reviewed commit is read again, a rebased one is merged again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReworkReason {
+    /// A review answered `request_changes`; the findings are the rework's body.
+    #[serde(rename = "review")]
+    Review,
+    /// A merge could not rebase the branch onto the main line; the worker's
+    /// report of the conflict is the rework's body.
+    #[serde(rename = "merge-conflict")]
+    MergeConflict,
+}
+
+impl ReworkReason {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Review => "review",
+            Self::MergeConflict => "merge-conflict",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self, Error> {
+        match raw {
+            "review" => Ok(Self::Review),
+            "merge-conflict" => Ok(Self::MergeConflict),
+            other => Err(Error::Invalid(format!("invalid rework_reason: {other}"))),
         }
     }
 }
@@ -337,6 +378,12 @@ pub struct Task {
     /// work only.
     #[serde(default)]
     pub done_at: Option<String>,
+    /// Set on a `rework` task: the `normal` task whose branch it works on.
+    #[serde(default)]
+    pub rework_target_task_id: Option<String>,
+    /// Set on a `rework` task: what sent the work back.
+    #[serde(default)]
+    pub rework_reason: Option<ReworkReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -701,6 +748,33 @@ pub fn available_transitions(task: &Task) -> Vec<TaskStatus> {
         .collect()
 }
 
+/// [`available_transitions`] as a card shows it: the row's own refusals, and
+/// the one refusal that needs the database — a target with a rework on its
+/// branch is not offered `ready` or `done`, which [`set_status_by_operator`]
+/// would refuse with `rework_in_flight`. Read here so a screen never offers a
+/// press the status route turns down.
+pub fn offered_transitions(db: &Db, task: &Task) -> Result<Vec<TaskStatus>, Error> {
+    let mut offered = available_transitions(task);
+    if offered
+        .iter()
+        .any(|to| matches!(to, TaskStatus::Ready | TaskStatus::Done))
+        && db.with_conn(|conn| rework_holds(conn, task))?
+    {
+        offered.retain(|to| !matches!(to, TaskStatus::Ready | TaskStatus::Done));
+    }
+    Ok(offered)
+}
+
+/// Whether a rework on `task`'s branch is open. Only a `normal` task can have
+/// one, and only the pressed transitions that would put the target back in a
+/// queue ask.
+fn rework_holds(conn: &Connection, task: &Task) -> Result<bool, Error> {
+    if task.kind != TaskKind::Normal {
+        return Ok(false);
+    }
+    has_open_attempt(conn, "rework_target_task_id", REVIEW_IS_OVER, &task.id)
+}
+
 /// Why an operator surface may not press `to` on `task`, if it may not.
 ///
 /// The single owner of "a human may not press this", consulted both by
@@ -769,6 +843,16 @@ fn operator_refusal(task: &Task, to: TaskStatus) -> Option<Error> {
         return Some(Error::Invalid(format!(
             "task {} is a review: it is finished by a verdict \
              (POST /worker/review-report), not by a status change",
+            task.id
+        )));
+    }
+    // A rework is finished by the commit it added, and only its report names
+    // one. A pressed `done` would hand the target back with the commit the
+    // rework was issued to replace.
+    if task.kind == TaskKind::Rework && to == TaskStatus::Done {
+        return Some(Error::Invalid(format!(
+            "task {} is a rework: it is finished by a report naming the commit it added \
+             (POST /worker/report), not by a status change",
             task.id
         )));
     }
@@ -862,7 +946,7 @@ fn attempt_noun(kind: TaskKind) -> &'static str {
     match kind {
         TaskKind::InstantRelease => "release",
         TaskKind::InstantMerge => "merge",
-        TaskKind::Normal | TaskKind::Review => "task",
+        TaskKind::Normal | TaskKind::Review | TaskKind::Rework => "task",
     }
 }
 
@@ -973,6 +1057,23 @@ fn set_status_pressed_by(
                 task.status.as_str(),
                 to.as_str()
             )));
+        }
+        // While a rework holds the branch, the target goes nowhere by hand:
+        // `ready` would hand the same branch to a second worker, and `done`
+        // would put the commit the rework is replacing back in front of a
+        // review. Calling the rework off (`cancelled`, `dropped`) is the way
+        // back to pressing.
+        if presser == Presser::Operator
+            && matches!(to, TaskStatus::Ready | TaskStatus::Done)
+            && rework_holds(tx, &task)?
+        {
+            return Err(Error::Precondition {
+                code: "rework_in_flight",
+                message: format!(
+                    "task {id} has a rework on its branch; cancel or drop that rework before \
+                     moving the task by hand"
+                ),
+            });
         }
         if to == TaskStatus::Ready {
             check_catalogued(tx, &task)?;
@@ -1403,7 +1504,14 @@ pub fn report(
             )));
         }
         if outcome == ReportOutcome::Blocked {
-            return report_blocked(tx, &task, verification, checks_json.as_deref(), &stamp);
+            return report_blocked(
+                tx,
+                &task,
+                verification,
+                checks,
+                checks_json.as_deref(),
+                &stamp,
+            );
         }
         // The gate belongs to the report, not to one status: a merge that
         // already landed must still be told the checks passed, or a repeat
@@ -1448,6 +1556,7 @@ pub fn report(
                         let tag = release_tag.unwrap_or_default();
                         ship_release(tx, &task, tag, &stamp)?;
                     }
+                    TaskKind::Rework => finish_rework(tx, &task, commit_sha, &stamp)?,
                     TaskKind::Review => unreachable!("a review is refused above"),
                 }
                 read(tx, &task.id)
@@ -1493,10 +1602,14 @@ fn report_blocked(
     tx: &Connection,
     task: &Task,
     reason: &str,
+    checks: &[Check],
     checks_json: Option<&str>,
     stamp: &str,
 ) -> Result<Task, Error> {
     match task.status {
+        TaskStatus::Wip if task.kind == TaskKind::InstantMerge && is_rebase_conflict(checks) => {
+            drop_conflicted_merge(tx, task, reason, checks_json, stamp)
+        }
         TaskStatus::Wip => {
             tx.execute(
                 "UPDATE tasks SET status = 'blocked', verification = ?2, checks_json = ?3,
@@ -1504,10 +1617,31 @@ fn report_blocked(
                  WHERE id = ?1",
                 rusqlite::params![task.id, reason, checks_json, stamp],
             )?;
+            // A rework that stopped stops the work it was for: the branch is
+            // waiting for a person, and the target is where that person looks.
+            // Only a target still parked for this rework moves; one a person
+            // already called off or moved on keeps that decision.
+            if task.kind == TaskKind::Rework
+                && let Some(target_id) = task.rework_target_task_id.as_deref()
+            {
+                tx.execute(
+                    "UPDATE tasks SET status = 'blocked', verification = ?2, updated_at = ?3
+                     WHERE id = ?1 AND status = 'wip' AND claim_id IS NULL",
+                    rusqlite::params![target_id, reason, stamp],
+                )?;
+            }
             read(tx, &task.id)
         }
         // A worker that did not hear the answer sends the same report again.
         TaskStatus::Blocked if task.verification.as_deref() == Some(reason) => Ok(task.clone()),
+        // A conflicted merge was dropped by its own report; its repeat finds it
+        // there, carrying the same reason.
+        TaskStatus::Dropped
+            if task.kind == TaskKind::InstantMerge
+                && task.verification.as_deref() == Some(reason) =>
+        {
+            Ok(task.clone())
+        }
         TaskStatus::Blocked => Err(Error::Invalid(format!(
             "task {} is already blocked for another reason: {}",
             task.id,
@@ -1598,6 +1732,222 @@ fn has_open_attempt(
         [target_id],
         |row| row.get(0),
     )?)
+}
+
+/// Whether a blocked merge report says the rebase itself failed, as opposed to
+/// a check that ran red afterwards. The worker names the step in its checks —
+/// `git rebase` with a non-zero exit — and that name, not the free text of the
+/// reason, is what turns the failure into rework: a red test is still a
+/// judgement for a person, but a conflict is a job for the branch's author.
+fn is_rebase_conflict(checks: &[Check]) -> bool {
+    checks
+        .iter()
+        .any(|check| check.name.trim() == "git rebase" && check.exit_code != 0)
+}
+
+/// End a merge whose rebase conflicted, and issue the rework that resolves it.
+///
+/// The merge is `dropped`, not `blocked`: `blocked` would hold the product's
+/// train for a person, and the train has nothing to wait for — the branch is
+/// going back to its author, and the merge of the rebased commit is a fresh
+/// attempt (`merge:<target>~2`) issued when the rework is done. The reason and
+/// checks stay on the dropped row, the way they would on a blocked one.
+fn drop_conflicted_merge(
+    tx: &Connection,
+    merge: &Task,
+    reason: &str,
+    checks_json: Option<&str>,
+    stamp: &str,
+) -> Result<Task, Error> {
+    let Some(target_id) = merge.merge_target_task_id.as_deref() else {
+        return Err(Error::Invalid(format!(
+            "merge task {} has no target to rework",
+            merge.id
+        )));
+    };
+    // The same two questions a landing asks, because the answer is a write on
+    // the target either way: is it still the approved work this merge was
+    // issued for, on the commit the merge read? A target a person called off
+    // or moved on meanwhile is not sent back to its branch over that decision.
+    let target = read(tx, target_id)?;
+    if target.status != TaskStatus::Approved {
+        return Err(Error::Invalid(format!(
+            "task {target_id} is {}, so merge task {} cannot send it back for rework",
+            target.status.as_str(),
+            merge.id
+        )));
+    }
+    if target.commit_sha != merge.commit_sha {
+        return Err(Error::Precondition {
+            code: "merge_subject_changed",
+            message: format!(
+                "task {target_id} is on commit {}, and merge task {} was issued for {}; \
+                 the conflict belongs to a commit the work has left behind",
+                target.commit_sha.as_deref().unwrap_or("<no commit>"),
+                merge.id,
+                merge.commit_sha.as_deref().unwrap_or("<no commit>")
+            ),
+        });
+    }
+    tx.execute(
+        "UPDATE tasks SET status = 'dropped', verification = ?2, checks_json = ?3,
+                updated_at = ?4
+         WHERE id = ?1",
+        rusqlite::params![merge.id, reason, checks_json, stamp],
+    )?;
+    let body = format!(
+        "merge {} could not rebase the branch onto the main line. Rebase it, resolve \
+         the conflicts, run the checks, and report the rebased commit; the merge is \
+         issued again for that commit.\n\nmerge subject: {}\n\n{reason}",
+        merge.id,
+        merge.commit_sha.as_deref().unwrap_or("<no commit>")
+    );
+    park_for_rework(tx, target_id, stamp)?;
+    ensure_rework(tx, target_id, ReworkReason::MergeConflict, &body, stamp)?;
+    read(tx, &merge.id)
+}
+
+/// Take `target_id` out of every queue while a rework works on its branch.
+///
+/// `wip` with no lease: the work is in progress again, which is what the
+/// status says, and a claim never takes a `wip` row whose lease is absent,
+/// so the target cannot be handed to a second worker while the rework holds
+/// the branch. `done` and `approved` are both left behind, so neither a
+/// review nor a merge can be issued for the commit the rework is replacing;
+/// the rework's own report puts the target back in front of the step it
+/// returns to.
+fn park_for_rework(tx: &Connection, target_id: &str, stamp: &str) -> Result<(), Error> {
+    tx.execute(
+        "UPDATE tasks SET status = 'wip', claimed_by = NULL, claim_id = NULL,
+                claimed_at = NULL, claim_expires_at = NULL, updated_at = ?2
+         WHERE id = ?1",
+        rusqlite::params![target_id, stamp],
+    )?;
+    Ok(())
+}
+
+/// Finish the rework `rework` reported: put `commit_sha` on its target and
+/// hand the target back to the step the rework was issued from.
+///
+/// Sent back by a review, the reworked commit is `done` again and read again
+/// (`review:<target>~2`); sent back by a conflicted merge, the rebased commit
+/// carries the approval the merge was issued under, so it is `approved` again
+/// and merged again (`merge:<target>~2`) without another reading. `done_at`
+/// keeps its first value either way — a second pass is not a second finish.
+fn finish_rework(
+    tx: &Connection,
+    rework: &Task,
+    commit_sha: &str,
+    stamp: &str,
+) -> Result<(), Error> {
+    let (Some(target_id), Some(reason)) = (
+        rework.rework_target_task_id.as_deref(),
+        rework.rework_reason,
+    ) else {
+        return Err(Error::Invalid(format!(
+            "rework task {} has no target to hand back",
+            rework.id
+        )));
+    };
+    // Parked (`wip`, no lease), or `blocked` because this rework once stopped
+    // and was handed back to the queue by hand: either is the target waiting
+    // for this very rework. Anything else — cancelled, dropped, moved on by a
+    // person who called the rework off first — is not, and the report is
+    // refused rather than writing over that decision.
+    let target = read(tx, target_id)?;
+    if !matches!(target.status, TaskStatus::Wip | TaskStatus::Blocked) {
+        return Err(Error::Invalid(format!(
+            "task {target_id} is {}, so rework task {} cannot hand it back",
+            target.status.as_str(),
+            rework.id
+        )));
+    }
+    let returns_to = match reason {
+        ReworkReason::Review => TaskStatus::Done,
+        ReworkReason::MergeConflict => TaskStatus::Approved,
+    };
+    tx.execute(
+        "UPDATE tasks SET status = ?2, commit_sha = ?3, updated_at = ?4,
+                done_at = COALESCE(done_at, ?4)
+         WHERE id = ?1",
+        rusqlite::params![target_id, returns_to.as_str(), commit_sha, stamp],
+    )?;
+    match reason {
+        ReworkReason::Review => ensure_review(tx, target_id, stamp),
+        ReworkReason::MergeConflict => ensure_merge(tx, target_id, stamp),
+    }
+}
+
+/// See to it that `target_id` has a rework on its branch, issuing one if it
+/// has none. A rework already open is already the answer: the findings that
+/// arrive meanwhile are read from the target's `latest_review` and the merge's
+/// own row, and a second worker on the same branch would only collide.
+fn ensure_rework(
+    tx: &Connection,
+    target_id: &str,
+    reason: ReworkReason,
+    body: &str,
+    stamp: &str,
+) -> Result<(), Error> {
+    if has_open_attempt(tx, "rework_target_task_id", REVIEW_IS_OVER, target_id)? {
+        return Ok(());
+    }
+    issue_rework_in_tx(tx, target_id, reason, body, stamp)?;
+    Ok(())
+}
+
+/// The id of the rework of `target_id`. Derived, like a review's, so the two
+/// read as a pair; a second round is `rework:<target>~2`.
+#[must_use]
+pub fn rework_task_id(target_id: &str) -> String {
+    format!("rework:{target_id}")
+}
+
+/// Issue the `rework` task that puts another commit on `target_id`'s branch.
+///
+/// The rework inherits the target's product, branch, priority and release
+/// level, and carries the reason and the findings it is to answer in its body.
+/// It is claimed like ordinary work — `kinds: ["rework"]`, or no `kinds` at
+/// all — and finished with a `done` report naming the commit it added.
+fn issue_rework_in_tx(
+    tx: &Connection,
+    target_id: &str,
+    reason: ReworkReason,
+    body: &str,
+    stamp: &str,
+) -> Result<Task, Error> {
+    let target = read(tx, target_id)?;
+    if target.kind != TaskKind::Normal {
+        return Err(Error::Invalid(format!(
+            "task {target_id} is {}, and only normal work is reworked",
+            target.kind.as_str()
+        )));
+    }
+    let Some(branch) = &target.branch else {
+        return Err(Error::Invalid(format!(
+            "task {target_id} has no branch to rework"
+        )));
+    };
+    let (id, _attempt) = free_attempt_id(tx, &rework_task_id(target_id))?;
+    tx.execute(
+        "INSERT INTO tasks (id, title, body, status, kind, product_id, priority, branch,
+                            rework_target_task_id, rework_reason, release_level,
+                            created_at, updated_at)
+         VALUES (?1, ?2, ?3, 'ready', 'rework', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+        rusqlite::params![
+            id,
+            format!("rework {target_id}: {}", target.title),
+            body,
+            target.product_id,
+            target.priority,
+            branch,
+            target_id,
+            reason.as_str(),
+            target.release_level.as_str(),
+            stamp,
+        ],
+    )?;
+    read(tx, &id)
 }
 
 /// Nothing reaches the main line without evidence: a merge report must carry
@@ -1876,8 +2226,9 @@ fn release_subtasks_of(
     tx.execute(
         &format!(
             "UPDATE tasks SET status = 'released', release_tag = ?2, updated_at = ?3
-             WHERE status = 'done' AND kind IN ('review', 'instant:merge')
-               AND COALESCE(review_target_task_id, merge_target_task_id) IN (
+             WHERE status = 'done' AND kind IN ('review', 'instant:merge', 'rework')
+               AND COALESCE(review_target_task_id, merge_target_task_id,
+                            rework_target_task_id) IN (
                  SELECT id FROM tasks WHERE kind = 'normal' AND status = 'released'
                    AND {targets_where}
                )"
@@ -2250,16 +2601,25 @@ pub fn review_report(
                      WHERE id = ?1",
                     rusqlite::params![review.id, verdict.as_str(), findings, stamp],
                 )?;
-                tx.execute(
-                    "UPDATE tasks SET status = ?2, updated_at = ?3 WHERE id = ?1",
-                    rusqlite::params![target_id, verdict_moves_target_to(verdict), stamp],
-                )?;
-                // An approval is the last judgement before the main line, so
-                // the merge it earns is issued here rather than waited for: a
-                // human pressing "merge" afterwards would be pressing a button
-                // whose answer the review already gave.
-                if verdict == ReviewVerdict::Approve {
-                    ensure_merge(tx, &target_id, &stamp)?;
+                match verdict {
+                    // An approval is the last judgement before the main line,
+                    // so the merge it earns is issued here rather than waited
+                    // for: a human pressing "merge" afterwards would be pressing
+                    // a button whose answer the review already gave.
+                    ReviewVerdict::Approve => {
+                        tx.execute(
+                            "UPDATE tasks SET status = 'approved', updated_at = ?2 WHERE id = ?1",
+                            rusqlite::params![target_id, stamp],
+                        )?;
+                        ensure_merge(tx, &target_id, &stamp)?;
+                    }
+                    // Changes asked for are a job on the branch, not a second
+                    // first attempt: the target leaves every queue and the
+                    // findings go to whoever picks the rework up.
+                    ReviewVerdict::RequestChanges => {
+                        park_for_rework(tx, &target_id, &stamp)?;
+                        ensure_rework(tx, &target_id, ReworkReason::Review, findings, &stamp)?;
+                    }
                 }
                 read(tx, &review.id)
             }
@@ -2287,20 +2647,6 @@ pub fn review_report(
             ))),
         }
     })
-}
-
-/// Where a verdict leaves the reviewed task.
-///
-/// `request_changes` is the one way back out of `done`, and it deliberately
-/// skips the catalogue gate that guards an ordinary promotion to `ready`: this
-/// is the continuation of work already admitted, not a new admission, and a
-/// product whose clone left the tree would otherwise leave the task hanging —
-/// impossible to approve and impossible to hand back.
-fn verdict_moves_target_to(verdict: ReviewVerdict) -> &'static str {
-    match verdict {
-        ReviewVerdict::Approve => TaskStatus::Approved.as_str(),
-        ReviewVerdict::RequestChanges => TaskStatus::Ready.as_str(),
-    }
 }
 
 /// Whether the world is still the one this review was issued for. Each refusal
@@ -2510,7 +2856,13 @@ fn from_row(row: &Row<'_>) -> Result<Task, Error> {
         release_task_id: row.get(22)?,
         depends_on: row.get(23)?,
         done_at: row.get(24)?,
+        rework_target_task_id: row.get(25)?,
+        rework_reason: decode_reason(row.get::<_, Option<String>>(26)?.as_deref())?,
     })
+}
+
+fn decode_reason(raw: Option<&str>) -> Result<Option<ReworkReason>, Error> {
+    raw.map(ReworkReason::parse).transpose()
 }
 
 fn decode_verdict(raw: Option<&str>) -> Result<Option<ReviewVerdict>, Error> {
@@ -2529,12 +2881,13 @@ mod tests {
     use time::macros::datetime;
 
     use super::{
-        ALL_STATUSES, Check, NewTask, Releasable, ReleaseLevel, ReportOutcome, ReviewVerdict, Task,
-        TaskKind, TaskPatch, TaskStatus, available_transitions, can_transition, claim, create,
-        dependency_status, get, issue_merge, issue_release, issue_review, latest_review, list,
-        list_active, list_by_status, list_done, merge_task_id, mergeable, pending_merges,
-        pending_releases, pending_reviews, releasable, release_claim, release_task_id, report,
-        review_report, review_task_id, set_status, set_status_by_operator, unreviewed, update,
+        ALL_STATUSES, Check, NewTask, Releasable, ReleaseLevel, ReportOutcome, ReviewVerdict,
+        ReworkReason, Task, TaskKind, TaskPatch, TaskStatus, available_transitions, can_transition,
+        claim, create, dependency_status, get, issue_merge, issue_release, issue_review,
+        latest_review, list, list_active, list_by_status, list_done, merge_task_id, mergeable,
+        offered_transitions, pending_merges, pending_releases, pending_reviews, releasable,
+        release_claim, release_task_id, report, review_report, review_task_id, rework_task_id,
+        set_status, set_status_by_operator, unreviewed, update,
     };
     use crate::clock::format_z;
     use crate::db::Db;
@@ -3748,12 +4101,12 @@ mod tests {
             later(),
         )
         .unwrap();
-        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Ready);
+        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Wip);
         // Second round: the worker reports a new commit, a second review approves.
-        let leased = claim(&db, "worker", &[TaskKind::Normal], later(), 60)
+        let leased = claim(&db, "worker", &[TaskKind::Rework], later(), 60)
             .unwrap()
-            .expect("the work handed back is claimable again");
-        assert_eq!(leased.id, "t-1");
+            .expect("the rework of the work handed back is claimable");
+        assert_eq!(leased.rework_target_task_id.as_deref(), Some("t-1"));
         report(
             &db,
             &leased.claim_id.expect("claim_id"),
@@ -4293,8 +4646,8 @@ mod tests {
         assert_eq!(outcome.verdict, ReviewVerdict::RequestChanges);
         assert_eq!(
             get(&db, "t-1").unwrap().status,
-            TaskStatus::Ready,
-            "the verdict the parent lives by stands"
+            TaskStatus::Wip,
+            "the verdict the parent lives by stands: it is being reworked"
         );
         assert!(
             claim(&db, "sol", &[TaskKind::Review], later(), 60)
@@ -4326,10 +4679,10 @@ mod tests {
 
         // The rework is reviewed, and that review is issued while the first
         // attempt sits frozen.
-        let leased = claim(&db, "worker", &[TaskKind::Normal], later(), 60)
+        let leased = claim(&db, "worker", &[TaskKind::Rework], later(), 60)
             .unwrap()
             .unwrap();
-        assert_eq!(leased.id, "t-1");
+        assert_eq!(leased.rework_target_task_id.as_deref(), Some("t-1"));
         report(
             &db,
             &leased.claim_id.expect("claim_id"),
@@ -4510,7 +4863,7 @@ mod tests {
                 later(),
             )
             .unwrap();
-            let leased = claim(&db, "worker", &[TaskKind::Normal], later(), 60)
+            let leased = claim(&db, "worker", &[TaskKind::Rework], later(), 60)
                 .unwrap()
                 .unwrap();
             report(
@@ -4639,8 +4992,10 @@ mod tests {
         assert_eq!(get(&db, &first_id).unwrap().status, TaskStatus::Done);
 
         // The rework lands a new commit, and the next review is issued for it.
-        let leased = claim(&db, "worker", &[], later(), 60).unwrap().unwrap();
-        assert_eq!(leased.id, "t-1");
+        let leased = claim(&db, "worker", &[TaskKind::Rework], later(), 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(leased.rework_target_task_id.as_deref(), Some("t-1"));
         report(
             &db,
             &leased.claim_id.expect("claim_id"),
@@ -4841,7 +5196,7 @@ mod tests {
     /// itself is `done` and keeps the findings, and the parent goes back to the
     /// queue.
     #[test]
-    fn requesting_changes_returns_the_parent_to_the_queue_with_the_findings() {
+    fn requesting_changes_parks_the_parent_and_issues_a_rework_with_the_findings() {
         let db = db_with_product();
         create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
         work_to_done(&db, "t-1");
@@ -4871,8 +5226,8 @@ mod tests {
         let parent = get(&db, "t-1").unwrap();
         assert_eq!(
             parent.status,
-            TaskStatus::Ready,
-            "the work goes back to the queue"
+            TaskStatus::Wip,
+            "the work is in progress again, on its branch, through a rework"
         );
         assert_eq!(
             parent.commit_sha.as_deref(),
@@ -4931,7 +5286,7 @@ mod tests {
             later(),
         )
         .expect("a review must always be able to hand the work back");
-        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Ready);
+        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Wip);
     }
 
     /// Nothing reaches the merge queue on a report alone: the reviewer's verdict
@@ -5170,12 +5525,12 @@ mod tests {
             later(),
         )
         .unwrap();
-        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Ready);
+        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Wip);
 
-        let leased = claim(&db, "worker", &[TaskKind::Normal], later(), 60)
+        let leased = claim(&db, "worker", &[TaskKind::Rework], later(), 60)
             .unwrap()
             .unwrap();
-        assert_eq!(leased.id, "t-1");
+        assert_eq!(leased.rework_target_task_id.as_deref(), Some("t-1"));
         report(
             &db,
             &leased.claim_id.expect("claim_id"),
@@ -5350,7 +5705,7 @@ mod tests {
             merges_of(&db, "t-1").is_empty(),
             "work sent back has nothing to land"
         );
-        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Ready);
+        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Wip);
     }
 
     /// Register a product so tasks of a second product have somewhere to belong.
@@ -5451,8 +5806,10 @@ mod tests {
         );
     }
 
-    /// Block the head of a train the way a worker does, and answer with the row
-    /// as the report left it.
+    /// Block the head of a train the way a worker does — with a check that ran
+    /// red after the rebase, which is a judgement for a person (a conflict in
+    /// the rebase itself is rework, see `a_conflicted_merge_is_dropped…`) —
+    /// and answer with the row as the report left it.
     fn block_merge(db: &Db, id: &str, commit_sha: &str, reason: &str) -> Task {
         let claim_id = get(db, id).unwrap().claim_id.expect("claim_id");
         let blocked = report(
@@ -5461,8 +5818,8 @@ mod tests {
             commit_sha,
             reason,
             &[Check {
-                name: "git rebase".into(),
-                exit_code: 1,
+                name: "cargo test".into(),
+                exit_code: 101,
             }],
             ReportOutcome::Blocked,
             None,
@@ -6415,7 +6772,7 @@ mod tests {
         assert_eq!(outcome.subject_commit_sha.as_deref(), Some("abc1234"));
 
         // The rework is reviewed again, and the newest verdict is the answer.
-        let leased = claim(&db, "worker", &[TaskKind::Normal], later(), 60)
+        let leased = claim(&db, "worker", &[TaskKind::Rework], later(), 60)
             .unwrap()
             .unwrap();
         report(
@@ -6868,5 +7225,379 @@ mod tests {
         )
         .unwrap();
         assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Approved);
+    }
+
+    // --- rework ---
+
+    /// The rework a verdict issued, read back.
+    fn issued_rework(db: &Db, target_id: &str) -> Task {
+        get(db, &rework_task_id(target_id)).expect("a rework must have been issued")
+    }
+
+    fn claim_rework(db: &Db, at: time::OffsetDateTime) -> Task {
+        claim(db, "fixer", &[TaskKind::Rework], at, 60)
+            .unwrap()
+            .expect("a rework must be waiting to be claimed")
+    }
+
+    fn send_back(db: &Db, target_id: &str, subject: &str, findings: &str) {
+        let (_, review_claim) = claim_review(db, target_id);
+        review_report(
+            db,
+            &review_claim,
+            subject,
+            ReviewVerdict::RequestChanges,
+            findings,
+            later(),
+        )
+        .unwrap();
+    }
+
+    /// `request_changes` no longer hands the work back to `ready`: the target
+    /// leaves every queue and a `rework` carrying the findings is issued on its
+    /// branch, claimable as its own kind and by a loop that asks for anything.
+    #[test]
+    fn request_changes_issues_a_rework_and_parks_the_target() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 7), now()).unwrap();
+        work_to_done(&db, "t-1");
+        let finished = get(&db, "t-1").unwrap();
+
+        send_back(&db, "t-1", "abc1234", "the helper is untested");
+
+        let target = get(&db, "t-1").unwrap();
+        assert_eq!(
+            target.status,
+            TaskStatus::Wip,
+            "in progress again, not ready"
+        );
+        assert_eq!(
+            target.claim_id, None,
+            "no lease: the rework holds the branch"
+        );
+        assert_eq!(target.done_at, finished.done_at);
+        let rework = issued_rework(&db, "t-1");
+        assert_eq!(rework.kind, TaskKind::Rework);
+        assert_eq!(rework.status, TaskStatus::Ready);
+        assert_eq!(rework.rework_target_task_id.as_deref(), Some("t-1"));
+        assert_eq!(rework.rework_reason, Some(ReworkReason::Review));
+        assert_eq!(rework.branch, target.branch);
+        assert_eq!(rework.priority, 7);
+        assert_eq!(rework.product_id, target.product_id);
+        assert_eq!(rework.body, "the helper is untested");
+
+        assert!(
+            claim(&db, "worker", &[TaskKind::Normal], later(), 60)
+                .unwrap()
+                .is_none(),
+            "the target is not handed to a second worker"
+        );
+        assert!(matches!(
+            set_status_by_operator(&db, "t-1", TaskStatus::Ready, later()),
+            Err(Error::Precondition {
+                code: "rework_in_flight",
+                ..
+            })
+        ));
+        assert!(matches!(
+            set_status_by_operator(&db, "rework:t-1", TaskStatus::Done, later()),
+            Err(Error::Invalid(_))
+        ));
+        assert_eq!(
+            offered_transitions(&db, &target).unwrap(),
+            [
+                TaskStatus::Blocked,
+                TaskStatus::Cancelled,
+                TaskStatus::Dropped
+            ],
+            "a card offers no press the status route refuses"
+        );
+        let leased = claim(&db, "anyone", &[], later(), 60)
+            .unwrap()
+            .expect("a loop that asks for anything is handed the rework");
+        assert_eq!(leased.id, "rework:t-1");
+    }
+
+    /// A rework that stopped and was handed back to the queue by hand still
+    /// finishes: its target waited in `blocked`, and the report moves it on.
+    #[test]
+    fn a_blocked_rework_handed_back_by_hand_still_hands_its_target_on() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        work_to_done(&db, "t-1");
+        send_back(&db, "t-1", "abc1234", "fix it");
+        let rework = claim_rework(&db, later());
+        report(
+            &db,
+            rework.claim_id.as_deref().unwrap(),
+            "abc1234",
+            "needs a decision",
+            &[],
+            ReportOutcome::Blocked,
+            None,
+            later(),
+        )
+        .unwrap();
+        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Blocked);
+        assert!(
+            matches!(
+                set_status_by_operator(&db, "t-1", TaskStatus::Ready, later()),
+                Err(Error::Precondition {
+                    code: "rework_in_flight",
+                    ..
+                })
+            ),
+            "the target is not handed to a second worker over its rework"
+        );
+
+        set_status_by_operator(&db, "rework:t-1", TaskStatus::Ready, later()).unwrap();
+        let rework = claim_rework(&db, even_later());
+        report(
+            &db,
+            rework.claim_id.as_deref().unwrap(),
+            "def5678",
+            "decided, cargo test",
+            &[],
+            ReportOutcome::Done,
+            None,
+            even_later(),
+        )
+        .unwrap();
+        let target = get(&db, "t-1").unwrap();
+        assert_eq!(target.status, TaskStatus::Done);
+        assert_eq!(target.commit_sha.as_deref(), Some("def5678"));
+        assert_eq!(get(&db, "review:t-1~2").unwrap().status, TaskStatus::Ready);
+    }
+
+    /// A target a person called off is not written over by the reports of the
+    /// attempts that were still running for it: a conflict report on a merge
+    /// whose target left `approved` is refused, and a blocked rework leaves a
+    /// cancelled target cancelled.
+    #[test]
+    fn reports_do_not_write_over_a_target_a_person_moved() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        work_to_approved(&db, "t-1");
+        let merge_id = claim_merge(&db, "builder", later()).unwrap();
+        let merge = get(&db, &merge_id).unwrap().claim_id.unwrap();
+        set_status_by_operator(&db, "t-1", TaskStatus::Blocked, later()).unwrap();
+        let refused = report(
+            &db,
+            &merge,
+            "abc1234",
+            "rebase conflicted",
+            &[Check {
+                name: "git rebase".into(),
+                exit_code: 1,
+            }],
+            ReportOutcome::Blocked,
+            None,
+            later(),
+        )
+        .unwrap_err();
+        assert!(matches!(refused, Error::Invalid(_)), "{refused:?}");
+        assert_eq!(get(&db, &merge_id).unwrap().status, TaskStatus::Wip);
+        assert!(get(&db, "rework:t-1").is_err(), "nothing was issued");
+
+        create(&db, &new_task("t-2", TaskKind::Normal, 0), now()).unwrap();
+        work_to_done(&db, "t-2");
+        send_back(&db, "t-2", "abc1234", "fix it");
+        let rework = claim_rework(&db, later());
+        set_status_by_operator(&db, "t-2", TaskStatus::Cancelled, later()).unwrap();
+        report(
+            &db,
+            rework.claim_id.as_deref().unwrap(),
+            "abc1234",
+            "stuck",
+            &[],
+            ReportOutcome::Blocked,
+            None,
+            even_later(),
+        )
+        .unwrap();
+        assert_eq!(get(&db, "rework:t-2").unwrap().status, TaskStatus::Blocked);
+        assert_eq!(get(&db, "t-2").unwrap().status, TaskStatus::Cancelled);
+    }
+
+    /// A rework sent back by a review is finished like ordinary work; its
+    /// commit becomes the target's, the target is `done` again with its first
+    /// `done_at`, and the next review reads the new commit.
+    #[test]
+    fn a_reviewed_rework_hands_the_new_commit_to_the_next_review() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        work_to_done(&db, "t-1");
+        let finished = get(&db, "t-1").unwrap();
+        send_back(&db, "t-1", "abc1234", "fix it");
+        let rework = claim_rework(&db, later());
+
+        report(
+            &db,
+            rework.claim_id.as_deref().unwrap(),
+            "def5678",
+            "cargo test",
+            &[],
+            ReportOutcome::Done,
+            None,
+            even_later(),
+        )
+        .unwrap();
+
+        let target = get(&db, "t-1").unwrap();
+        assert_eq!(target.status, TaskStatus::Done);
+        assert_eq!(target.commit_sha.as_deref(), Some("def5678"));
+        assert_eq!(
+            target.done_at, finished.done_at,
+            "a second pass is not a second finish"
+        );
+        assert_eq!(get(&db, "rework:t-1").unwrap().status, TaskStatus::Done);
+        let next = get(&db, "review:t-1~2").expect("the next review is issued");
+        assert_eq!(next.status, TaskStatus::Ready);
+        assert_eq!(next.commit_sha.as_deref(), Some("def5678"));
+
+        // Sent back again, the round is numbered like a review's.
+        send_back(&db, "t-1", "def5678", "still wrong");
+        assert_eq!(issued_rework(&db, "t-1").status, TaskStatus::Done);
+        assert_eq!(get(&db, "rework:t-1~2").unwrap().status, TaskStatus::Ready);
+    }
+
+    /// A merge whose rebase conflicted is dropped, not blocked: the product's
+    /// train moves on, the branch goes back to its author as a rework, and the
+    /// rebased commit is merged again under the approval it already has —
+    /// without another review.
+    #[test]
+    fn a_conflicted_merge_is_dropped_and_reworked_then_merged_again() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        create(&db, &new_task("t-2", TaskKind::Normal, 0), now()).unwrap();
+        work_to_approved(&db, "t-1");
+        work_to_approved(&db, "t-2");
+        let merge_id = claim_merge(&db, "builder", later()).expect("a merge is waiting");
+        let merge = get(&db, &merge_id).unwrap().claim_id.unwrap();
+        let conflict = [Check {
+            name: "git rebase".into(),
+            exit_code: 1,
+        }];
+
+        let dropped = report(
+            &db,
+            &merge,
+            "abc1234",
+            "rebase onto the main line conflicted: src/task.rs",
+            &conflict,
+            ReportOutcome::Blocked,
+            None,
+            later(),
+        )
+        .unwrap();
+
+        assert_eq!(dropped.status, TaskStatus::Dropped);
+        assert_eq!(dropped.checks, conflict.to_vec());
+        let target_id = dropped.merge_target_task_id.clone().unwrap();
+        let target = get(&db, &target_id).unwrap();
+        assert_eq!(target.status, TaskStatus::Wip);
+        let rework = issued_rework(&db, &target_id);
+        assert_eq!(rework.rework_reason, Some(ReworkReason::MergeConflict));
+        assert!(rework.body.contains("src/task.rs"), "{}", rework.body);
+        assert!(rework.body.contains("abc1234"), "{}", rework.body);
+        // The same report again finds the merge dropped and issues nothing new.
+        report(
+            &db,
+            &merge,
+            "abc1234",
+            "rebase onto the main line conflicted: src/task.rs",
+            &conflict,
+            ReportOutcome::Blocked,
+            None,
+            later(),
+        )
+        .unwrap();
+        assert!(get(&db, &format!("rework:{target_id}~2")).is_err());
+        // The other approved task's merge is claimable: no train is stopped.
+        let other = claim_merge(&db, "builder", even_later()).expect("the train moves on");
+        assert_ne!(other, merge_id);
+
+        let rework = claim_rework(&db, even_later());
+        report(
+            &db,
+            rework.claim_id.as_deref().unwrap(),
+            "eee1111",
+            "rebased, cargo test",
+            &[],
+            ReportOutcome::Done,
+            None,
+            even_later(),
+        )
+        .unwrap();
+        let target = get(&db, &target_id).unwrap();
+        assert_eq!(target.status, TaskStatus::Approved);
+        assert_eq!(target.commit_sha.as_deref(), Some("eee1111"));
+        let again = get(&db, &format!("merge:{target_id}~2")).expect("the merge is issued again");
+        assert_eq!(again.status, TaskStatus::Ready);
+        assert_eq!(again.commit_sha.as_deref(), Some("eee1111"));
+        assert!(
+            get(&db, &format!("review:{target_id}~2")).is_err(),
+            "a rebase is not reviewed again"
+        );
+    }
+
+    /// A merge blocked by a red check is still a judgement for a person: it
+    /// stops the train as before and issues nothing.
+    #[test]
+    fn a_merge_blocked_by_a_red_check_is_not_reworked() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        work_to_approved(&db, "t-1");
+        let merge = get(&db, &claim_merge(&db, "builder", later()).unwrap())
+            .unwrap()
+            .claim_id
+            .unwrap();
+        let red = [Check {
+            name: "cargo test".into(),
+            exit_code: 101,
+        }];
+        let blocked = report(
+            &db,
+            &merge,
+            "abc1234",
+            "cargo test failed",
+            &red,
+            ReportOutcome::Blocked,
+            None,
+            later(),
+        )
+        .unwrap();
+        assert_eq!(blocked.status, TaskStatus::Blocked);
+        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Approved);
+        assert!(get(&db, "rework:t-1").is_err());
+    }
+
+    /// A rework that stops stops its target with the same reason: the branch is
+    /// waiting for a person, and the target is where that person looks.
+    #[test]
+    fn a_blocked_rework_blocks_its_target_with_the_reason() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        work_to_done(&db, "t-1");
+        send_back(&db, "t-1", "abc1234", "fix it");
+        let rework = claim_rework(&db, later());
+        report(
+            &db,
+            rework.claim_id.as_deref().unwrap(),
+            "abc1234",
+            "needs a decision on the schema",
+            &[],
+            ReportOutcome::Blocked,
+            None,
+            even_later(),
+        )
+        .unwrap();
+        assert_eq!(get(&db, "rework:t-1").unwrap().status, TaskStatus::Blocked);
+        let target = get(&db, "t-1").unwrap();
+        assert_eq!(target.status, TaskStatus::Blocked);
+        assert_eq!(
+            target.verification.as_deref(),
+            Some("needs a decision on the schema")
+        );
     }
 }

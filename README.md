@@ -163,7 +163,9 @@ human can see which task this run took. Going the other way, the report hands
 back `commit_sha`, the `verification` a human reads, and the `checks` that ran.
 The other kinds answer elsewhere and are deliberately not repeated here: a
 review is claimed with `{"kinds": ["review"]}` and answered with a verdict on
-`/worker/review-report`, and a merge with `{"kinds": ["instant:merge"]}`; both
+`/worker/review-report`, a rework with `{"kinds": ["rework"]}` and finished on
+this same route with the commit it added, and a merge with
+`{"kinds": ["instant:merge"]}`; all three
 bodies are in
 [Reviewing, merging and releasing](#reviewing-merging-and-releasing).
 
@@ -418,9 +420,11 @@ review tasks alone — and answers on the review's own route:
 
 Both verdicts are successes: a review that asks for changes did its job. No
 checks are demanded — a reviewer's evidence is what they wrote, and it is kept
-on the review either way. `request_changes` hands the task back to `ready` in
-the same transaction, and the worker reads why on its own card, under
-`latest_review`. `approve` moves the task to `approved` — the one way that
+on the review either way. `request_changes` does **not** hand the task back to
+`ready`: the same transaction issues a `rework` task on the work's branch (see
+[Rework](#rework) below), and the target waits in `wip` with no lease while
+that rework runs. The findings are readable on the rework's `body` and, as
+before, on the target's own card under `latest_review`. `approve` moves the task to `approved` — the one way that
 status is reached — after confirming, inside that transaction, that the task is
 still waiting in `done` and still on the commit the review was issued for. An
 approval that arrives after the work moved on is refused with code
@@ -448,6 +452,44 @@ review pushed back there would keep the next review of that task from being
 issued, and from `blocked` it could be handed back to the queue, claimed, and
 answered a second time over the verdict already given. A finished attempt never
 stands in the way: the next review of the reworked commit is issued as usual.
+
+### Rework
+
+A `rework` task is another pass over finished work, on the branch it already
+has. The control plane issues it in two places, and nobody files one by hand:
+
+- a review that answers `request_changes` issues `rework:<id>` with
+  `rework_reason: "review"` and the findings as its `body`;
+- a merge whose **rebase conflicted** issues `rework:<id>` with
+  `rework_reason: "merge-conflict"` and the worker's report of the conflict as
+  its `body` (see [When a merge cannot be integrated](#when-a-merge-cannot-be-integrated)).
+
+The rework inherits the target's product, branch, priority and release level,
+names the target in `rework_target_task_id`, and starts in `ready`. A second
+round is `rework:<id>~2`, `~3`, and so on, like a review's. While a rework is
+open its target is `wip` **with the lease columns empty**: that is what keeps
+the target out of every queue — a claim never takes a `wip` row without a
+lease, a review is only issued for `done` work and a merge only for `approved`
+work, and pressing `ready` or `done` on the target by hand is refused with 409
+and code `rework_in_flight` until the rework is cancelled or dropped.
+
+A fixer claims it like ordinary work — `POST /worker/claim` with
+`{"kinds": ["rework"]}`, or with no `kinds` at all, which takes every kind — and
+finishes it on `POST /worker/report` with the commit it added:
+
+```jsonc
+{ "claim_id": "...", "commit_sha": "def5678", "verification": "cargo test" }
+```
+
+What the `done` leads to follows from the reason, in the same transaction. Sent
+back by a review, the new commit becomes the target's, the target is `done`
+again (its `done_at` keeps its first value) and the next review is issued for
+the new commit. Sent back by a conflicted merge, the rebased commit becomes the
+target's, the target is `approved` again — a rebase is not a second reading —
+and the next merge is issued for it. A `blocked` report on a rework moves the
+rework and its target to `blocked` with the same reason, which is the one case
+that does wait for a person. A pressed `done` on a rework is refused, like a
+pressed `done` on a review: only a report names the commit.
 
 Only the control plane writes an `instant:merge` task, and that is an invariant
 of the domain rather than a rule of one transport: task registration files
@@ -520,20 +562,32 @@ away — it is a result to keep. The worker says so on the same route, with
 }
 ```
 
-That is a **successful report of a failure**: it answers 200. The merge task
-moves to `blocked`, `verification` keeps the reason and `checks` keeps the
-evidence, and the target does not move — nothing landed, so nothing advances to
-`merged`. The check gate above applies to success only; a worker saying it was
-blocked is reporting the red check, not claiming it as a pass. `outcome` defaults
-to `"done"`, so a worker written before this field existed keeps working
-unchanged. Re-sending the identical report is idempotent and writes nothing new;
-sending a *different* reason for a task that is already blocked answers 400.
+That is a **successful report of a failure**: it answers 200. What it does next
+depends on *which* step failed, and the worker says which through the name of
+the red check:
 
-A blocked merge stops its product's train, and that is the intended behaviour:
-everything behind it would be rebasing onto a main line that is still waiting.
-`GET /api/control` carries the reason on the blocked merge's row in
-`pending_merges`, under `verification`, so a screen can name the jam from that
-one payload.
+- **The rebase itself conflicted** — a check named `git rebase` with a non-zero
+  `exit_code`. That is a job for the branch's author, not a judgement for a
+  person, so the merge is `dropped` (with the reason on `verification` and the
+  evidence on `checks`), the product's train moves on, and the same transaction
+  issues `rework:<target>` with `rework_reason: "merge-conflict"` and the report
+  in its body (see [Rework](#rework)). The rebased commit the rework reports is
+  merged again as `merge:<target>~2`, without another review.
+- **A check ran red after the rebase** — anything else. The merge moves to
+  `blocked`, `verification` keeps the reason and `checks` keeps the evidence,
+  and the target does not move — nothing landed, so nothing advances to
+  `merged`. A blocked merge stops its product's train, and that is intended:
+  everything behind it would be rebasing onto a main line that is still
+  waiting for a person. `GET /api/control` carries the reason on the blocked
+  merge's row in `pending_merges`, under `verification`, so a screen can name
+  the jam from that one payload.
+
+The check gate above applies to success only; a worker saying it was blocked
+is reporting the red check, not claiming it as a pass. `outcome` defaults to
+`"done"`, so a worker written before this field existed keeps working
+unchanged. Re-sending the identical report is idempotent and writes nothing new
+— a repeated conflict report finds its merge already dropped; sending a
+*different* reason for a task that is already blocked answers 400.
 
 **How a merge ended is its worker's report, not a press.** `done` and `blocked`
 are outcomes, and both are refused on an `instant:merge` task with 400 and code

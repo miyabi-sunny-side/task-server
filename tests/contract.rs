@@ -430,6 +430,26 @@ async fn work_to_done(state: &AppState, id: &str, commit_sha: &str) -> Value {
     done
 }
 
+/// Claim the rework a verdict or a conflicted merge issued for `target_id`, the
+/// way a fixer does, and report the commit it added.
+async fn rework_to_done(state: &AppState, target_id: &str, commit_sha: &str) -> Value {
+    let (status, lease) = claim_kind(state, "fixer", &json!(["rework"])).await;
+    assert_eq!(status, StatusCode::OK, "claim rework: {lease}");
+    assert_eq!(lease["kind"], "rework", "{lease}");
+    assert_eq!(
+        lease["rework_target_task_id"], target_id,
+        "the fixer must get the rework of {target_id}: {lease}"
+    );
+    let (status, done) = post_report(state, &report_body(&claim_id_of(&lease), commit_sha)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "report rework of {target_id}: {done}"
+    );
+    assert_eq!(done["status"], "done");
+    done
+}
+
 /// Claim an issued merge and land it with checks that all passed.
 async fn land_merge(state: &AppState, merge_id: &str, commit_sha: &str) -> Value {
     let claim_id = claim_next(state, merge_id).await;
@@ -2286,7 +2306,7 @@ async fn a_review_is_issued_once_and_a_finished_one_frees_the_target() {
     .await;
     assert_eq!(status, StatusCode::OK, "a verdict is a success: {answered}");
 
-    work_to_done(&state, "t-read", "def5678").await;
+    rework_to_done(&state, "t-read", "def5678").await;
     let (status, second) = get_task(&state, "review:t-read~2").await;
     assert_eq!(
         status,
@@ -2421,8 +2441,8 @@ async fn the_status_route_cannot_raise_an_answered_review() {
     let (status, parent) = get_task(&state, "t-read").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        parent["status"], "ready",
-        "the verdict the work lives by stands: {parent}"
+        parent["status"], "wip",
+        "the verdict the work lives by stands: the work is being reworked: {parent}"
     );
     assert_eq!(parent["latest_review"]["verdict"], "request_changes");
 
@@ -2435,7 +2455,7 @@ async fn the_status_route_cannot_raise_an_answered_review() {
 
     // And the frozen attempt does not keep the next one out: the report of the
     // rework issues it.
-    work_to_done(&state, "t-read", "def5678").await;
+    rework_to_done(&state, "t-read", "def5678").await;
     let (status, next) = get_task(&state, "review:t-read~2").await;
     assert_eq!(
         status,
@@ -2546,9 +2566,22 @@ async fn a_review_hands_work_back_with_findings_the_worker_can_read() {
     let (status, sent_back) = get_task(&state, "t-fix").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        sent_back["status"], "ready",
-        "work sent back is claimable again: {sent_back}"
+        sent_back["status"], "wip",
+        "work sent back is in progress again, through its rework: {sent_back}"
     );
+    assert_eq!(
+        sent_back["claim_id"],
+        Value::Null,
+        "the rework holds the branch, not a lease on the target: {sent_back}"
+    );
+    assert_eq!(
+        transitions(&sent_back),
+        ["blocked", "cancelled", "dropped"],
+        "the card offers no press the status route refuses while the rework runs: {sent_back}"
+    );
+    let (status, refused) = post_status(&state, "t-fix", "ready").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["code"], "rework_in_flight", "{refused}");
     assert_eq!(
         sent_back["latest_review"]["verdict"], "request_changes",
         "the worker reads the verdict off its own task: {sent_back}"
@@ -2568,7 +2601,7 @@ async fn a_review_hands_work_back_with_findings_the_worker_can_read() {
     );
 
     // The rework is reviewed again, and the newest verdict is what answers.
-    work_to_done(&state, "t-fix", "def5678").await;
+    rework_to_done(&state, "t-fix", "def5678").await;
     let approved = approve_task(&state, "t-fix", "def5678").await;
     assert_eq!(approved["latest_review"]["verdict"], "approve");
     assert_eq!(
@@ -2804,15 +2837,17 @@ async fn a_products_merges_are_handed_out_one_at_a_time_and_a_blocked_one_stops_
         "the second merge of a product waits for the first: {waiting}"
     );
 
-    // The head cannot be integrated, and says so. That is a report, not an
-    // error: the reason and the checks are kept on the merge.
-    let checks = json!([{"name": "git rebase", "exit_code": 1}]);
+    // The head cannot be integrated — a check ran red after the rebase — and
+    // says so. That is a report, not an error: the reason and the checks are
+    // kept on the merge. (A conflict in the rebase itself is rework instead,
+    // see `a_conflicted_merge_is_dropped_and_its_rework_lands_the_rebase`.)
+    let checks = json!([{"name": "cargo test", "exit_code": 101}]);
     let (status, blocked) = post_report(
         &state,
         &blocked_report_body(
             &claim_id,
             &subject,
-            "rebase onto main conflicts in src/task.rs",
+            "cargo test failed after the rebase",
             &checks,
         ),
     )
@@ -2824,7 +2859,7 @@ async fn a_products_merges_are_handed_out_one_at_a_time_and_a_blocked_one_stops_
     );
     assert_eq!(blocked["status"], "blocked");
     assert_eq!(
-        blocked["verification"], "rebase onto main conflicts in src/task.rs",
+        blocked["verification"], "cargo test failed after the rebase",
         "the reason has to be readable: {blocked}"
     );
     assert_eq!(blocked["checks"], checks, "{blocked}");
@@ -2849,7 +2884,7 @@ async fn a_products_merges_are_handed_out_one_at_a_time_and_a_blocked_one_stops_
         &blocked_report_body(
             &claim_id,
             &subject,
-            "rebase onto main conflicts in src/task.rs",
+            "cargo test failed after the rebase",
             &checks,
         ),
     )
@@ -2903,8 +2938,8 @@ async fn the_status_route_cannot_restart_a_blocked_merge() {
         &blocked_report_body(
             &claim_id_of(&lease),
             "aaa1111",
-            "rebase onto main conflicts in src/task.rs",
-            &json!([{"name": "git rebase", "exit_code": 1}]),
+            "cargo test failed after the rebase",
+            &json!([{"name": "cargo test", "exit_code": 101}]),
         ),
     )
     .await;
@@ -2949,7 +2984,7 @@ async fn the_status_route_cannot_restart_a_blocked_merge() {
         .expect("pending_merges array");
     assert_summary_shape(&merges[0]);
     assert_eq!(
-        merges[0]["verification"], "rebase onto main conflicts in src/task.rs",
+        merges[0]["verification"], "cargo test failed after the rebase",
         "the blocked head carries the reason a screen shows: {plane}"
     );
     assert_eq!(
@@ -2975,7 +3010,7 @@ async fn the_status_route_cannot_restart_a_blocked_merge() {
     let (status, failed) = get_task(&state, "merge:t-a-jam").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        failed["verification"], "rebase onto main conflicts in src/task.rs",
+        failed["verification"], "cargo test failed after the rebase",
         "while the attempt that failed keeps saying why: {failed}"
     );
 }
@@ -3346,4 +3381,91 @@ async fn a_worker_hands_a_live_claim_back_and_the_next_claim_takes_the_task() {
     assert_eq!(late["code"], "claim_not_live");
     let (_, card) = get_task(&state, "t-1").await;
     assert_eq!(card["status"], "wip");
+}
+
+/// A merge whose rebase conflicted is not a jam for a person: the merge is
+/// dropped, the train moves on, and the branch goes back to its author as a
+/// `rework` carrying the report. The rebased commit is merged again under the
+/// approval it already has, with no second review.
+#[tokio::test]
+async fn a_conflicted_merge_is_dropped_and_its_rework_lands_the_rebase() {
+    let (_dir, state) = file_backed_state();
+    put_product(&state, PRODUCT, true).await;
+    approved_task(&state, "t-clash", PRODUCT, "aaa1111").await;
+
+    let (status, lease) = claim_kind(&state, "luna", &json!(["instant:merge"])).await;
+    assert_eq!(status, StatusCode::OK, "{lease}");
+    assert_eq!(lease["id"], "merge:t-clash", "{lease}");
+    let checks = json!([{"name": "git rebase", "exit_code": 1}]);
+    let (status, dropped) = post_report(
+        &state,
+        &blocked_report_body(
+            &claim_id_of(&lease),
+            "aaa1111",
+            "rebase onto main conflicts in src/task.rs",
+            &checks,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{dropped}");
+    assert_eq!(
+        dropped["status"], "dropped",
+        "a conflict ends the attempt: {dropped}"
+    );
+    assert_eq!(dropped["checks"], checks, "{dropped}");
+
+    let (status, rework) = get_task(&state, "rework:t-clash").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the conflict issued a rework: {rework}"
+    );
+    assert_eq!(rework["kind"], "rework");
+    assert_eq!(rework["status"], "ready");
+    assert_eq!(rework["rework_target_task_id"], "t-clash");
+    assert_eq!(rework["rework_reason"], "merge-conflict");
+    assert_eq!(rework["branch"], "task/t-clash");
+    assert!(
+        rework["body"]
+            .as_str()
+            .is_some_and(|body| body.contains("src/task.rs") && body.contains("aaa1111")),
+        "the rework carries the conflict report: {rework}"
+    );
+    let (status, parked) = get_task(&state, "t-clash").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        parked["status"], "wip",
+        "the target is in progress again: {parked}"
+    );
+    // The train moves on while the branch is being rebased: the next merge of
+    // the product is claimable, with nothing blocked ahead of it.
+    approved_task(&state, "t-behind", PRODUCT, "bbb2222").await;
+    let plane = control(&state).await;
+    assert_eq!(
+        ids_of(&plane["pending_merges"]),
+        ["merge:t-behind"],
+        "the dropped merge left the queue and stopped nobody: {plane}"
+    );
+    let (status, other) = claim_kind(&state, "sol", &json!(["instant:merge"])).await;
+    assert_eq!(status, StatusCode::OK, "{other}");
+    assert_eq!(other["id"], "merge:t-behind", "{other}");
+
+    // The rebased commit goes straight back to the merge queue: approved once
+    // is approved, and a rebase is not a second reading.
+    rework_to_done(&state, "t-clash", "ccc3333").await;
+    let (status, back) = get_task(&state, "t-clash").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(back["status"], "approved", "{back}");
+    assert_eq!(back["commit_sha"], "ccc3333", "{back}");
+    let (status, again) = get_task(&state, "merge:t-clash~2").await;
+    assert_eq!(status, StatusCode::OK, "the merge is issued again: {again}");
+    assert_eq!(again["commit_sha"], "ccc3333", "{again}");
+    let (status, none) = get_task(&state, "review:t-clash~2").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "no second review: {none}");
+    let (status, summaries) = send(&state, read("/api/tasks?status=done")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        ids_of(&summaries).contains(&"rework:t-clash"),
+        "the finished rework is an ordinary row of the listing: {summaries}"
+    );
 }

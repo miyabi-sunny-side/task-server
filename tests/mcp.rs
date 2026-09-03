@@ -1154,11 +1154,22 @@ async fn a_reviewer_answers_over_mcp_and_http_sees_the_same_row() {
         "request_changes"
     );
 
-    // One database: HTTP reads the same row, and the worker reads the findings
-    // off the task it will claim again.
+    // One database: HTTP reads the same row, and the fixer reads the findings
+    // off the rework it will claim.
     let (status, card) = http(&router, "GET", "/api/tasks/t-1", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(card["status"], "ready", "the work went back: {card}");
+    assert_eq!(
+        card["status"], "wip",
+        "the work went back to its branch, as a rework: {card}"
+    );
+    let (status, rework) = http(&router, "GET", "/api/tasks/rework:t-1", None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the verdict issued a rework: {rework}"
+    );
+    assert_eq!(rework["rework_reason"], "review");
+    assert_eq!(rework["body"], "the empty case is unguarded");
     assert_eq!(card["latest_review"]["verdict"], "request_changes");
     assert_eq!(
         card["latest_review"]["findings"],
@@ -1242,8 +1253,8 @@ async fn merge_blocked_over_mcp(router: &Router) {
             json!({
                 "claim_id": claim_id,
                 "commit_sha": "abc1234",
-                "verification": "rebase onto main conflicts in src/task.rs",
-                "checks": [{"name": "git rebase", "exit_code": 1}],
+                "verification": "cargo test failed after the rebase",
+                "checks": [{"name": "cargo test", "exit_code": 101}],
                 "outcome": "blocked",
             }),
         )

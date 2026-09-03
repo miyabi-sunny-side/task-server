@@ -121,8 +121,9 @@ pub struct TaskSetStatusArgs {
 pub struct TaskClaimArgs {
     /// Who is taking the work, so an abandoned lease can be traced.
     pub worker: String,
-    /// The kinds of work this loop handles: `normal`, `instant:merge`,
-    /// `review`. Left out, anything claimable.
+    /// The kinds of work this loop handles: `normal`, `rework`,
+    /// `instant:merge`, `review`, `instant:release`. Left out, anything
+    /// claimable — a rework included.
     #[serde(default)]
     pub kinds: Option<Vec<String>>,
     /// A fresh key for one logical claim attempt. Retrying it recovers the same
@@ -197,7 +198,7 @@ fn answer(result: Result<Value, Error>) -> CallToolResult {
 /// One task with the statuses it may move to next and the verdict of its latest
 /// finished review, the same card the HTTP API answers with.
 fn card(db: &crate::db::Db, task: &Task) -> Result<Value, Error> {
-    let available_transitions = task::available_transitions(task);
+    let available_transitions = task::offered_transitions(db, task)?;
     let latest_review = if task.kind == TaskKind::Normal {
         task::latest_review(db, &task.id)?
     } else {
@@ -438,10 +439,14 @@ impl Worker {
                        the same commit twice is accepted. A merge task is only accepted when \
                        every check exited 0. Finishing ordinary work issues the review that \
                        reads it, in the same transaction. Pass outcome=\"blocked\" instead when \
-                       the work could not be finished — a rebase that conflicted, a check that \
-                       failed — and `verification` becomes the reason: the task is moved to \
-                       `blocked` with that reason and those checks kept, and whatever a merge \
-                       would have landed stays where it is."
+                       the work could not be finished and `verification` becomes the reason. \
+                       A merge whose checks name `git rebase` red is a conflict: the merge is \
+                       dropped, the target is parked, and a `rework` (merge-conflict) is \
+                       issued on its branch in the same transaction. Any other blocked report \
+                       moves the task to `blocked` with the reason and checks kept, and \
+                       whatever a merge would have landed stays where it is. A `rework` \
+                       reported `done` puts its commit on its target and reissues the review \
+                       or the merge the target came from."
     )]
     fn task_report(&self, Parameters(args): Parameters<TaskReportArgs>) -> CallToolResult {
         let checks: Vec<Check> = args.checks.into_iter().map(Check::from).collect();
@@ -475,8 +480,9 @@ impl Worker {
                        `review_subject_mismatch` when the commit named is not the one under \
                        review. An approval also issues the merge that lands the work, in that \
                        same transaction, so nothing waits for a human afterwards. \
-                       `request_changes` hands the task back to `ready` with the findings on \
-                       the record."
+                       `request_changes` parks the task (`wip`, no lease) and issues a \
+                       `rework` task on its branch carrying the findings, in that same \
+                       transaction; the findings also stay on the record."
     )]
     fn task_review_report(
         &self,
