@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::db::Db;
 use crate::error::Error;
 use crate::product::{self, Product};
+use crate::runs::{self, NewRun};
 use crate::state::AppState;
 use crate::task::{
     self, Check, NewTask, Releasable, ReleaseLevel, ReportOutcome, ReviewOutcome, ReviewVerdict,
@@ -141,6 +142,8 @@ pub struct TaskCard {
     /// when it has none or that task has landed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dependency_status: Option<TaskStatus>,
+    /// How many haystack rows name this task (`GET /api/runs?task_id=`).
+    pub runs_count: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -314,11 +317,13 @@ fn card(db: &Db, task: Task) -> Result<TaskCard, Error> {
         None
     };
     let dependency_status = task::dependency_status(db, &task)?;
+    let runs_count = runs::count_for_task(db, &task.id)?;
     Ok(TaskCard {
         task,
         available_transitions,
         latest_review,
         dependency_status,
+        runs_count,
     })
 }
 
@@ -592,6 +597,66 @@ pub async fn worker_claim_release(
 ) -> Result<Json<TaskCard>, Error> {
     let released = task::release_claim(&state.db, &body.claim_id, &body.reason, state.clock.now())?;
     Ok(Json(card(&state.db, released)?))
+}
+
+/// A worker appends one run to the haystack. Same boundary as the other
+/// `/worker/*` routes. 201 with the row when it was written, 200 with the row
+/// already there when `(claim_id, attempt, source)` was seen before.
+pub async fn worker_runs(
+    State(state): State<AppState>,
+    Json(body): Json<NewRun>,
+) -> Result<Response, Error> {
+    let (run, created) = runs::append(&state.db, &body, state.clock.now())?;
+    let status = if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(run)).into_response())
+}
+
+/// A person (or the rescue acting as one) leaves a note on a task. The source
+/// is `rescue` whatever the body says: this door is the rescue's.
+pub async fn api_runs_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut body): Json<NewRun>,
+) -> Result<Response, Error> {
+    require_human_mutation(&headers, &state)?;
+    body.source = Some(runs::Source::Rescue);
+    let (run, created) = runs::append(&state.db, &body, state.clock.now())?;
+    let status = if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(run)).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RunsQuery {
+    #[serde(default)]
+    pub since: i64,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+}
+
+/// Read the haystack forward from a watermark: `{ runs, next }`, `next` being
+/// the `since` of the following page while one exists.
+pub async fn api_runs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<RunsQuery>,
+) -> Result<Json<runs::Page>, Error> {
+    require_identity(&headers, &state)?;
+    Ok(Json(runs::list(
+        &state.db,
+        query.since,
+        query.limit,
+        query.task_id.as_deref(),
+    )?))
 }
 
 /// The review's own completion route.

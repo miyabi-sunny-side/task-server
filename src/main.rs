@@ -66,6 +66,15 @@ async fn serve() -> Result<(), Box<dyn Error>> {
     // exits over an unreadable project tree is worse than never binding at all.
     let state = AppState::from_env()?;
     derive_catalogue(&state, &catalogue)?;
+    // The haystack keeps every row; only the two output tails age out. Once per
+    // start is enough — the sweep is about disk, not about freshness.
+    let blanked =
+        task_server::runs::prune_tails(&state.db, state.clock.now(), state.runs_retention_days)?;
+    info!(
+        blanked,
+        retention_days = state.runs_retention_days,
+        "run tails swept"
+    );
 
     let listener = TcpListener::bind(bind_addr).await?;
     info!(%bind_addr, "server listening");

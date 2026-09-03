@@ -3508,3 +3508,158 @@ async fn control_lists_stuck_work_once_the_threshold_passes() {
         assert!(plane.get(key).is_some(), "{key} missing: {plane}");
     }
 }
+
+// --- runs (the haystack) ---
+
+fn worker_run(claim_id: &str, attempt: i64) -> Value {
+    json!({
+        "source": "worker",
+        "worker": "sandbox-01",
+        "task_id": "t-hay",
+        "kind": "normal",
+        "claim_id": claim_id,
+        "attempt": attempt,
+        "profile": "fable",
+        "outcome": "done",
+        "checks": [{"name": "cargo test --locked", "exit_code": 0}],
+        "stdout_tail": "ok"
+    })
+}
+
+/// A worker appends over the worker boundary (no identity, stale capability
+/// ignored), a resend answers 200 with the same row, and the Task Card counts
+/// the rows.
+#[tokio::test]
+async fn a_worker_appends_a_run_idempotently_and_the_card_counts_it() {
+    let state = AppState::for_test();
+    put_product(&state, "sunny-side/keeper", true).await;
+    create_task(
+        &state,
+        &json!({"id": "t-hay", "title": "hay", "product_id": "sunny-side/keeper"}),
+    )
+    .await;
+
+    let (status, first) = send(&state, worker("/worker/runs", &worker_run("c-1", 1))).await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    assert_eq!(first["id"], 1);
+    assert_eq!(first["source"], "worker");
+    assert_eq!(first["truncated"], false);
+
+    let mut stale_probe = request("POST", "/worker/runs")
+        .header("x-worker-capability", STALE_WORKER_CAPABILITY)
+        .body(Body::from(worker_run("c-1", 1).to_string()))
+        .unwrap();
+    let (status, again) = send(&state, std::mem::replace(&mut stale_probe, read("/"))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a resend is not a second row: {again}"
+    );
+    assert_eq!(again["id"], 1);
+
+    let (status, second) = send(&state, worker("/worker/runs", &worker_run("c-1", 2))).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(second["id"], 2);
+
+    let (status, refused) = send(
+        &state,
+        worker(
+            "/worker/runs",
+            &json!({"source": "worker", "task_id": "t-hay"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+
+    let (_, card) = get_task(&state, "t-hay").await;
+    assert_eq!(card["runs_count"], 2, "{card}");
+    let (_, other) = get_task(&state, "t-hay").await;
+    assert!(other.get("latest_review").is_none() || other["latest_review"].is_null());
+}
+
+/// The human door is the rescue's: identity and CSRF are required, and the
+/// source is `rescue` whatever the body claims. Reading needs identity only,
+/// pages by id and offers `next` while a page is full.
+#[tokio::test]
+async fn people_append_rescue_notes_and_read_the_haystack_forward() {
+    let state = AppState::for_test();
+    for attempt in 1..=3 {
+        let (status, _) = send(&state, worker("/worker/runs", &worker_run("c-1", attempt))).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let note = json!({"source": "worker", "task_id": "t-hay", "note": "five lines\nof rescue"});
+    let (status, _) = send(
+        &state,
+        request("POST", "/api/runs")
+            .header("x-auth-user", USER)
+            .body(Body::from(note.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "CSRF token is required");
+    let (status, rescue) = send(&state, human("POST", "/api/runs", &note)).await;
+    assert_eq!(status, StatusCode::CREATED, "{rescue}");
+    assert_eq!(rescue["source"], "rescue", "the door decides the source");
+    assert_eq!(rescue["id"], 4);
+
+    let (status, _) = send(
+        &state,
+        request("GET", "/api/runs").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "reading needs an identity"
+    );
+
+    let (status, page) = send(&state, read("/api/runs?since=0&limit=2")).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(ids_of_runs(&page), [1, 2]);
+    assert_eq!(page["next"], 2);
+    let (_, page) = send(&state, read("/api/runs?since=2&limit=2")).await;
+    assert_eq!(ids_of_runs(&page), [3, 4]);
+    assert_eq!(page["next"], 4);
+    let (_, page) = send(&state, read("/api/runs?since=4&limit=2")).await;
+    assert_eq!(ids_of_runs(&page), Vec::<i64>::new());
+    assert_eq!(page["next"], Value::Null);
+
+    let (_, filtered) = send(&state, read("/api/runs?task_id=t-hay")).await;
+    assert_eq!(ids_of_runs(&filtered), [1, 2, 3, 4]);
+    let (_, nobody_page) = send(&state, read("/api/runs?task_id=nobody")).await;
+    assert_eq!(ids_of_runs(&nobody_page), Vec::<i64>::new());
+}
+
+fn ids_of_runs(page: &Value) -> Vec<i64> {
+    page["runs"]
+        .as_array()
+        .expect("runs")
+        .iter()
+        .map(|run| run["id"].as_i64().expect("id"))
+        .collect()
+}
+
+/// The haystack survives a reopen: the schema is stamped, rows are kept, and
+/// the tails sweep blanks only what is past retention.
+#[tokio::test]
+async fn the_haystack_persists_across_reopen_and_the_sweep_keeps_the_rows() {
+    let (dir, state, clock) = clocked_state(60);
+    let (status, _) = send(&state, worker("/worker/runs", &worker_run("c-1", 1))).await;
+    assert_eq!(status, StatusCode::CREATED);
+    clock.advance_secs(91 * 24 * 3600);
+    let (status, _) = send(&state, worker("/worker/runs", &worker_run("c-1", 2))).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let state = reopen(&dir, state);
+    assert_eq!(state.db.schema_version().expect("version"), 15);
+    let now = task_server::clock::Clock::now(&clock);
+    let blanked = task_server::runs::prune_tails(&state.db, now, 90).expect("sweep");
+    assert_eq!(blanked, 1);
+    let (_, page) = send(&state, read("/api/runs")).await;
+    let runs = page["runs"].as_array().expect("runs");
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0]["stdout_tail"], Value::Null, "old tail blanked");
+    assert_eq!(runs[0]["outcome"], "done", "the rest is kept");
+    assert_eq!(runs[1]["stdout_tail"], "ok");
+}

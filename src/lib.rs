@@ -17,6 +17,7 @@ pub mod http;
 pub mod import;
 pub mod mcp;
 pub mod product;
+pub mod runs;
 pub mod scan;
 pub mod state;
 pub mod task;
@@ -46,6 +47,7 @@ pub fn app(state: AppState) -> Router {
             get(http::api_task).patch(http::api_patch_task),
         )
         .route("/tasks/{id}/status", post(http::api_set_status))
+        .route("/runs", get(http::api_runs).post(http::api_runs_post))
         .route("/control", get(http::api_control))
         .route("/merges", post(http::api_issue_merge))
         .route("/reviews", post(http::api_issue_review))
@@ -64,6 +66,7 @@ pub fn app(state: AppState) -> Router {
         .route("/worker/claim/release", post(http::worker_claim_release))
         .route("/worker/report", post(http::worker_report))
         .route("/worker/review-report", post(http::worker_review_report))
+        .route("/worker/runs", post(http::worker_runs))
         // Same domain layer, second transport. Both MCP faces share the worker
         // HTTP routes' trusted-network boundary.
         .merge(mcp::endpoints(&state))

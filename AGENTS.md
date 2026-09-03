@@ -466,6 +466,15 @@ recoverable estimate for history the column was not there to keep — and
 leaves every other row `NULL` rather than inventing a completion that never
 happened.
 
+`POST /worker/runs` appends one row to the haystack (`runs`) over the worker
+boundary; `POST /api/runs` is the same append for a person or the rescue (identity
++ CSRF, source forced to `rescue`); `GET /api/runs?since=&limit=&task_id=` pages
+the haystack forward by `id` with a `next` cursor. Rows are appended and never
+edited; the idempotency key of a worker's resend is `(claim_id, attempt, source)`;
+each source has its own required fields; tails are cut at 8 KB (`truncated`);
+the startup sweep blanks `stdout_tail` / `stderr_tail` past `RUNS_RETENTION_DAYS`
+(90) and touches nothing else. The Task Card carries `runs_count`.
+
 `GET /api/control` answers
 `{ mergeable, pending_merges, pending_releases, pending_reviews, unreviewed,
 releasable, stuck }`: the three `pending_*` lists are what the control plane has
