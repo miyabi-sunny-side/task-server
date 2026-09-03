@@ -1106,6 +1106,9 @@ counterpart to carry, so it earns no token pair.
 - Do report the outcome of a control action in place and reload the data
   behind it; don't add a toast, a timer, or a message that dismisses
   itself.
+- Do let a background reload (tab-visible return, the recurring interval)
+  swap in fresh data only on success; don't let it clear a drawn card or
+  list first, close an open modal, or reset a form or focus while it runs.
 - Do drop a status group entirely when it holds nothing; don't render a
   heading with a zero pill under it.
 - Do let a status say what it means through the vocabulary order and the

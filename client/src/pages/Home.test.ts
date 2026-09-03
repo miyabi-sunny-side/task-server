@@ -407,4 +407,75 @@ describe("Home", () => {
     );
     expect(callsTo(fetchMock, "/api/control")).toHaveLength(2);
   });
+
+  it("reloads on the recurring interval while visible, and stops after unmount", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = stubFetch({});
+
+      const { unmount } = render(Home);
+      await vi.waitFor(() =>
+        expect(region("tasks").dataset.state).toBe("success"),
+      );
+      expect(callsTo(fetchMock, "/api/tasks")).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(callsTo(fetchMock, "/api/tasks")).toHaveLength(2);
+      expect(callsTo(fetchMock, "/api/control")).toHaveLength(2);
+
+      unmount();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(callsTo(fetchMock, "/api/tasks")).toHaveLength(2);
+      expect(callsTo(fetchMock, "/api/control")).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the drawn panel and list when a background reload fails", async () => {
+    let fail = false;
+    const fetchMock = stubFetch({
+      control: () =>
+        fail
+          ? Promise.reject(new Error("offline"))
+          : jsonResponse(
+              plane({ releasable: [{ product_id: PRODUCT, task_count: 1 }] }),
+            ),
+      tasks: () =>
+        fail ? Promise.reject(new Error("offline")) : jsonResponse(TASKS),
+    });
+
+    render(Home);
+    await waitFor(() =>
+      expect(region("control").dataset.state).toBe("success"),
+    );
+    await waitFor(() => expect(region("tasks").dataset.state).toBe("success"));
+    expect(
+      screen.getByRole("link", { name: /テーマ切替/ }).getAttribute("href"),
+    ).toBe("/tasks/t-ready-1");
+
+    fail = true;
+    setVisibility("hidden");
+    setVisibility("visible");
+    await waitFor(() =>
+      expect(callsTo(fetchMock, "/api/control")).toHaveLength(2),
+    );
+    await waitFor(() =>
+      expect(callsTo(fetchMock, "/api/tasks")).toHaveLength(2),
+    );
+
+    // `callsTo` above only proves the requests were sent, not that their
+    // rejections have been caught yet — let that settle before reading
+    // state, or this assertion would just race ahead of the update.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // The failed background reload never swaps the success state for the
+    // error one: the panel and the list stay exactly as they were drawn
+    // (DESIGN.md, Do's and Don'ts).
+    expect(region("control").dataset.state).toBe("success");
+    expect(region("tasks").dataset.state).toBe("success");
+    expect(
+      screen.getByRole("link", { name: /テーマ切替/ }).getAttribute("href"),
+    ).toBe("/tasks/t-ready-1");
+  });
 });

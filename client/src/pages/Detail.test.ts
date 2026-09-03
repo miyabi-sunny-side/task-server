@@ -106,4 +106,59 @@ describe("Detail", () => {
       expect(screen.getByText("操作に失敗しました")).toBeTruthy(),
     );
   });
+
+  it("reloads on the recurring interval while mounted, and stops after unmount", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi
+        .fn<typeof fetch>()
+        .mockImplementation(() =>
+          Promise.resolve(new Response(JSON.stringify(CARD), { status: 200 })),
+        );
+      vi.stubGlobal("fetch", fetchMock);
+
+      const { unmount } = render(Detail, { props: { id: "alpha" } });
+      await vi.waitFor(() =>
+        expect(screen.getByRole("heading", { name: CARD.title })).toBeTruthy(),
+      );
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      unmount();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the drawn card when a background reload fails", async () => {
+    let fail = false;
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(() => {
+      if (fail) {
+        return Promise.reject(new Error("offline"));
+      }
+      return Promise.resolve(
+        new Response(JSON.stringify(CARD), { status: 200 }),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(Detail, { props: { id: "alpha" } });
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: CARD.title })).toBeTruthy(),
+    );
+
+    fail = true;
+    document.dispatchEvent(new Event("visibilitychange"));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    // Let the rejection settle before asserting the card is still drawn.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(screen.getByRole("heading", { name: CARD.title })).toBeTruthy();
+    expect(screen.getByText(CARD.body)).toBeTruthy();
+    expect(screen.queryByText("読み込みに失敗しました")).toBe(null);
+  });
 });

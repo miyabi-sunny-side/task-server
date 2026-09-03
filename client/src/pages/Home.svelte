@@ -1,6 +1,7 @@
 <script lang="ts">
   import ControlPanel from "../lib/ControlPanel.svelte";
   import StatusTaskList from "../lib/StatusTaskList.svelte";
+  import { startAutoReload } from "../lib/auto-reload";
   import {
     fetchControl,
     fetchTasks,
@@ -49,7 +50,10 @@
       controlState = "ready";
       controlLoaded = true;
     } catch (error) {
-      if (!aborted(error)) {
+      // A background reload that fails leaves an already-drawn panel alone;
+      // only a first load without data yet to show falls back to the error
+      // state (DESIGN.md, Result line).
+      if (!aborted(error) && !controlLoaded) {
         controlState = "error";
       }
     }
@@ -66,7 +70,7 @@
       listState = "ready";
       listLoaded = true;
     } catch (error) {
-      if (!aborted(error)) {
+      if (!aborted(error) && !listLoaded) {
         listState = "error";
       }
     }
@@ -77,19 +81,13 @@
     return Promise.all([loadControl(), loadList()]);
   }
 
-  function onVisibilityChange() {
-    if (document.visibilityState === "visible") {
-      void loadBoth();
-    }
-  }
-
   $effect(() => {
     void loadBoth();
-    document.addEventListener("visibilitychange", onVisibilityChange);
+    const stopAutoReload = startAutoReload(() => void loadBoth());
     return () => {
+      stopAutoReload();
       controlController?.abort();
       listController?.abort();
-      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   });
 </script>

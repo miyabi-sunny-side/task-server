@@ -1,6 +1,7 @@
 <script lang="ts">
   import { fetchTask, postTaskStatus, type TaskCard as Task } from "../lib/api";
   import TaskCard from "../lib/TaskCard.svelte";
+  import { startAutoReload } from "../lib/auto-reload";
 
   let { id }: { id: string } = $props();
 
@@ -10,6 +11,10 @@
   let actionError = $state("");
 
   let controller: AbortController | undefined;
+  // The id whose card is currently drawn, so a background reload's failure
+  // never displaces it — only a fresh id without a card yet falls back to
+  // the error state.
+  let loadedId: string | undefined;
 
   async function load(currentId: string) {
     controller?.abort();
@@ -17,11 +22,14 @@
     try {
       task = await fetchTask(currentId, controller.signal);
       detailState = "success";
+      loadedId = currentId;
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
         return;
       }
-      detailState = "error";
+      if (loadedId !== currentId) {
+        detailState = "error";
+      }
     }
   }
 
@@ -42,8 +50,15 @@
   }
 
   $effect(() => {
+    if (loadedId !== id) {
+      detailState = "loading";
+    }
     void load(id);
-    return () => controller?.abort();
+    const stopAutoReload = startAutoReload(() => void load(id));
+    return () => {
+      stopAutoReload();
+      controller?.abort();
+    };
   });
 </script>
 
