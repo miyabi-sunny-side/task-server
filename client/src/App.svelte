@@ -3,7 +3,7 @@
   import { loadSession } from "./lib/api";
   import { initRouter, router } from "./lib/router.svelte";
   import Detail from "./pages/Detail.svelte";
-  import Done from "./pages/Done.svelte";
+  import Closed from "./pages/Closed.svelte";
   import Home from "./pages/Home.svelte";
 
   $effect(() => {
@@ -21,8 +21,8 @@
 <main>
   {#if router.index === 1}
     <Detail id={router.params.id} />
-  {:else if router.index === 2}
-    <Done />
+  {:else if router.index === 3}
+    <Closed />
   {:else}
     <Home />
   {/if}

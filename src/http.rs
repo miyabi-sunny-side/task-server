@@ -127,6 +127,37 @@ impl From<Task> for DoneSummary {
     }
 }
 
+/// A row of the closed screen: finished or called-off `normal` work, and when it
+/// closed. `closed_at` is the sort key (`done_at` for finished work, the moment
+/// of cancelling otherwise); `done_at` stays for readers of the done screen.
+#[derive(Debug, Serialize)]
+pub struct ClosedSummary {
+    pub id: String,
+    pub title: String,
+    pub status: TaskStatus,
+    pub product_id: Option<String>,
+    pub release_tag: Option<String>,
+    pub verification: Option<String>,
+    pub done_at: Option<String>,
+    pub closed_at: String,
+}
+
+impl From<Task> for ClosedSummary {
+    fn from(task: Task) -> Self {
+        let closed_at = task::closed_moment(&task);
+        Self {
+            id: task.id,
+            title: task.title,
+            status: task.status,
+            product_id: task.product_id,
+            release_tag: task.release_tag,
+            verification: task.verification,
+            done_at: task.done_at,
+            closed_at,
+        }
+    }
+}
+
 /// The full task plus the transitions a human may actually press and, for work
 /// a review has answered, what that review said.
 #[derive(Debug, Serialize)]
@@ -371,6 +402,29 @@ pub async fn api_done(
     require_identity(&headers, &state)?;
     let tasks = task::list_done(&state.db)?;
     Ok(Json(tasks.into_iter().map(DoneSummary::from).collect()))
+}
+
+/// Finished and called-off `normal` work, most recently closed first
+/// (`GET /api/closed`).
+pub async fn api_closed(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ClosedSummary>>, Error> {
+    require_identity(&headers, &state)?;
+    let tasks = task::list_closed(&state.db)?;
+    Ok(Json(tasks.into_iter().map(ClosedSummary::from).collect()))
+}
+
+/// Remove a task that is over (`cancelled` / `dropped` / `released`) with the
+/// subtasks that pointed at it. Anything else is 409: the row stays auditable
+/// until a person calls it off.
+pub async fn api_delete_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<task::Deleted>, Error> {
+    require_human_mutation(&headers, &state)?;
+    Ok(Json(task::delete(&state.db, &id)?))
 }
 
 /// Register a task.

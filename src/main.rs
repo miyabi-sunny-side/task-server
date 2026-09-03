@@ -75,6 +75,16 @@ async fn serve() -> Result<(), Box<dyn Error>> {
         retention_days = state.runs_retention_days,
         "run tails swept"
     );
+    // Called-off work ages out; finished work never does. One line per row so
+    // the journal says what left.
+    let removed = task_server::task::sweep_called_off(
+        &state.db,
+        state.clock.now(),
+        state.called_off_retention_days,
+    )?;
+    for id in &removed {
+        info!(%id, retention_days = state.called_off_retention_days, "called-off task deleted");
+    }
 
     let listener = TcpListener::bind(bind_addr).await?;
     info!(%bind_addr, "server listening");

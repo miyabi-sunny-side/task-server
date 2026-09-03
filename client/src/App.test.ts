@@ -54,7 +54,7 @@ describe("App", () => {
     const header = screen.getByRole("banner");
     const title = header.querySelector('a[href="/"]');
     expect(title?.textContent).toContain("Task Server");
-    expect(header.querySelector('a[href="/done"]')).toBeTruthy();
+    expect(header.querySelector('a[href="/closed"]')).toBeTruthy();
     expect(screen.getByRole("button", { name: "メニュー" })).toBeTruthy();
     expect(header.querySelectorAll("a, button")).toHaveLength(3);
 
@@ -68,13 +68,13 @@ describe("App", () => {
     expect(window.location.pathname).toBe("/");
   });
 
-  it("navigates to /done from the header and marks it current", async () => {
+  it("navigates to /closed from the header and marks it current", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn<typeof fetch>().mockImplementation((input) => {
         const url = String(input);
         const payload =
-          url === "/api/tasks" || url === "/api/done"
+          url === "/api/tasks" || url === "/api/closed"
             ? []
             : url === "/api/control"
               ? {
@@ -96,15 +96,15 @@ describe("App", () => {
     render(App);
 
     const header = screen.getByRole("banner");
-    const doneLink = header.querySelector('a[href="/done"]') as HTMLElement;
+    const doneLink = header.querySelector('a[href="/closed"]') as HTMLElement;
     expect(doneLink.getAttribute("aria-current")).toBeNull();
 
     await fireEvent.click(doneLink);
 
-    expect(window.location.pathname).toBe("/done");
+    expect(window.location.pathname).toBe("/closed");
     expect(doneLink.getAttribute("aria-current")).toBe("page");
     await waitFor(() =>
-      expect(screen.getByText("完了したタスクがありません")).toBeTruthy(),
+      expect(screen.getByText("閉じたタスクがありません")).toBeTruthy(),
     );
   });
 });

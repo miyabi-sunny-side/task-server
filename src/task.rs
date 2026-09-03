@@ -11,7 +11,7 @@ const COLUMNS: &str = "id, title, body, status, kind, product_id, priority, bran
                        claim_id, claimed_at, claim_expires_at, commit_sha, verification, \
                        release_tag, created_at, updated_at, merge_target_task_id, checks_json, \
                        review_target_task_id, review_verdict, release_level, release_task_id, \
-                       depends_on, done_at, rework_target_task_id, rework_reason";
+                       depends_on, done_at, rework_target_task_id, rework_reason, closed_at";
 
 /// Every status, in vocabulary order. Used to enumerate legal transitions.
 pub(crate) const ALL_STATUSES: [TaskStatus; 10] = [
@@ -443,6 +443,10 @@ pub struct Task {
     /// Set on a `rework` task: what sent the work back.
     #[serde(default)]
     pub rework_reason: Option<ReworkReason>,
+    /// The moment the task was called off (`cancelled` or `dropped`), written
+    /// once. `None` on everything still open or finished the ordinary way.
+    #[serde(default)]
+    pub closed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -733,6 +737,150 @@ pub fn list_done(db: &Db) -> Result<Vec<Task>, Error> {
             ),
             &[],
         )
+    })
+}
+
+/// Closed work, most recently closed first: finished `normal` work (`done`,
+/// `approved`, `merged`, `released`, ordered by `done_at`) mixed with `normal`
+/// work that was called off (`cancelled`, ordered by `closed_at`). `dropped`
+/// is left out: it is only ever a subtask folded for a rebuild, and its target
+/// keeps the history.
+pub fn list_closed(db: &Db) -> Result<Vec<Task>, Error> {
+    db.with_conn(|conn| {
+        query_all(
+            conn,
+            &format!(
+                "SELECT {COLUMNS} FROM tasks
+                 WHERE kind = 'normal'
+                   AND status IN ('done', 'approved', 'merged', 'released', 'cancelled')
+                 ORDER BY COALESCE(CASE WHEN status = 'cancelled' THEN closed_at ELSE done_at END,
+                                   updated_at) DESC,
+                          id DESC"
+            ),
+            &[],
+        )
+    })
+}
+
+/// The moment a closed task closed: `closed_at` for called-off work, `done_at`
+/// for finished work, the last update when neither was recorded.
+#[must_use]
+pub fn closed_moment(task: &Task) -> String {
+    match task.status {
+        TaskStatus::Cancelled | TaskStatus::Dropped => task.closed_at.clone(),
+        _ => task.done_at.clone(),
+    }
+    .unwrap_or_else(|| task.updated_at.clone())
+}
+
+/// What a delete removed: the task and every subtask that pointed at it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Deleted {
+    pub id: String,
+    pub subtasks: Vec<String>,
+}
+
+/// Remove a task that is over — `cancelled`, `dropped` or `released` — together
+/// with the review, merge and rework subtasks that named it, so no orphan is
+/// left pointing at a row that is gone. Anything still in flight answers 409.
+///
+/// A task that waited on it (`depends_on`) loses the reference: it was already
+/// blocked or promoted when the dependency closed. A task this release shipped
+/// (`release_task_id`) loses the pointer the same way. The haystack keeps its
+/// rows: `runs.task_id` is text, not a key.
+///
+/// # Errors
+/// `Error::NotFound` when there is no such task, `Error::Conflict` when it is
+/// not over yet, `Error::Db` when the write fails.
+pub fn delete(db: &Db, id: &str) -> Result<Deleted, Error> {
+    db.with_tx(|tx| {
+        let task = read(tx, id)?;
+        if !matches!(
+            task.status,
+            TaskStatus::Cancelled | TaskStatus::Dropped | TaskStatus::Released
+        ) {
+            return Err(Error::Conflict(format!(
+                "task {id} is {}, and only cancelled, dropped or released tasks are deleted",
+                task.status.as_str()
+            )));
+        }
+        let subtasks = delete_subtasks_of(tx, id)?;
+        delete_row(tx, id)?;
+        Ok(Deleted {
+            id: id.to_owned(),
+            subtasks,
+        })
+    })
+}
+
+/// Remove the subtasks whose target is `id`, whatever their status: a subtask
+/// without its target has nothing to work on.
+fn delete_subtasks_of(tx: &Connection, id: &str) -> Result<Vec<String>, Error> {
+    let mut statement = tx.prepare(
+        "SELECT id FROM tasks
+         WHERE review_target_task_id = ?1 OR merge_target_task_id = ?1
+            OR rework_target_task_id = ?1
+         ORDER BY id ASC",
+    )?;
+    let subtasks = statement
+        .query_map([id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for subtask in &subtasks {
+        delete_row(tx, subtask)?;
+    }
+    Ok(subtasks)
+}
+
+/// Remove one row and every reference to it that the schema enforces.
+fn delete_row(tx: &Connection, id: &str) -> Result<(), Error> {
+    tx.execute(
+        "UPDATE tasks SET depends_on = NULL WHERE depends_on = ?1",
+        [id],
+    )?;
+    tx.execute(
+        "UPDATE tasks SET release_task_id = NULL WHERE release_task_id = ?1",
+        [id],
+    )?;
+    tx.execute("DELETE FROM claim_receipts WHERE task_id = ?1", [id])?;
+    tx.execute("DELETE FROM tasks WHERE id = ?1", [id])?;
+    Ok(())
+}
+
+/// Remove the `cancelled` and `dropped` tasks that closed more than
+/// `retention_days` ago. `released` stays: it is the history the closed screen
+/// shows. Returns the ids removed, targets first, so the caller can log each.
+///
+/// # Errors
+/// `Error::Db` when a read or write fails.
+pub fn sweep_called_off(
+    db: &Db,
+    now: OffsetDateTime,
+    retention_days: u64,
+) -> Result<Vec<String>, Error> {
+    let days = i64::try_from(retention_days).unwrap_or(i64::MAX);
+    let cutoff = format_z(now - time::Duration::days(days));
+    db.with_tx(|tx| {
+        let mut statement = tx.prepare(
+            "SELECT id FROM tasks
+             WHERE status IN ('cancelled', 'dropped')
+               AND COALESCE(closed_at, updated_at) < ?1
+             ORDER BY COALESCE(closed_at, updated_at) ASC, id ASC",
+        )?;
+        let stale = statement
+            .query_map([&cutoff], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut removed = Vec::new();
+        for id in stale {
+            // A subtask swept together with its target is already gone.
+            if read(tx, &id).is_err() {
+                continue;
+            }
+            let mut subtasks = delete_subtasks_of(tx, &id)?;
+            delete_row(tx, &id)?;
+            removed.push(id);
+            removed.append(&mut subtasks);
+        }
+        Ok(removed)
     })
 }
 
@@ -1159,7 +1307,9 @@ fn set_status_pressed_by(
         tx.execute(
             "UPDATE tasks SET status = ?2, updated_at = ?3,
                     done_at = CASE WHEN ?2 = 'done' AND kind = 'normal'
-                              THEN COALESCE(done_at, ?3) ELSE done_at END
+                              THEN COALESCE(done_at, ?3) ELSE done_at END,
+                    closed_at = CASE WHEN ?2 IN ('cancelled', 'dropped')
+                                THEN COALESCE(closed_at, ?3) ELSE closed_at END
              WHERE id = ?1",
             rusqlite::params![id, to.as_str(), stamp],
         )?;
@@ -1850,7 +2000,7 @@ fn drop_conflicted_merge(
     }
     tx.execute(
         "UPDATE tasks SET status = 'dropped', verification = ?2, checks_json = ?3,
-                updated_at = ?4
+                updated_at = ?4, closed_at = COALESCE(closed_at, ?4)
          WHERE id = ?1",
         rusqlite::params![merge.id, reason, checks_json, stamp],
     )?;
@@ -3033,6 +3183,7 @@ fn from_row(row: &Row<'_>) -> Result<Task, Error> {
         done_at: row.get(24)?,
         rework_target_task_id: row.get(25)?,
         rework_reason: decode_reason(row.get::<_, Option<String>>(26)?.as_deref())?,
+        closed_at: row.get(27)?,
     })
 }
 
@@ -3058,12 +3209,12 @@ mod tests {
     use super::{
         ALL_STATUSES, Check, NewTask, Releasable, ReleaseLevel, ReportOutcome, ReviewVerdict,
         ReworkReason, StuckReason, StuckThresholds, Task, TaskKind, TaskPatch, TaskStatus,
-        available_transitions, can_transition, claim, create, dependency_status, get, issue_merge,
-        issue_release, issue_review, latest_review, list, list_active, list_by_status, list_done,
-        merge_task_id, mergeable, offered_transitions, pending_merges, pending_releases,
-        pending_reviews, releasable, release_claim, release_task_id, report, review_report,
-        review_task_id, rework_task_id, set_status, set_status_by_operator, stuck, unreviewed,
-        update,
+        available_transitions, can_transition, claim, closed_moment, create, delete,
+        dependency_status, get, issue_merge, issue_release, issue_review, latest_review, list,
+        list_active, list_by_status, list_closed, list_done, merge_task_id, mergeable,
+        offered_transitions, pending_merges, pending_releases, pending_reviews, releasable,
+        release_claim, release_task_id, report, review_report, review_task_id, rework_task_id,
+        set_status, set_status_by_operator, stuck, sweep_called_off, unreviewed, update,
     };
     use crate::clock::format_z;
     use crate::db::Db;
@@ -7971,5 +8122,123 @@ mod tests {
             .map(|row| row.reason)
             .collect();
         assert_eq!(reasons, [StuckReason::LeaseExpired]);
+    }
+
+    // --- closed, delete, sweep ---
+
+    /// The closed list mixes finished and cancelled work, newest closing first,
+    /// and leaves `dropped` (a folded subtask) out.
+    #[test]
+    fn the_closed_list_mixes_finished_and_cancelled_work_by_when_they_closed() {
+        let db = db_with_product();
+        create(&db, &new_task("t-done", TaskKind::Normal, 0), now()).unwrap();
+        work_to_done(&db, "t-done");
+        create(&db, &new_task("t-off", TaskKind::Normal, 0), now()).unwrap();
+        set_status(&db, "t-off", TaskStatus::Cancelled, even_later()).unwrap();
+        create(&db, &new_task("t-open", TaskKind::Normal, 0), now()).unwrap();
+
+        let off = get(&db, "t-off").unwrap();
+        assert_eq!(
+            off.closed_at.as_deref(),
+            Some(format_z(even_later()).as_str())
+        );
+        assert_eq!(closed_moment(&off), format_z(even_later()));
+
+        let closed = list_closed(&db).unwrap();
+        let ids: Vec<&str> = closed.iter().map(|task| task.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["t-off", "t-done"],
+            "cancelled later, so it comes first"
+        );
+        // The review the done report issued is a subtask: not in the list.
+        assert!(closed.iter().all(|task| task.kind == TaskKind::Normal));
+
+        // A dropped subtask is closed but never listed.
+        let review = get(&db, &review_task_id("t-done")).unwrap();
+        set_status(&db, &review.id, TaskStatus::Dropped, even_later()).unwrap();
+        assert!(
+            get(&db, &review.id).unwrap().closed_at.is_some(),
+            "dropping stamps closed_at"
+        );
+        assert_eq!(list_closed(&db).unwrap().len(), 2);
+    }
+
+    /// Only work that is over can be deleted; deleting a target takes the
+    /// subtasks that named it and leaves no reference behind.
+    #[test]
+    fn delete_takes_only_finished_work_and_its_subtasks() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        work_to_done(&db, "t-1");
+        let review = review_task_id("t-1");
+        assert!(get(&db, &review).is_ok());
+        create(&db, &new_task("t-2", TaskKind::Normal, 0), now()).unwrap();
+        update(
+            &db,
+            "t-2",
+            &TaskPatch {
+                depends_on: Some(Some("t-1".into())),
+                ..TaskPatch::default()
+            },
+            now(),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(delete(&db, "t-1"), Err(Error::Conflict(_))),
+            "done work is not over yet"
+        );
+        assert!(matches!(delete(&db, "nope"), Err(Error::NotFound)));
+
+        set_status(&db, "t-1", TaskStatus::Cancelled, later()).unwrap();
+        let deleted = delete(&db, "t-1").unwrap();
+        assert_eq!(deleted.id, "t-1");
+        assert_eq!(deleted.subtasks, std::slice::from_ref(&review));
+        assert!(matches!(get(&db, "t-1"), Err(Error::NotFound)));
+        assert!(matches!(get(&db, &review), Err(Error::NotFound)));
+        let waiting = get(&db, "t-2").unwrap();
+        assert_eq!(
+            waiting.depends_on, None,
+            "the reference is gone with the row"
+        );
+        assert_eq!(
+            waiting.status,
+            TaskStatus::Blocked,
+            "but the block it caused stays"
+        );
+    }
+
+    /// The sweep deletes called-off work past retention and nothing else.
+    #[test]
+    fn the_sweep_deletes_old_called_off_work_only() {
+        let db = db_with_product();
+        for id in ["t-old", "t-fresh"] {
+            create(&db, &new_task(id, TaskKind::Normal, 0), now()).unwrap();
+        }
+        set_status(&db, "t-old", TaskStatus::Cancelled, now()).unwrap();
+        set_status(
+            &db,
+            "t-fresh",
+            TaskStatus::Cancelled,
+            now() + time::Duration::days(20),
+        )
+        .unwrap();
+        let landed = merge_waiting_for(&db, "t-shipped", "a/b");
+        merge_into(&db, &landed.id, TaskStatus::Done);
+        let release = claim_release(&db);
+        ship(&db, &release, Some("v0.1.1")).unwrap();
+        assert_eq!(get(&db, "t-shipped").unwrap().status, TaskStatus::Released);
+
+        let at = now() + time::Duration::days(31);
+        let removed = sweep_called_off(&db, at, 30).unwrap();
+        assert_eq!(removed, ["t-old"]);
+        assert!(matches!(get(&db, "t-old"), Err(Error::NotFound)));
+        assert!(get(&db, "t-fresh").is_ok(), "within retention");
+        assert!(
+            get(&db, "t-shipped").is_ok(),
+            "released work is never swept"
+        );
+        assert!(sweep_called_off(&db, at, 30).unwrap().is_empty());
     }
 }

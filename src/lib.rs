@@ -42,9 +42,12 @@ pub fn app(state: AppState) -> Router {
         .route("/session", get(http::api_session))
         .route("/tasks", get(http::api_tasks).post(http::api_create_task))
         .route("/done", get(http::api_done))
+        .route("/closed", get(http::api_closed))
         .route(
             "/tasks/{id}",
-            get(http::api_task).patch(http::api_patch_task),
+            get(http::api_task)
+                .patch(http::api_patch_task)
+                .delete(http::api_delete_task),
         )
         .route("/tasks/{id}/status", post(http::api_set_status))
         .route("/runs", get(http::api_runs).post(http::api_runs_post))

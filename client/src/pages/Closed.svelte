@@ -1,9 +1,9 @@
 <script lang="ts">
-  import { fetchDone, type DoneTask } from "../lib/api";
+  import { fetchClosed, type ClosedTask } from "../lib/api";
 
   type FetchState = "loading" | "error" | "ready";
 
-  let items = $state<DoneTask[]>([]);
+  let items = $state<ClosedTask[]>([]);
   let fetchState = $state<FetchState>("loading");
   let controller: AbortController | undefined;
   let loaded = false;
@@ -15,7 +15,7 @@
       fetchState = "loading";
     }
     try {
-      items = await fetchDone(controller.signal);
+      items = await fetchClosed(controller.signal);
       fetchState = "ready";
       loaded = true;
     } catch (error) {
@@ -33,7 +33,7 @@
       : fetchState,
   );
 
-  // DESIGN.md, Done page: the first one or two source lines, not a
+  // DESIGN.md, Closed page: the first one or two source lines, not a
   // CSS-clamped truncation, and no element at all when there is nothing to
   // show.
   function excerpt(verification: string | null): string {
@@ -50,13 +50,13 @@
 </script>
 
 <div class="content">
-  <section class="list" data-region="done" data-state={listState}>
+  <section class="list" data-region="closed" data-state={listState}>
     {#if listState === "loading"}
       <p class="state">
         <span class="spinner" aria-hidden="true"></span>読み込み中…
       </p>
     {:else if listState === "empty"}
-      <p class="state">完了したタスクがありません</p>
+      <p class="state">閉じたタスクがありません</p>
     {:else if listState === "error"}
       <div class="state-wrap">
         <p class="state error">読み込みに失敗しました</p>
@@ -78,7 +78,7 @@
                     <span class="badge">{item.release_tag}</span>
                   {/if}
                   <span class="product">{item.product_id}</span>
-                  <span class="done-at">{item.done_at}</span>
+                  <span class="done-at">{item.closed_at}</span>
                 </span>
               </span>
               {#if shown}
@@ -94,7 +94,7 @@
 
 <style lang="sass">
   // The card recipe, stacked so a verification excerpt can sit under the
-  // title (DESIGN.md, Done page — the same shape as a blocked merge card).
+  // title (DESIGN.md, Closed page — the same shape as a blocked merge card).
   .card
     flex-direction: column
     align-items: stretch

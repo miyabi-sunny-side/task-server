@@ -12,7 +12,11 @@ export const routes: RouteDef[] = [
   { pattern: /^\/$/, params: [] },
   { pattern: /^\/tasks\/([^/]+)$/, params: ["id"] },
   { pattern: /^\/done$/, params: [] },
+  { pattern: /^\/closed$/, params: [] },
 ];
+
+// The done page moved to /closed; the old address still reaches it.
+export const REDIRECTS: Record<string, string> = { "/done": "/closed" };
 
 export function matchRoute(pathname: string): RouteMatch {
   for (const [index, route] of routes.entries()) {
