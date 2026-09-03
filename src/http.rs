@@ -623,6 +623,23 @@ pub fn rescan(state: &AppState) -> Result<RescanAnswer, Error> {
                 .into(),
         });
     };
+    rescan_with(state, || {
+        product::derive_from_tree(&state.db, &root, state.clock.now())
+    })
+}
+
+/// The serialisation around a walk, with the walk injected so it can be measured.
+///
+/// Requests queue on the gate. One that arrived while another was walking takes
+/// that walk's result (`walked: false`): the tree it would have read is the tree
+/// that walk read, at or after the moment it asked.
+///
+/// # Errors
+/// Whatever `walk` returns.
+pub fn rescan_with(
+    state: &AppState,
+    walk: impl FnOnce() -> Result<product::Derived, Error>,
+) -> Result<RescanAnswer, Error> {
     let arrived = std::time::Instant::now();
     let mut gate = state
         .rescan
@@ -636,7 +653,7 @@ pub fn rescan(state: &AppState) -> Result<RescanAnswer, Error> {
             derived: derived.clone(),
         });
     }
-    let derived = product::derive_from_tree(&state.db, &root, state.clock.now())?;
+    let derived = walk()?;
     gate.finished = Some((std::time::Instant::now(), derived.clone()));
     Ok(RescanAnswer {
         walked: true,

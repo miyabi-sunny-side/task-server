@@ -3781,17 +3781,55 @@ async fn a_rescan_walks_the_tree_now_and_names_what_changed() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    // Two at once: the second arrives while the first walks and takes its result.
-    let a = send(&state, human("POST", "/api/products/rescan", &json!({})));
-    let b = send(&state, human("POST", "/api/products/rescan", &json!({})));
-    let ((status_a, answer_a), (status_b, answer_b)) = tokio::join!(a, b);
-    assert_eq!(status_a, StatusCode::OK);
-    assert_eq!(status_b, StatusCode::OK);
-    let walked = [answer_a["walked"].as_bool(), answer_b["walked"].as_bool()];
-    assert!(
-        walked.contains(&Some(true)),
-        "one of them walked: {answer_a} {answer_b}"
+    // Two at once: the second arrives while the first walks and takes its
+    // result, so the tree is walked once. The walk is injected and made slow so
+    // the overlap is certain rather than a matter of scheduling.
+    let slow = Arc::new(state.clone());
+    let walks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let first = {
+        let (state, walks) = (Arc::clone(&slow), Arc::clone(&walks));
+        std::thread::spawn(move || {
+            task_server::http::rescan_with(&state, || {
+                walks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                Ok(task_server::product::Derived::default())
+            })
+            .expect("first rescan")
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let second = {
+        let (state, walks) = (Arc::clone(&slow), Arc::clone(&walks));
+        std::thread::spawn(move || {
+            task_server::http::rescan_with(&state, || {
+                walks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(task_server::product::Derived::default())
+            })
+            .expect("second rescan")
+        })
+    };
+    let (first, second) = (
+        first.join().expect("thread"),
+        second.join().expect("thread"),
     );
+    assert!(first.walked, "the first request walks");
+    assert!(
+        !second.walked,
+        "the second arrived during the walk and took its result"
+    );
+    assert_eq!(
+        walks.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one walk for two requests"
+    );
+    // A request that arrives after the walk finished walks again.
+    let third = task_server::http::rescan_with(&state, || {
+        walks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(task_server::product::Derived::default())
+    })
+    .expect("third rescan");
+    assert!(third.walked);
+    assert_eq!(walks.load(std::sync::atomic::Ordering::SeqCst), 2);
 
     // No tree: nothing to rescan.
     let curated = AppState::for_test();

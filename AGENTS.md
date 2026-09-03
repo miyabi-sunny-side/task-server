@@ -48,7 +48,8 @@ JSON API, the MCP endpoints, and the compiled client.
   gate fires on the transition only, so a row that is already `ready` or beyond
   is never demoted, and `available_transitions` still offers `ready`.
 - `APP_PROJECTS_DIR` derives the catalogue from the `<org>/<repo>` tree on disk
-  at startup, in one transaction: a git repository with an `origin` remote is a
+  at startup and on `POST /api/products/rescan` (MCP `product_rescan`), in one
+  transaction: a git repository with an `origin` remote is a
   product, and its id is the local placement rather than the remote's owner. A row
   matching the tree is not rewritten, so `updated_at` is not stamped by a restart.
   An empty walk changes nothing and warns — including on an empty catalogue, since

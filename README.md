@@ -51,7 +51,7 @@ creates the database (and its parent directory) on first start.
 | GET | `/api/products` | product list |
 | GET | `/api/products/{id}` | one product |
 | PUT | `/api/products/{id}` | create or replace a product. With a project tree configured this is a temporary override: the next walk reads the values back from the tree |
-| POST | `/api/products/rescan` | walk the project tree now (the same walk the startup runs) and answer `{walked, inserted, updated, unchanged, archived, unarchived, skipped, releases_unknown}`; 409 `catalogue_not_derived` without `APP_PROJECTS_DIR`. Rescans are serialised; a request that arrived during a walk gets that walk's result (`walked: false`) |
+| POST | `/api/products/rescan` | walk the project tree now (the same walk the startup runs) and answer `{walked, inserted, updated, unchanged, archived, unarchived, skipped_archive_all, skipped, releases_unknown}`; 409 `catalogue_not_derived` without `APP_PROJECTS_DIR`. Rescans are serialised; a request that arrived during a walk gets that walk's result (`walked: false`) |
 | POST | `/worker/claim` | lease the next ready task; optional `kinds` routes by role and optional `idempotency_key` makes an uncertain response retryable |
 | POST | `/worker/claim/release` | `{"claim_id": "...", "reason": "..."}` hands a live claim back: the task returns to `ready` with the reason on `verification`; a claim that is not live is 409 `claim_not_live` |
 | POST | `/worker/runs` | append one run to the haystack; idempotent on `(claim_id, attempt, source)` — 201 with the row when written, 200 with the row already there on a resend |
@@ -982,7 +982,7 @@ corrections instead of moving an existing release tag.
 | `APP_STUCK_RELEASE_SECS` | `1800` | How long an `instant:release` may stay `wip` before it is `stuck` (`release-stalled`). |
 | `APP_CSRF_TOKEN` | `dev-csrf` | Required on human mutation as `X-CSRF-Token`. |
 | `APP_STATIC_DIR` | `client/dist` | Directory of the production frontend. |
-| `APP_PROJECTS_DIR` | (unset) | Root of the `<org>/<repo>` project tree the catalogue is derived from at startup. Unset means nothing is walked and the catalogue is curated over the API alone; set and unreadable refuses the start. |
+| `APP_PROJECTS_DIR` | (unset) | Root of the `<org>/<repo>` project tree the catalogue is derived from, at startup and on `POST /api/products/rescan`. Unset means nothing is walked and the catalogue is curated over the API alone; set and unreadable refuses the start. |
 | `TASK_SERVER_ENV` | (unset) | Set to `production` to require `APP_CSRF_TOKEN` and drop the development identity. |
 | `RUST_LOG` | `info` | `tracing-subscriber` filter, for example `task_server=debug,tower_http=debug`. |
 
