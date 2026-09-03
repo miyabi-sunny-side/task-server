@@ -742,9 +742,12 @@ pub fn list_done(db: &Db) -> Result<Vec<Task>, Error> {
 
 /// Closed work, most recently closed first: finished `normal` work (`done`,
 /// `approved`, `merged`, `released`, ordered by `done_at`) mixed with `normal`
-/// work that was called off (`cancelled`, ordered by `closed_at`). `dropped`
-/// is left out: it is only ever a subtask folded for a rebuild, and its target
-/// keeps the history.
+/// work that was called off (`cancelled`, ordered by `closed_at`). `dropped` is
+/// left out: it is the status of a subtask folded for a rebuild, whose target
+/// keeps the history. An operator can also move a `normal` task to `dropped`;
+/// such a task is then on no list — not the top page, not this one — until the
+/// retention sweep deletes it, reachable only by its URL. `cancelled` is the
+/// word for calling off normal work.
 pub fn list_closed(db: &Db) -> Result<Vec<Task>, Error> {
     db.with_conn(|conn| {
         query_all(
@@ -857,7 +860,11 @@ pub fn sweep_called_off(
     now: OffsetDateTime,
     retention_days: u64,
 ) -> Result<Vec<String>, Error> {
-    let days = i64::try_from(retention_days).unwrap_or(i64::MAX);
+    // Clamp to a century: `Duration::days` overflows on an absurd value, and
+    // nothing older than that exists to sweep anyway.
+    let days = i64::try_from(retention_days)
+        .unwrap_or(i64::MAX)
+        .min(36_500);
     let cutoff = format_z(now - time::Duration::days(days));
     db.with_tx(|tx| {
         let mut statement = tx.prepare(

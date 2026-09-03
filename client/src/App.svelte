@@ -21,7 +21,7 @@
 <main>
   {#if router.index === 1}
     <Detail id={router.params.id} />
-  {:else if router.index === 3}
+  {:else if router.index === 2}
     <Closed />
   {:else}
     <Home />

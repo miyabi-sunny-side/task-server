@@ -65,10 +65,10 @@ describe("router", () => {
   });
 
   it("maps /closed to the closed route and redirects /done there in place", () => {
-    expect(matchRoute("/closed")).toEqual({ index: 3, params: {} });
+    expect(matchRoute("/closed")).toEqual({ index: 2, params: {} });
     window.history.pushState(null, "", "/done");
     syncRoute();
     expect(window.location.pathname).toBe("/closed");
-    expect(router.index).toBe(3);
+    expect(router.index).toBe(2);
   });
 });

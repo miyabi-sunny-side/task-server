@@ -648,7 +648,7 @@ mod tests {
 
     use super::{
         Db, SCHEMA_V1, SCHEMA_V2, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
-        SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
+        SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15,
     };
 
     fn pragma_string(db: &Db, pragma: &str) -> String {
@@ -1998,6 +1998,73 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// Version 16 adds `closed_at` and estimates it for work already called off:
+    /// a `cancelled` or `dropped` row takes its last update as the moment, every
+    /// other row gets nothing. Reopening runs the step again and changes nothing.
+    #[test]
+    fn a_version_fifteen_database_backfills_closed_at_for_called_off_work_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sqlite.db");
+
+        let legacy = Connection::open(&path).unwrap();
+        for batch in [SCHEMA_V1, SCHEMA_V2] {
+            legacy.execute_batch(batch).unwrap();
+        }
+        super::rebuild_tasks_without_the_product_key(&legacy).unwrap();
+        for batch in [
+            SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10,
+            SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15,
+        ] {
+            legacy.execute_batch(batch).unwrap();
+        }
+        legacy
+            .execute_batch(
+                "INSERT INTO tasks (id, title, status, kind, product_id, created_at, updated_at)
+                 VALUES ('t-off', 'called off', 'cancelled', 'normal', 'a/b', 'then', 'later');
+                 INSERT INTO tasks (id, title, status, kind, product_id, created_at, updated_at)
+                 VALUES ('merge:t-x', 'folded', 'dropped', 'instant:merge', 'a/b', 'then', 'late');
+                 INSERT INTO tasks (id, title, status, kind, product_id, created_at, updated_at)
+                 VALUES ('t-done', 'finished', 'done', 'normal', 'a/b', 'then', 'later');
+                 INSERT INTO tasks (id, title, status, kind, product_id, created_at, updated_at)
+                 VALUES ('t-open', 'still going', 'wip', 'normal', 'a/b', 'then', 'later');",
+            )
+            .unwrap();
+        let before: i64 = legacy
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, 15, "the fixture must start at version 15");
+        drop(legacy);
+
+        let closed_at = |db: &Db, id: &str| -> Option<String> {
+            db.with_conn(|conn| {
+                Ok(
+                    conn.query_row("SELECT closed_at FROM tasks WHERE id = ?1", [id], |row| {
+                        row.get(0)
+                    })?,
+                )
+            })
+            .unwrap()
+        };
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(user_version(&db), 16);
+        assert_eq!(closed_at(&db, "t-off"), Some("later".to_owned()));
+        assert_eq!(closed_at(&db, "merge:t-x"), Some("late".to_owned()));
+        assert_eq!(
+            closed_at(&db, "t-done"),
+            None,
+            "finished work was not called off"
+        );
+        assert_eq!(closed_at(&db, "t-open"), None);
+        drop(db);
+
+        // Reopening runs the step again and must change nothing.
+        let db = Db::open(&path).unwrap();
+        assert_eq!(user_version(&db), 16);
+        assert_eq!(closed_at(&db, "t-off"), Some("later".to_owned()));
+        assert_eq!(closed_at(&db, "t-done"), None);
     }
 
     /// Version 15 adds the haystack table and nothing else: every task row comes

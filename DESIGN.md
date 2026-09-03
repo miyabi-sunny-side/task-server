@@ -766,8 +766,11 @@ counterpart to carry, so it earns no token pair.
   no page heading of its own. It lists every `kind: normal` task whose
   status is `done`, `approved`, `merged`, `released` or `cancelled` —
   non-`normal` tasks (`review`, `instant:merge`, `rework`) never appear,
-  and `dropped` never appears anywhere: it is a subtask folded for a
-  rebuild, and its target keeps the history. `released` and `cancelled`
+  and `dropped` never appears anywhere: it is the status of a subtask
+  folded for a rebuild, whose target keeps the history. (An operator may
+  also drop a `normal` task by hand; it then sits on no page until the
+  retention sweep deletes it, reachable only by its URL — `cancelled` is
+  the word for calling off normal work, and it stays readable here.) `released` and `cancelled`
   are shown here on purpose: the top page drops a task the moment it
   ships or is called off, and this one list is where closed work keeps
   being readable, told apart by the status badge alone. Rows sort by the

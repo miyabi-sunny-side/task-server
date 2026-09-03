@@ -7,7 +7,7 @@
   let themeOpen = $state(false);
   let menuButton = $state<HTMLButtonElement | undefined>();
 
-  let onClosed = $derived(router.index === 3);
+  let onClosed = $derived(router.index === 2);
 
   function closeMenu() {
     menuOpen = false;
