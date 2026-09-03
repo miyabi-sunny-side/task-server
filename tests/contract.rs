@@ -3652,7 +3652,7 @@ async fn the_haystack_persists_across_reopen_and_the_sweep_keeps_the_rows() {
     assert_eq!(status, StatusCode::CREATED);
 
     let state = reopen(&dir, state);
-    assert_eq!(state.db.schema_version().expect("version"), 15);
+    assert_eq!(state.db.schema_version().expect("version"), 16);
     let now = task_server::clock::Clock::now(&clock);
     let blanked = task_server::runs::prune_tails(&state.db, now, 90).expect("sweep");
     assert_eq!(blanked, 1);
@@ -3662,4 +3662,69 @@ async fn the_haystack_persists_across_reopen_and_the_sweep_keeps_the_rows() {
     assert_eq!(runs[0]["stdout_tail"], Value::Null, "old tail blanked");
     assert_eq!(runs[0]["outcome"], "done", "the rest is kept");
     assert_eq!(runs[1]["stdout_tail"], "ok");
+}
+
+// --- closed, delete ---
+
+/// The closed list holds finished and cancelled work in one list, newest
+/// closing first; `/done` still answers. Deleting is refused while work is open
+/// and takes the subtasks that named the task once it is over.
+#[tokio::test]
+async fn closed_work_is_listed_together_and_deleted_only_once_over() {
+    let (_dir, state, clock) = clocked_state(60);
+    put_product(&state, "sunny-side/keeper", true).await;
+    for id in ["t-fin", "t-off"] {
+        create_task(
+            &state,
+            &json!({"id": id, "title": id, "product_id": "sunny-side/keeper"}),
+        )
+        .await;
+    }
+    set_status(&state, "t-fin", "ready").await;
+    work_to_done(&state, "t-fin", "abc1234").await;
+    clock.advance_secs(60);
+    set_status(&state, "t-off", "ready").await;
+    let (status, _) = post_status(&state, "t-off", "cancelled").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, closed) = send(&state, read("/api/closed")).await;
+    assert_eq!(status, StatusCode::OK, "{closed}");
+    let rows = closed.as_array().expect("rows");
+    assert_eq!(ids_of(&closed), ["t-off", "t-fin"], "{closed}");
+    assert_eq!(rows[0]["status"], "cancelled");
+    assert_eq!(rows[0]["closed_at"], "2026-08-15T10:01:00Z");
+    assert_eq!(rows[1]["status"], "done");
+    assert_eq!(rows[1]["closed_at"], rows[1]["done_at"]);
+    let (status, done) = send(&state, read("/api/done")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids_of(&done), ["t-fin"], "the old list is unchanged");
+
+    let (status, refused) = send(&state, human("DELETE", "/api/tasks/t-fin", &json!({}))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    let (status, _) = send(
+        &state,
+        request("DELETE", "/api/tasks/t-off")
+            .header("x-auth-user", USER)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "CSRF token is required");
+
+    let (status, deleted) = send(&state, human("DELETE", "/api/tasks/t-off", &json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{deleted}");
+    assert_eq!(deleted["id"], "t-off");
+    let (status, _) = get_task(&state, "t-off").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A cancelled task with a review still pointing at it: both go.
+    let (status, _) = post_status(&state, "t-fin", "cancelled").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, deleted) = send(&state, human("DELETE", "/api/tasks/t-fin", &json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{deleted}");
+    assert_eq!(deleted["subtasks"], json!(["review:t-fin"]));
+    let (status, _) = get_task(&state, "review:t-fin").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(&state, human("DELETE", "/api/tasks/t-fin", &json!({}))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "deleting twice is not found");
 }

@@ -275,12 +275,12 @@ The shell stacks three rows:
 1. **App header — invariant on every page.** Sticky, 48px, full width,
    `--c-wash-base` background, 1px bottom hairline. Contents are exactly
    three, left to right: the app title as a home link (`<a href="/">`,
-   label type, on-surface ink, no underline), the done link
-   (`<a href="/done">`, label type, same ink, grouped beside the title
+   label type, on-surface ink, no underline), the closed link
+   (`<a href="/closed">`, label type, same ink, grouped beside the title
    with `--sp-2` gap), and the hamburger icon-button (right, unchanged).
-   **The title and the done link are the header's only navigation
+   **The title and the closed link are the header's only navigation
    links**; every other destination lives inside the menu, so phone
-   widths never crowd. The done link is a plain page-navigation link,
+   widths never crowd. The closed link is a plain page-navigation link,
    not a primary action — it never takes the accent-filled button
    treatment, so it never competes with a page's one accent-filled
    control (see Colors, Buttons). Its only states are default and
@@ -467,11 +467,11 @@ counterpart to carry, so it earns no token pair.
 
 - **App header:** per Layout. The title link keeps on-surface ink with
   no underline (chrome, not content — the `link` token is for body
-  links). Beside it, the **done link** is the header's one
+  links). Beside it, the **closed link** is the header's one
   page-navigation link: label type, `var(--sp-1) var(--sp-2)` padding,
   `--radius-sm`, inline-flex, 36px min height (the same hit target as
   the hamburger). Default state matches the title — on-surface ink,
-  transparent background, hover fills `--c-hover-1`. On `/done` it
+  transparent background, hover fills `--c-hover-1`. On `/closed` it
   carries `aria-current="page"` plus the **selected-radio treatment
   already used in the release modal** (`--c-accent-subtle` background,
   `--radius-sm`) and switches its text to `--c-accent` ink — the tint
@@ -656,13 +656,15 @@ counterpart to carry, so it earns no token pair.
 
   **Task list.** Below the panel, the open tasks grouped by status.
   Groups follow the status vocabulary order — the main line `draft`,
-  `ready`, `wip`, `done`, `approved`, `merged`, then the sidetracks
-  `blocked`, `cancelled`, `dropped` — and **a group holding nothing is
-  not rendered at all**, heading included. The order is the pipeline
+  `ready`, `wip`, `done`, `approved`, `merged`, then the sidetrack
+  `blocked` — and **a group holding nothing is not rendered at all**,
+  heading included. `cancelled` and `dropped` are never grouped: a task
+  that was called off leaves this page the way a released one does, and
+  the closed page is where a cancelled task keeps being readable. The order is the pipeline
   read from its start, so `approved` sits between `done` and `merged`:
   that is where the work stands — finished, carried past review, not
-  yet landed. `released` is never shown — shipped work leaves this
-  page.
+  yet landed. `released`, `cancelled` and `dropped` are never shown —
+  shipped and called-off work leaves this page.
 
   **What the list hides, and why.** The list shows `normal` tasks only,
   and hides two things. A `normal` task hides while another region of
@@ -756,16 +758,31 @@ counterpart to carry, so it earns no token pair.
   A `review` task's own card adds its subject commit as a muted caption
   in the caption row, so the operator can see which commit the verdict
   was passed on.
-- **Done page — completed task list.** Reached from the header's done
-  link (`/done`); no sub-header, per Layout item 2 — like the top page,
-  the content column opens directly on the list and current location is
-  carried by the header's selected state alone, with no page heading of
-  its own. It lists every `kind: normal` task whose status is `done`,
-  `approved`, `merged`, or `released` — non-`normal` tasks (`review`,
-  `instant:merge`, `rework`) never appear, matching the top page's own status
-  groups. `released` is shown here on purpose: the top page drops a task
-  the moment it ships, and this list is where shipped work keeps being
-  readable. Rows sort by completion time, most recent first.
+- **Closed page — finished and called-off task list.** Reached from the
+  header's closed link (`/closed`; `/done` is the old address and is
+  rewritten to `/closed` in place); no sub-header, per Layout item 2 —
+  like the top page, the content column opens directly on the list and
+  current location is carried by the header's selected state alone, with
+  no page heading of its own. It lists every `kind: normal` task whose
+  status is `done`, `approved`, `merged`, `released` or `cancelled` —
+  non-`normal` tasks (`review`, `instant:merge`, `rework`) never appear,
+  and `dropped` never appears anywhere: it is the status of a subtask
+  folded for a rebuild, whose target keeps the history. (An operator may
+  also drop a `normal` task by hand; it then sits on no page until the
+  retention sweep deletes it, reachable only by its URL — `cancelled` is
+  the word for calling off normal work, and it stays readable here.) `released` and `cancelled`
+  are shown here on purpose: the top page drops a task the moment it
+  ships or is called off, and this one list is where closed work keeps
+  being readable, told apart by the status badge alone. Rows sort by the
+  moment they closed (`closed_at`: completion for finished work, the
+  cancelling for called-off work), most recent first.
+
+  **Deleting is not a screen.** A closed task can be deleted
+  (`DELETE /api/tasks/{id}`, the MCP `task_delete`, or the retention
+  sweep), but no page holds a delete control: the top page issues
+  nothing, and the closed page and the Task Card state what is, in the
+  same voice as everything else. Deleting is an operator's act over the
+  API, like issuing a release by hand.
 
   Each row reuses the **card recipe** (`.cards` / `.card`:
   surface-raised, 1px hairline, `--radius-md`, 10px padding, 8px gaps
@@ -787,10 +804,10 @@ counterpart to carry, so it earns no token pair.
   The list container carries `data-state="loading|empty|error|success"`
   on the task list's own discipline: _loading_ is the centered accent
   spinner line; _empty_ is one centered muted `.state` line reading
-  "完了したタスクがありません" and nothing else — no heading, no zero
+  "閉じたタスクがありません" and nothing else — no heading, no zero
   pill; _error_ is the `.state.error` line plus a default "再試行"
   button; _success_ is the rows. There is no group heading and no status
-  grouping here — unlike the top page's task list, the done page is
+  grouping here — unlike the top page's task list, the closed page is
   already filtered to one purpose and reads faster as one flat,
   time-ordered list than as separate single-status groups.
 - **Buttons:** default = surface-raised bg, 1px hairline, label type,
@@ -851,10 +868,10 @@ counterpart to carry, so it earns no token pair.
      turns the body `rgb(250, 246, 239)`, writes the storage key, and
      leaves the modal open.
   3. At 375px the header contains exactly three interactive elements —
-     the title `<a href="/">`, the done link `<a href="/done">`, and
+     the title `<a href="/">`, the closed link `<a href="/closed">`, and
      the hamburger `<button>` — and
      `document.documentElement.scrollWidth` never exceeds the
-     viewport, with the menu closed or open, on both `/` and `/done`.
+     viewport, with the menu closed or open, on both `/` and `/closed`.
   4. Cards compute to 1px border / 8px radius / 10px padding / 8px gap;
      the list's `data-state` reflects loading, empty, error, success.
   5. Chrome icons are all inline SVG on the 24×24 viewBox grid, stroked
@@ -1045,28 +1062,32 @@ counterpart to carry, so it earns no token pair.
       dependency id as a muted caption beside the product id, and a task
       without a dependency carries none. No button anywhere is added for
       dependencies.
-  30. Header done link states, computed. Off `/done`, the done link's
-      computed `background-color` is transparent and it carries no
-      `aria-current` attribute. On `/done`, it carries
+  30. Header closed link states, computed. Off `/closed`, the closed
+      link's computed `background-color` is transparent and it carries no
+      `aria-current` attribute. On `/closed`, it carries
       `aria-current="page"`, its computed `background-color` equals
       `--c-accent-subtle` (`rgba(94, 184, 199, 0.15)` in Sumi,
       `rgba(47, 111, 126, 0.1)` in Kinari), its computed `color` equals
       `--c-accent`, and its computed `border-radius` equals 6px. On no
       page does the header itself contain a solid-accent-background
-      element — the done link never computes a solid `--c-accent`
+      element — the closed link never computes a solid `--c-accent`
       background in either state, so it never becomes a second
       accent-filled control alongside a page's own primary button.
-      `:focus-visible` on the done link shows the same 2px accent
+      `:focus-visible` on the closed link shows the same 2px accent
       outline as every other control, and clicking it or activating it
-      with Enter navigates to `/done` without a full page reload.
-  31. The done page shows only completed work, correctly typed. Every
-      row links to a task whose `kind` is `normal`; no `review` or
-      `instant:merge` task ever appears. Every row's status is one of
-      `done`, `approved`, `merged`, `released`; no other status appears.
-      Loading the page twice against unchanged server state yields rows
-      in the same order, and that order is non-increasing by completion
-      time (each row's timestamp is at or after the next row's).
-  32. Done row composition and single focus stop. Each row computes the
+      with Enter navigates to `/closed` without a full page reload.
+      Loading `/done` lands on the closed page with the address rewritten
+      to `/closed` and no extra history entry.
+  31. The closed page shows only closed work, correctly typed. Every
+      row links to a task whose `kind` is `normal`; no `review`,
+      `instant:merge` or `rework` task ever appears. Every row's status is
+      one of `done`, `approved`, `merged`, `released`, `cancelled`; no
+      other status appears, and `dropped` appears nowhere. Loading the
+      page twice against unchanged server state yields rows in the same
+      order, and that order is non-increasing by `closed_at` (each row's
+      timestamp is at or after the next row's). The top page's status
+      groups hold no `cancelled` or `dropped` task.
+  32. Closed row composition and single focus stop. Each row computes the
       card recipe (1px border, 8px radius, 10px padding) and contains
       exactly one focusable element — the row's own link — regardless
       of whether a release-tag chip or a verification excerpt is
@@ -1077,8 +1098,8 @@ counterpart to carry, so it earns no token pair.
       — not an empty one — and a row whose `verification` holds more
       than two lines shows only its first two, joined by a single
       `\n`, in the rendered `textContent`.
-  33. Done page states. With no completed tasks the list renders
-      exactly one `.state` element reading "完了したタスクがありません"
+  33. Closed page states. With no closed tasks the list renders
+      exactly one `.state` element reading "閉じたタスクがありません"
       and no row, no heading, and no pill. While loading it renders the
       centered accent spinner and no rows. On a failed fetch it renders
       the `.state.error` line plus a default-styled "再試行" button
@@ -1143,7 +1164,7 @@ counterpart to carry, so it earns no token pair.
   learn why.
 - Do present the menu as a hamburger-anchored dropdown; centered
   modals are for dialogs (theme settings), never for navigation.
-- Do give the done link the selected-radio tint (`--c-accent-subtle`
+- Do give the closed link the selected-radio tint (`--c-accent-subtle`
   background, `--c-accent` text) and `aria-current="page"` when active;
   don't give a page-navigation link a solid accent-filled background —
   that treatment stays reserved for a region's one primary action.

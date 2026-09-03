@@ -142,6 +142,17 @@ export function fetchDone(signal?: AbortSignal): Promise<DoneTask[]> {
   return requestJson("/api/done", { signal });
 }
 
+// A row of the closed screen: finished `normal` work and `normal` work that was
+// called off, in one list. `closed_at` is the moment it closed (the server's
+// sort key: `done_at` for finished work, the cancelling for the rest).
+export interface ClosedTask extends DoneTask {
+  closed_at: string;
+}
+
+export function fetchClosed(signal?: AbortSignal): Promise<ClosedTask[]> {
+  return requestJson("/api/closed", { signal });
+}
+
 export function fetchTask(id: string, signal?: AbortSignal): Promise<TaskCard> {
   return requestJson(`/api/tasks/${encodeURIComponent(id)}`, { signal });
 }

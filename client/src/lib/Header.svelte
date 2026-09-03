@@ -7,7 +7,7 @@
   let themeOpen = $state(false);
   let menuButton = $state<HTMLButtonElement | undefined>();
 
-  let onDone = $derived(router.index === 2);
+  let onClosed = $derived(router.index === 2);
 
   function closeMenu() {
     menuOpen = false;
@@ -39,11 +39,11 @@
     <a class="title" href="/">Task Server</a>
     <a
       class="done-link"
-      class:selected={onDone}
-      href="/done"
-      aria-current={onDone ? "page" : undefined}
+      class:selected={onClosed}
+      href="/closed"
+      aria-current={onClosed ? "page" : undefined}
     >
-      done
+      closed
     </a>
   </div>
   <div class="menu-wrapper">

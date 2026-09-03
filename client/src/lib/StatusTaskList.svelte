@@ -5,6 +5,8 @@
   // read from its start — so `approved` sits between `done` and `merged`,
   // past review and not yet landed. `released` is absent on purpose —
   // shipped work leaves the top page.
+  // `released`, `cancelled` and `dropped` are not here: work that shipped or
+  // was called off leaves this page for the closed one (DESIGN.md, Task list).
   const STATUS_ORDER = [
     "draft",
     "ready",
@@ -13,8 +15,6 @@
     "approved",
     "merged",
     "blocked",
-    "cancelled",
-    "dropped",
   ];
 
   let {

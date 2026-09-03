@@ -71,9 +71,11 @@ describe("StatusTaskList", () => {
       "approved",
       "merged",
       "blocked",
-      "cancelled",
-      "dropped",
     ]);
+    // Called-off work leaves this page for the closed one, like released.
+    for (const status of ["cancelled", "dropped"]) {
+      expect(document.querySelector(`[data-status="${status}"]`)).toBeNull();
+    }
   });
 
   it("renders no group for a status nothing is in, and never one for released", () => {
@@ -156,8 +158,6 @@ describe("StatusTaskList", () => {
       "wip",
       "merged",
       "blocked",
-      "cancelled",
-      "dropped",
     ]);
     const ready = groups().find((group) => group.dataset.status === "ready")!;
     expect(cardsOf(ready).map((card) => card.getAttribute("href"))).toEqual([

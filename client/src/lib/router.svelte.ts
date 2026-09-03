@@ -1,4 +1,4 @@
-import { matchRoute } from "./routes";
+import { REDIRECTS, matchRoute } from "./routes";
 
 const current = $state<{ index: number; params: Record<string, string> }>({
   index: 0,
@@ -15,6 +15,11 @@ export const router = {
 };
 
 export function syncRoute(): void {
+  const moved = REDIRECTS[window.location.pathname];
+  if (moved) {
+    // A moved page: rewrite the address in place, no second history entry.
+    window.history.replaceState(null, "", moved);
+  }
   const match = matchRoute(window.location.pathname);
   current.index = match.index;
   current.params = match.params;

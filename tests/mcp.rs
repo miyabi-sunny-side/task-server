@@ -341,6 +341,16 @@ async fn catalogue(router: &Router, id: &str) {
     assert_eq!(status, StatusCode::OK, "cataloguing {id}");
 }
 
+const ADMIN_TOOLS: [&str; 7] = [
+    "product_list",
+    "task_create",
+    "task_delete",
+    "task_get",
+    "task_list",
+    "task_set_status",
+    "task_update",
+];
+
 #[tokio::test]
 async fn both_endpoints_handshake_and_expose_only_their_own_tools() {
     let (_dir, state) = file_backed_state();
@@ -363,14 +373,7 @@ async fn both_endpoints_handshake_and_expose_only_their_own_tools() {
     );
     assert_eq!(
         admin.tool_names().await,
-        [
-            "product_list",
-            "task_create",
-            "task_get",
-            "task_list",
-            "task_set_status",
-            "task_update",
-        ],
+        ADMIN_TOOLS,
         "the admin endpoint owns the catalogue-and-task surface"
     );
 
@@ -1557,4 +1560,45 @@ async fn mcp_status_change_cannot_finish_a_review() {
         StatusCode::CONFLICT,
         "the refused press must not have freed the one-open-review index: {again}"
     );
+}
+
+/// `task_delete` refuses open work with the same 409 the route gives and
+/// removes a called-off task with its subtasks.
+#[tokio::test]
+async fn task_delete_removes_only_work_that_is_over() {
+    let (_dir, state) = file_backed_state();
+    let router = task_server::app(state);
+    let mut admin = McpClient::new(&router, "/mcp", STALE_MCP_CAPABILITY);
+    admin.initialize().await;
+    catalogue(&router, "sunny-side/keeper").await;
+    admin
+        .call(
+            "task_create",
+            json!({"id": "t-1", "title": "gone soon", "product_id": "sunny-side/keeper"}),
+        )
+        .await;
+    admin
+        .call("task_set_status", json!({ "id": "t-1", "status": "ready" }))
+        .await;
+
+    let refused = admin.call("task_delete", json!({ "id": "t-1" })).await;
+    assert_eq!(
+        refused["isError"],
+        json!(true),
+        "open work stays: {refused}"
+    );
+    assert_eq!(refused["structuredContent"]["code"], "conflict");
+
+    admin
+        .call(
+            "task_set_status",
+            json!({ "id": "t-1", "status": "cancelled" }),
+        )
+        .await;
+    let deleted = admin.call("task_delete", json!({ "id": "t-1" })).await;
+    assert_eq!(deleted["isError"], json!(false), "{deleted}");
+    assert_eq!(deleted["structuredContent"]["deleted"]["id"], "t-1");
+    let gone = admin.call("task_get", json!({ "id": "t-1" })).await;
+    assert_eq!(gone["isError"], json!(true));
+    assert_eq!(gone["structuredContent"]["code"], "not_found");
 }

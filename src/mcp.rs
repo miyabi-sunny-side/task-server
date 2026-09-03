@@ -355,6 +355,16 @@ impl Admin {
                 .and_then(|task| card(&self.state.db, &task)),
         )
     }
+
+    #[tool(
+        description = "Delete a task that is over: `cancelled`, `dropped` or `released`. The \
+                       review, merge and rework subtasks that named it go with it. Anything \
+                       still open is refused with 409 — call it off first (task_set_status \
+                       cancelled), then delete. The haystack keeps the task's runs."
+    )]
+    fn task_delete(&self, Parameters(args): Parameters<TaskIdArgs>) -> CallToolResult {
+        answer(task::delete(&self.state.db, &args.id).map(|deleted| json!({ "deleted": deleted })))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]

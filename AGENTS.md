@@ -29,8 +29,15 @@ JSON API, the MCP endpoints, and the compiled client.
   bucket, and endpoint through the environment and carries none of them.
 - HTTP is the only way in, carrying both the JSON API and the MCP endpoints.
   There is no file store and no git side effect.
-- There is no physical delete. Discarding a task is a transition to
-  `cancelled` or `dropped`, so the row stays auditable.
+- Discarding a task is a transition to `cancelled` or `dropped`, so the row
+  stays auditable. The one physical delete is `DELETE /api/tasks/{id}` (and
+  the MCP `task_delete`), allowed only for `cancelled`, `dropped` or
+  `released` tasks — anything open answers 409 — and it takes the review,
+  merge and rework subtasks that named the task with it, so no orphan points at
+  a row that is gone. `runs.task_id` is text, not a key: the haystack keeps
+  the task's runs. The startup sweep deletes `cancelled` / `dropped` tasks
+  closed more than `CALLED_OFF_RETENTION_DAYS` (30) ago, one log line each;
+  `released` is never swept. `closed_at` records when a task was called off.
 - Product ids are `org/repo`, never a path. Task ids are one path segment.
 - The `products` table is the register of product identity. A task may be
   created with a `product_id` that is not in it, but it may not be promoted:
@@ -436,8 +443,10 @@ and `dropped`.
 | GET | `/api/session` | read |
 | GET | `/api/tasks`, `/api/tasks/{id}` | read |
 | GET | `/api/done` | read |
+| GET | `/api/closed` | read |
 | POST | `/api/tasks` | human mutation |
 | PATCH | `/api/tasks/{id}` | human mutation |
+| DELETE | `/api/tasks/{id}` | human mutation |
 | POST | `/api/tasks/{id}/status` | human mutation |
 | GET | `/api/control` | read |
 | POST | `/api/reviews`, `/api/merges`, `/api/releases` | human mutation (reconciliation handles) |
@@ -451,7 +460,9 @@ for a status explicitly; an unknown status is a 400. Single-task responses are
 the full task plus `available_transitions`, and `latest_review` when a review
 has answered for it.
 
-`GET /api/done` answers the done screen directly rather than composing several
+`GET /api/closed` answers the closed screen directly (finished and cancelled
+`normal` work by the moment it closed); `GET /api/done` stays for readers of the
+older done list and answers it directly rather than composing several
 `?status=` calls: every `normal` task whose status is `done`, `approved`,
 `merged`, or `released`, newest-completed first (`done_at DESC, id DESC`).
 `done_at` is a `tasks` column of its own — the moment a task first reached

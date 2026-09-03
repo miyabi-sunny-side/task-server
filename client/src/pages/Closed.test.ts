@@ -7,12 +7,12 @@ import {
 } from "@testing-library/svelte";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { DoneTask } from "../lib/api";
-import Done from "./Done.svelte";
+import type { ClosedTask } from "../lib/api";
+import Closed from "./Closed.svelte";
 
 const PRODUCT = "sunny-side/task-server";
 
-function task(over: Partial<DoneTask> & { id: string }): DoneTask {
+function task(over: Partial<ClosedTask> & { id: string }): ClosedTask {
   return {
     title: `task ${over.id}`,
     status: "done",
@@ -20,6 +20,7 @@ function task(over: Partial<DoneTask> & { id: string }): DoneTask {
     release_tag: null,
     verification: null,
     done_at: "2026-08-15T10:00:00Z",
+    closed_at: over.done_at ?? "2026-08-15T10:00:00Z",
     ...over,
   };
 }
@@ -33,7 +34,7 @@ function jsonResponse(payload: unknown, status = 200): Response {
 
 function stubFetch(handler: () => Response | Promise<Response>) {
   const fetchMock = vi.fn<typeof fetch>(async (input) => {
-    if (String(input) === "/api/done") {
+    if (String(input) === "/api/closed") {
       return handler();
     }
     throw new Error(`unexpected request: ${String(input)}`);
@@ -44,10 +45,10 @@ function stubFetch(handler: () => Response | Promise<Response>) {
 
 function region(): HTMLElement {
   const found = document.querySelector<HTMLElement>(
-    '[data-region="done"][data-state]',
+    '[data-region="closed"][data-state]',
   );
   if (!found) {
-    throw new Error("done region with data-state was not found");
+    throw new Error("closed region with data-state was not found");
   }
   return found;
 }
@@ -64,15 +65,23 @@ function focusableIn(root: HTMLElement): Element[] {
   ];
 }
 
-// Newest-completed first, exactly as /api/done already returns it (the
+// Newest-closed first, exactly as /api/closed already returns it (the
 // server owns the sort; this component renders whatever order it receives).
-const ROWS: DoneTask[] = [
+const ROWS: ClosedTask[] = [
   task({
     id: "t-newest",
     title: "最新の完了",
     status: "done",
     done_at: "2026-08-17T09:00:00Z",
     verification: "line one\nline two\nline three",
+  }),
+  task({
+    id: "t-called-off",
+    title: "取り下げ",
+    status: "cancelled",
+    done_at: null,
+    closed_at: "2026-08-16T12:00:00Z",
+    verification: null,
   }),
   task({
     id: "t-middle",
@@ -91,7 +100,7 @@ const ROWS: DoneTask[] = [
   }),
 ];
 
-describe("Done", () => {
+describe("Closed", () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
@@ -100,23 +109,31 @@ describe("Done", () => {
   it("renders the rows in the order the API returns them", async () => {
     stubFetch(() => jsonResponse(ROWS));
 
-    render(Done);
+    render(Closed);
     await waitFor(() => expect(region().dataset.state).toBe("success"));
 
     expect(cards().map((card) => card.getAttribute("href"))).toEqual([
       "/tasks/t-newest",
+      "/tasks/t-called-off",
       "/tasks/t-middle",
       "/tasks/t-oldest",
     ]);
+    // A called-off task sits in the same list, told apart by its badge and
+    // dated by the moment it closed.
+    const calledOff = cards()[1];
+    expect(calledOff.querySelector(".badge")?.textContent?.trim()).toBe(
+      "cancelled",
+    );
+    expect(calledOff.textContent).toContain("2026-08-16T12:00:00Z");
   });
 
   it("shows product, status, release tag, done_at, and a two-line excerpt", async () => {
     stubFetch(() => jsonResponse(ROWS));
 
-    render(Done);
+    render(Closed);
     await waitFor(() => expect(region().dataset.state).toBe("success"));
 
-    const [newest, , oldest] = cards();
+    const [newest, , , oldest] = cards();
     expect(newest.textContent).toContain("最新の完了");
     expect(newest.textContent).toContain(PRODUCT);
     expect(newest.textContent).toContain("2026-08-17T09:00:00Z");
@@ -136,7 +153,7 @@ describe("Done", () => {
   it("renders no excerpt element for a row with no verification", async () => {
     stubFetch(() => jsonResponse(ROWS));
 
-    render(Done);
+    render(Closed);
     await waitFor(() => expect(region().dataset.state).toBe("success"));
 
     const [, middle] = cards();
@@ -146,17 +163,17 @@ describe("Done", () => {
   it("shows exactly one muted line when nothing has finished", async () => {
     stubFetch(() => jsonResponse([]));
 
-    render(Done);
+    render(Closed);
 
     await waitFor(() => expect(region().dataset.state).toBe("empty"));
-    expect(region().textContent?.trim()).toBe("完了したタスクがありません");
+    expect(region().textContent?.trim()).toBe("閉じたタスクがありません");
     expect(cards()).toHaveLength(0);
   });
 
   it("gives every row exactly one focusable element, the row link itself", async () => {
     stubFetch(() => jsonResponse(ROWS));
 
-    render(Done);
+    render(Closed);
     await waitFor(() => expect(region().dataset.state).toBe("success"));
 
     for (const card of cards()) {
@@ -171,7 +188,7 @@ describe("Done", () => {
       fail ? Promise.reject(new Error("offline")) : jsonResponse(ROWS),
     );
 
-    render(Done);
+    render(Closed);
     expect(region().dataset.state).toBe("loading");
 
     await waitFor(() => expect(region().dataset.state).toBe("error"));
@@ -181,6 +198,6 @@ describe("Done", () => {
     await fireEvent.click(retry);
 
     await waitFor(() => expect(region().dataset.state).toBe("success"));
-    expect(cards()).toHaveLength(3);
+    expect(cards()).toHaveLength(4);
   });
 });

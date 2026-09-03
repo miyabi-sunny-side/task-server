@@ -39,6 +39,8 @@ creates the database (and its parent directory) on first start.
 | POST | `/api/tasks` | create a task in `draft` (optional `release_level`: `patch` by default, `minor`, `major`), returns 201 |
 | GET | `/api/tasks/{id}` | Task Card: the task plus `available_transitions`, `latest_review` and `runs_count` |
 | PATCH | `/api/tasks/{id}` | edit `title`, `body`, `product_id`, `priority`, `branch`, `release_level` |
+| DELETE | `/api/tasks/{id}` | remove a `cancelled`, `dropped` or `released` task with the review / merge / rework subtasks that named it; anything open is 409. Answers `{deleted: {id, subtasks}}` |
+| GET | `/api/closed` | finished (`done`, `approved`, `merged`, `released`) and `cancelled` `normal` work in one list, most recently closed first; each row adds `closed_at` (the sort key) beside `done_at` |
 | POST | `/api/tasks/{id}/status` | move the task to `{"status": "..."}`; `approved`, `merged`, and `released` are refused |
 | POST | `/api/runs` | the rescue leaves a note on a task: `{task_id, note}`; the source is `rescue` whatever the body says. 201 with the row |
 | GET | `/api/runs?since=<id>&limit=<n>&task_id=<id>` | the haystack from `id > since` upward, at most `limit` (default 100, max 500); `next` is the `since` of the following page while one exists |
@@ -64,7 +66,8 @@ the one thing a cross-site page cannot produce. `Origin` is not read. Worker
 HTTP routes and both MCP endpoints deliberately add no application-layer
 authentication; bind address and firewall decide who reaches them. Each worker
 report still has to match its lease's `claim_id`. Tasks are never physically
-deleted; discard one by moving it to `cancelled` or `dropped`.
+deleted while it is open; discard one by moving it to `cancelled` or `dropped`, and
+delete it (`DELETE /api/tasks/{id}`) once it is over — or let the retention sweep do it.
 
 ## A worker in curl
 
@@ -669,7 +672,7 @@ boundary and have no application-layer authorization:
 
 | Endpoint | Authorization | Tools |
 | --- | --- | --- |
-| `POST /mcp` | none at the application layer | `product_list`, `task_create`, `task_get`, `task_list`, `task_update`, `task_set_status` |
+| `POST /mcp` | none at the application layer | `product_list`, `task_create`, `task_get`, `task_list`, `task_update`, `task_set_status`, `task_delete` |
 | `POST /worker/mcp` | none at the application layer | `task_claim`, `task_report`, `task_review_report` |
 
 Point clients at `http://127.0.0.1:3000/mcp` or `/worker/mcp`. The `initialize`
@@ -682,8 +685,8 @@ rollout. Worker reports remain bound to their leases by `claim_id`.
 
 Catalogue writes stay off MCP and are made over HTTP. Review, merge and release
 issuance remains owned by the control plane; their HTTP routes are
-reconciliation handles, not worker tools. There is no delete tool, just as there
-is no delete route. `task_create` therefore files ordinary work and takes no
+reconciliation handles, not worker tools. The one delete — `task_delete`, the twin of
+`DELETE /api/tasks/{id}` — takes only `cancelled`, `dropped` or `released` work. `task_create` therefore files ordinary work and takes no
 `kind`, and `task_set_status` refuses `merged` and `released` with the same code
 and for the same reason the HTTP status route does — one domain function answers
 both, so neither transport can become a way around the other.
@@ -965,6 +968,7 @@ corrections instead of moving an existing release tag.
 | `APP_DB_PATH` | `data/task-server.db` | SQLite database, for the server and for `import-markdown` alike. Created with its parent directory on first use. |
 | `APP_BIND_ADDR` | `127.0.0.1:3000` | HTTP listener. Keep loopback unless you are sure you want otherwise. |
 | `CLAIM_TTL_SECS` | `3600` | Lease lifetime for a claim. |
+| `CALLED_OFF_RETENTION_DAYS` | `30` | Days a `cancelled` / `dropped` task stays before the startup sweep deletes it (one log line per task). `released` work is never swept. |
 | `RUNS_RETENTION_DAYS` | `90` | Days a run keeps its `stdout_tail` / `stderr_tail` before the startup sweep blanks them. Every other field of a run is kept for good. |
 | `APP_STUCK_UNCLAIMED_SECS` | `900` | How long a `ready` task (or an issued review / merge / release / rework) may wait unclaimed before `GET /api/control` lists it in `stuck`. |
 | `APP_STUCK_SUBTASK_SECS` | `300` | How long `done` may go without a review, `approved` without a merge, or `merged` without a release before it is `stuck` (`no-subtask`). |

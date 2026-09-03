@@ -11,8 +11,12 @@ interface RouteDef {
 export const routes: RouteDef[] = [
   { pattern: /^\/$/, params: [] },
   { pattern: /^\/tasks\/([^/]+)$/, params: ["id"] },
-  { pattern: /^\/done$/, params: [] },
+  { pattern: /^\/closed$/, params: [] },
 ];
+
+// The done page moved to /closed; the old address still reaches it (rewritten
+// by syncRoute before matching, so it needs no route of its own).
+export const REDIRECTS: Record<string, string> = { "/done": "/closed" };
 
 export function matchRoute(pathname: string): RouteMatch {
   for (const [index, route] of routes.entries()) {

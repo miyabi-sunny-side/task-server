@@ -1,7 +1,7 @@
 import { waitFor } from "@testing-library/svelte";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { initRouter, navigate, router } from "./router.svelte";
+import { initRouter, navigate, router, syncRoute } from "./router.svelte";
 import { matchRoute } from "./routes";
 
 describe("matchRoute", () => {
@@ -62,5 +62,13 @@ describe("router", () => {
     expect(router.index).toBe(1);
     anchor.remove();
     teardown();
+  });
+
+  it("maps /closed to the closed route and redirects /done there in place", () => {
+    expect(matchRoute("/closed")).toEqual({ index: 2, params: {} });
+    window.history.pushState(null, "", "/done");
+    syncRoute();
+    expect(window.location.pathname).toBe("/closed");
+    expect(router.index).toBe(2);
   });
 });
