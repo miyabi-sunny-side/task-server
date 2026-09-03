@@ -697,10 +697,10 @@ impl Walk {
         // "unknown" so the caller keeps the flag it holds, and the other
         // products are still catalogued.
         let Ok(Some(object_dirs)) = self.object_directories(&dirs.common.join("objects")) else {
-            return Ok(None);
+            return None;
         };
         let Ok(repo) = Self::open(&dirs.git) else {
-            return Ok(None);
+            return None;
         };
         match self.default_tree(&repo, &dirs.git, object_dirs) {
             Ok(Resolved::Tree(default)) => self
