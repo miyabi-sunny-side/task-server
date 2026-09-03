@@ -3937,7 +3937,9 @@ async fn a_dependency_that_already_landed_promotes_over_http() {
     assert_eq!(promoted["status"], "ready", "{promoted}");
 
     // `released` counts as landed too: a non-releasing product ends its work
-    // there straight from the merge.
+    // there straight from the merge. A fresh server, so the release the keeper's
+    // landing issued above is not what the claim hands out.
+    let state = AppState::for_test();
     put_product(&state, "sunny-side/library", false).await;
     drive_to_merged_or_released(&state, "t-lib", "sunny-side/library", "def5678").await;
     let (_, shipped) = get_task(&state, "t-lib").await;
@@ -3945,7 +3947,7 @@ async fn a_dependency_that_already_landed_promotes_over_http() {
     let after_release = create_task(
         &state,
         &json!({"id": "t-after-release", "title": "after release",
-                "product_id": "sunny-side/keeper", "depends_on": "t-lib"}),
+                "product_id": "sunny-side/library", "depends_on": "t-lib"}),
     )
     .await;
     assert_eq!(after_release["status"], "ready", "{after_release}");
