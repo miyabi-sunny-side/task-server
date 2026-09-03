@@ -3935,4 +3935,18 @@ async fn a_dependency_that_already_landed_promotes_over_http() {
     .await;
     assert_eq!(status, StatusCode::OK, "{promoted}");
     assert_eq!(promoted["status"], "ready", "{promoted}");
+
+    // `released` counts as landed too: a non-releasing product ends its work
+    // there straight from the merge.
+    put_product(&state, "sunny-side/library", false).await;
+    drive_to_merged_or_released(&state, "t-lib", "sunny-side/library", "def5678").await;
+    let (_, shipped) = get_task(&state, "t-lib").await;
+    assert_eq!(shipped["status"], "released", "{shipped}");
+    let after_release = create_task(
+        &state,
+        &json!({"id": "t-after-release", "title": "after release",
+                "product_id": "sunny-side/keeper", "depends_on": "t-lib"}),
+    )
+    .await;
+    assert_eq!(after_release["status"], "ready", "{after_release}");
 }

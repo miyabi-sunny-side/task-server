@@ -274,8 +274,8 @@ pressed to `ready` — the status route and `task_set_status` answer 409
 `dependency_pending` — and its card carries the dependency's status as
 `dependency_status`. The landing promotes every `draft` that waited for it,
 through the same gate a pressed `ready` goes through; a draft the gate refuses
-(product not catalogued, no product) stays `draft` with the reason on
-`verification`.
+(`product_not_catalogued`, `product_archived`, `product_required`) stays `draft`
+with the reason on `verification`.
 
 **A draft pointed at work that has already landed is promoted at once.** Filing
 a task after its dependency shipped, or re-linking a chain onto a landed task,
@@ -286,8 +286,9 @@ refused. A task that is not `draft` is left where it is.
 
 A dependency that could never land is refused when set: the task itself, an
 unknown task, a `cancelled` or `dropped` task, or a chain that leads back. When
-a dependency is later called off, its dependants are moved to `blocked` with the
-reason. Clearing `depends_on` (`null`) is the way to skip the order.
+a dependency is later called off, its `draft` and `ready` dependants are moved to
+`blocked` with the reason; work already under way is not touched. Clearing
+`depends_on` (`null`) is the way to skip the order.
 
 ## The product catalogue
 
