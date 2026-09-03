@@ -116,7 +116,7 @@ JSON API, the MCP endpoints, and the compiled client.
   `task::set_status_by_operator` refuses it inside the transaction that reads the
   row, and `available_transitions` leaves it out, so neither HTTP nor MCP can
   finish a review without a verdict — which would also have freed the
-  one-open-review index, whose predicate stops at `done`. While the review is
+  one-open-review index, whose predicate stops at `done` (and `released`). While the review is
   still open, only `done` is closed: `wip` is how a reviewer claims the task, and
   `blocked`, `cancelled`, and `dropped` stay pressable so an attempt can be
   called off. That `cancelled` and `dropped` release the index is the point of
@@ -174,7 +174,7 @@ JSON API, the MCP endpoints, and the compiled client.
 - `POST /worker/report` with the default `outcome` finishes a `normal` task and
   calls `task::ensure_review` in the same transaction. `ensure_review` is a
   no-op when some review already holds the target — the test is the predicate of
-  the one-open-review index, `status NOT IN ('done', 'cancelled', 'dropped')` —
+  the one-open-review index, `status NOT IN ('done', 'cancelled', 'dropped', 'released')` —
   because that review either hands the work back or is refused as stale, and
   either way the work has a reader. Otherwise it issues one, and a review that
   cannot be issued takes the whole report down with it rather than leaving work
@@ -187,7 +187,10 @@ JSON API, the MCP endpoints, and the compiled client.
   `status NOT IN ('cancelled', 'dropped')` — a landed merge keeps its target for
   ever, so `done` is *not* on that list. `request_changes` issues nothing.
 - One open review per target, kept by a partial unique index whose predicate
-  excludes `done`, `cancelled`, and `dropped`. That is where it parts company
+  excludes `done`, `cancelled`, `dropped`, and `released` (since schema
+  version 12; a target reviewed twice ships both rounds to `released`, and
+  before that the release report collided on the index and rolled back). That
+  is where it parts company
   with the merge index, which keeps `done`: a landed merge still owns its
   target, while a review that answered is over and must not block the next
   round. The two therefore need columns of their own. A retry is

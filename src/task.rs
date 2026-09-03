@@ -694,8 +694,8 @@ fn operator_refusal(task: &Task, to: TaskStatus) -> Option<Error> {
     //
     //   * `blocked` puts the finished attempt back inside the single-open-review
     //     index — its predicate is `status NOT IN ('done', 'cancelled',
-    //     'dropped')` — so an attempt that is over would stand in the way of the
-    //     next review of the same target;
+    //     'dropped', 'released')` — so an attempt that is over would stand in
+    //     the way of the next review of the same target;
     //   * from `blocked` the row walks on to `ready` and, on a claim, to `wip`,
     //     where `review_report` accepts it again and writes a second verdict
     //     over the first — the one answer the target lived by, overwritten by
@@ -727,7 +727,7 @@ fn operator_refusal(task: &Task, to: TaskStatus) -> Option<Error> {
     // finishing it. It
     // would leave a finished review carrying no verdict and no findings, and —
     // because the single-open-review index is written `status NOT IN ('done',
-    // 'cancelled', 'dropped')` — it would free the target for the next review
+    // 'cancelled', 'dropped', 'released')` — it would free the target for the next review
     // as though this one had answered. That is the whole completion contract
     // walked around, so the domain refuses it and every surface inherits the
     // refusal.
@@ -1516,7 +1516,9 @@ fn ensure_merge(tx: &Connection, target_id: &str, stamp: &str) -> Result<(), Err
 }
 
 /// The statuses that end a review's hold on its target, spelled as the partial
-/// unique index spells it. A review is over the moment it answers.
+/// unique index spells it. A review is over the moment it answers, and a review
+/// carried to `released` with its shipped target is over as well — two of them
+/// may share a target, because a target reviewed twice ships both its rounds.
 ///
 /// One phrase, three readers: [`ensure_review`] asks it before issuing,
 /// [`pending_reviews`] lists the attempts it excludes, and [`unreviewed`]
@@ -1524,10 +1526,11 @@ fn ensure_merge(tx: &Connection, target_id: &str, stamp: &str) -> Result<(), Err
 /// listed as unreviewed exactly when a new review could be issued for it — so
 /// they read it from here instead of each spelling it out.
 ///
-/// The migration that creates the index spells it again in its own SQL, and
+/// The migration that (re)creates the index spells it again in its own SQL, and
 /// stays there on purpose: a migration is the record of what a past schema was
-/// made of, and it must not change under a later edit to this line.
-const REVIEW_IS_OVER: &str = "('done', 'cancelled', 'dropped')";
+/// made of, and it must not change under a later edit to this line. Version 5
+/// stopped at `done`; version 12 added `released`.
+const REVIEW_IS_OVER: &str = "('done', 'cancelled', 'dropped', 'released')";
 
 /// The statuses that end a merge's hold on its target. A landed merge keeps its
 /// target for ever — `done` is not on this list — because a task that merged is
@@ -1912,7 +1915,7 @@ pub fn pending_merges(db: &Db) -> Result<Vec<Task>, Error> {
             &format!(
                 "SELECT {COLUMNS} FROM tasks
                  WHERE kind = 'instant:merge'
-                   AND status NOT IN ('done', 'cancelled', 'dropped')
+                   AND status NOT IN ('done', 'cancelled', 'dropped', 'released')
                  ORDER BY created_at ASC, id ASC"
             ),
             &[],
@@ -3684,6 +3687,77 @@ mod tests {
             Some(next.id.as_str())
         );
         assert_eq!(get(&db, "t-2").unwrap().status, TaskStatus::Merged);
+    }
+
+    /// A target that went through review twice (`request_changes`, then approve)
+    /// carries two finished reviews. Shipping it moves both to `released` in
+    /// one UPDATE — which the one-open-review index used to refuse, because its
+    /// predicate treated `released` as open and two released reviews of one
+    /// target collided. The whole report rolled back as a 500 and the release
+    /// stayed `wip` while the tag was already on origin.
+    #[test]
+    fn a_release_ships_a_target_that_was_reviewed_twice() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        work_to_done(&db, "t-1");
+        let (first_review, claim_id) = claim_review(&db, "t-1");
+        review_report(
+            &db,
+            &claim_id,
+            "abc1234",
+            ReviewVerdict::RequestChanges,
+            "please add the missing test",
+            later(),
+        )
+        .unwrap();
+        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Ready);
+        // Second round: the worker reports a new commit, a second review approves.
+        let leased = claim(&db, "worker", &[TaskKind::Normal], later(), 60)
+            .unwrap()
+            .expect("the work handed back is claimable again");
+        assert_eq!(leased.id, "t-1");
+        report(
+            &db,
+            &leased.claim_id.expect("claim_id"),
+            "def5678",
+            "cargo test",
+            &[],
+            ReportOutcome::Done,
+            None,
+            later(),
+        )
+        .unwrap();
+        let (second_review, claim_id) = claim_review(&db, "t-1");
+        assert_eq!(second_review, format!("{first_review}~2"));
+        review_report(
+            &db,
+            &claim_id,
+            "def5678",
+            ReviewVerdict::Approve,
+            "now it is right",
+            later(),
+        )
+        .unwrap();
+        let merge = issued_merge(&db, "t-1");
+        merge_into(&db, &merge.id, TaskStatus::Done);
+        let release = claim_release(&db);
+
+        let shipped = ship(&db, &release, Some("v0.1.1")).expect("two finished reviews ship");
+        assert_eq!(shipped.status, TaskStatus::Released);
+        for id in ["t-1", &first_review, &second_review, &merge.id, &release.id] {
+            let task = get(&db, id).unwrap();
+            assert_eq!(task.status, TaskStatus::Released, "{id}");
+            assert_eq!(task.release_tag.as_deref(), Some("v0.1.1"), "{id}");
+        }
+        assert!(
+            pending_reviews(&db).unwrap().is_empty(),
+            "released reviews are not pending"
+        );
+        assert!(
+            pending_merges(&db).unwrap().is_empty(),
+            "released merges are not pending"
+        );
+        assert!(pending_releases(&db).unwrap().is_empty());
     }
 
     /// A release is finished by the tag it cut and by nothing else: no tag, or

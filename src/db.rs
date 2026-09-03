@@ -281,6 +281,36 @@ PRAGMA user_version = 11;
 COMMIT;
 ";
 
+/// The one-open-review index as every version from 12 on spells it: `released`
+/// is over, like `done`, `cancelled` and `dropped`. The version 5 index stopped
+/// at `done`, so a target reviewed twice (`request_changes`, then approve) could
+/// not be shipped — moving both finished reviews to `released` collided on the
+/// index and the whole release report rolled back while the tag was already on
+/// origin. Rewriting an index is idempotent, so this is also run — in its own
+/// transaction — before the version 9 and 10 backfills, which move `done`
+/// reviews to `released` and would hit the same collision on any database that
+/// already carries the index (version 5 to 9) when it upgrades through them.
+const REVIEW_INDEX_RELEASED_IS_OVER: &str = "\
+BEGIN;
+DROP INDEX IF EXISTS tasks_open_review_target_idx;
+CREATE UNIQUE INDEX tasks_open_review_target_idx ON tasks(review_target_task_id)
+  WHERE review_target_task_id IS NOT NULL
+    AND status NOT IN ('done', 'cancelled', 'dropped', 'released');
+COMMIT;
+";
+
+/// Version 12 changes nothing but the one-open-review index: see
+/// [`REVIEW_INDEX_RELEASED_IS_OVER`]. No row moves.
+const SCHEMA_V12: &str = "\
+BEGIN;
+DROP INDEX IF EXISTS tasks_open_review_target_idx;
+CREATE UNIQUE INDEX tasks_open_review_target_idx ON tasks(review_target_task_id)
+  WHERE review_target_task_id IS NOT NULL
+    AND status NOT IN ('done', 'cancelled', 'dropped', 'released');
+PRAGMA user_version = 12;
+COMMIT;
+";
+
 /// How long a writer waits for a lock before giving up, in milliseconds.
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -446,6 +476,14 @@ fn migrate(conn: &Connection) -> Result<(), Error> {
     if version < 8 {
         conn.execute_batch(SCHEMA_V8)?;
     }
+    if (5..10).contains(&version) {
+        // The version 9 and 10 backfills move `done` reviews to `released`; on
+        // the version 5 index two of them for one target would collide. Widen
+        // the index first on every database that already has it (a database
+        // below 5 has no review rows yet, so its backfills move nothing) —
+        // version 12 does the same again, harmlessly.
+        conn.execute_batch(REVIEW_INDEX_RELEASED_IS_OVER)?;
+    }
     if version < 9 {
         conn.execute_batch(SCHEMA_V9)?;
     }
@@ -454,6 +492,9 @@ fn migrate(conn: &Connection) -> Result<(), Error> {
     }
     if version < 11 {
         conn.execute_batch(SCHEMA_V11)?;
+    }
+    if version < 12 {
+        conn.execute_batch(SCHEMA_V12)?;
     }
     Ok(())
 }
@@ -508,7 +549,7 @@ mod tests {
 
     use super::{
         Db, SCHEMA_V1, SCHEMA_V2, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
-        SCHEMA_V10,
+        SCHEMA_V10, SCHEMA_V11,
     };
 
     fn pragma_string(db: &Db, pragma: &str) -> String {
@@ -600,11 +641,11 @@ mod tests {
         let named = Db::open(":memory:").unwrap();
         assert_eq!(pragma_string(&named, "journal_mode"), "memory");
         assert_eq!(pragma_int(&named, "busy_timeout"), 5000);
-        assert_eq!(user_version(&named), 11);
+        assert_eq!(user_version(&named), 12);
 
         let private = Db::open_in_memory().unwrap();
         assert_eq!(pragma_int(&private, "busy_timeout"), 5000);
-        assert_eq!(user_version(&private), 11);
+        assert_eq!(user_version(&private), 12);
 
         // A URI spelling is not one of them. Only the exact `:memory:` is
         // exempt, so a URI is an ordinary filename: it lands on disk in WAL,
@@ -693,7 +734,7 @@ mod tests {
     #[test]
     fn migration_creates_the_current_schema() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(user_version(&db), 11);
+        assert_eq!(user_version(&db), 12);
         let tables: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row(
@@ -725,7 +766,7 @@ mod tests {
         drop(db);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 11);
+        assert_eq!(user_version(&db), 12);
         let products: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row("SELECT count(*) FROM products", [], |row| row.get(0))?)
@@ -760,7 +801,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 11);
+        assert_eq!(user_version(&db), 12);
 
         let (title, status, priority, merge_target, checks): (
             String,
@@ -856,7 +897,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 11);
+        assert_eq!(user_version(&db), 12);
 
         db.with_conn(|conn| {
             let rows_after = rebuilt_rows(conn, ["t-target", "merge:t-target", "t-plain"]);
@@ -960,7 +1001,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 11);
+        assert_eq!(user_version(&db), 12);
         let archived = |db: &Db| -> (usize, Option<String>) {
             db.with_conn(|conn| {
                 let columns = column_names(conn, "products");
@@ -985,7 +1026,7 @@ mod tests {
         // column is not added twice and the row is not re-marked.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 11);
+        assert_eq!(user_version(&db), 12);
         assert_eq!(archived(&db), (1, None), "a second open changes nothing");
         let tasks: i64 = db
             .with_conn(|conn| {
@@ -1188,7 +1229,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 11);
+        assert_eq!(user_version(&db), 12);
         db.with_conn(|conn| {
             let columns = column_names(conn, "tasks");
             for added in ["review_target_task_id", "review_verdict"] {
@@ -1216,7 +1257,7 @@ mod tests {
         // Reopening runs the step again and must change nothing.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 11);
+        assert_eq!(user_version(&db), 12);
         let tasks: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?)
@@ -1274,7 +1315,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 11);
+        assert_eq!(user_version(&db), 12);
 
         let upgraded = Connection::open(&path).unwrap();
         assert!(
@@ -1305,7 +1346,7 @@ mod tests {
         // Reopening runs nothing again.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 11);
+        assert_eq!(user_version(&db), 12);
     }
 
     /// The step on its own: a database that already reached version 6 loses the
@@ -1352,7 +1393,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 11);
+        assert_eq!(user_version(&db), 12);
         let upgraded = Connection::open(&path).unwrap();
         assert!(
             !column_names(&upgraded, "tasks").contains(&"merge_sequence".to_owned()),
@@ -1415,7 +1456,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 11);
+        assert_eq!(user_version(&db), 12);
         db.with_conn(|conn| {
             let husk = |id: &str| -> (String, Option<String>, String) {
                 conn.query_row(
@@ -1568,7 +1609,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 11);
+        assert_eq!(user_version(&db), 12);
         db.with_conn(|conn| {
             let names = column_names(conn, "tasks");
             for column in V10_COLUMNS {
@@ -1608,6 +1649,168 @@ mod tests {
         .unwrap();
     }
 
+    /// Version 12 rewrites the one-open-review index so `released` no longer
+    /// counts as open. Before it, a target reviewed twice (`request_changes`, then
+    /// approve) could not be shipped: moving both finished reviews to
+    /// `released` collided on the index and the whole release report rolled
+    /// back. The rewrite has to hold for a database that already carries such a
+    /// pair, and the index must still refuse two open reviews of one target.
+    #[test]
+    fn a_version_eleven_database_lets_two_released_reviews_share_a_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sqlite.db");
+
+        let legacy = Connection::open(&path).unwrap();
+        for batch in [SCHEMA_V1, SCHEMA_V2] {
+            legacy.execute_batch(batch).unwrap();
+        }
+        super::rebuild_tasks_without_the_product_key(&legacy).unwrap();
+        for batch in [
+            SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10,
+            SCHEMA_V11,
+        ] {
+            legacy.execute_batch(batch).unwrap();
+        }
+        legacy
+            .execute_batch(
+                "INSERT INTO tasks (id, title, body, status, kind, product_id, release_tag,
+                                    created_at, updated_at)
+                 VALUES ('t-1', 'shipped twice-reviewed work', 'body', 'merged', 'normal', 'a/b',
+                         NULL, 'early', 'late');
+                 INSERT INTO tasks (id, title, body, status, kind, product_id,
+                                    review_target_task_id, review_attempt, review_verdict,
+                                    created_at, updated_at)
+                 VALUES ('review:t-1', 'first', 'body', 'done', 'review', 'a/b', 't-1', 1,
+                         'request_changes', 'early', 'early');
+                 INSERT INTO tasks (id, title, body, status, kind, product_id,
+                                    review_target_task_id, review_attempt, review_verdict,
+                                    created_at, updated_at)
+                 VALUES ('review:t-1~2', 'second', 'body', 'done', 'review', 'a/b', 't-1', 2,
+                         'approve', 'early', 'early');",
+            )
+            .unwrap();
+        let before: i64 = legacy
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, 11, "the fixture must start at version 11");
+        // On the old index this is exactly the statement the release ran.
+        let collided = legacy.execute(
+            "UPDATE tasks SET status = 'released' WHERE review_target_task_id = 't-1'",
+            [],
+        );
+        assert!(
+            collided.is_err(),
+            "the fixture must reproduce the collision"
+        );
+        drop(legacy);
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(user_version(&db), 12);
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE tasks SET status = 'released', release_tag = 'v1.0.0'
+                 WHERE review_target_task_id = 't-1'",
+                [],
+            )
+            .expect("two finished reviews of one target may both be released");
+            let released: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM tasks WHERE review_target_task_id = 't-1'
+                     AND status = 'released'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(released, 2);
+            // One open review per target is still the rule.
+            conn.execute(
+                "INSERT INTO tasks (id, title, body, status, kind, product_id,
+                                    review_target_task_id, review_attempt, created_at, updated_at)
+                 VALUES ('review:t-1~3', 'third', 'body', 'ready', 'review', 'a/b', 't-1', 3,
+                         'now', 'now')",
+                [],
+            )
+            .unwrap();
+            let second_open = conn.execute(
+                "INSERT INTO tasks (id, title, body, status, kind, product_id,
+                                    review_target_task_id, review_attempt, created_at, updated_at)
+                 VALUES ('review:t-1~4', 'fourth', 'body', 'ready', 'review', 'a/b', 't-1', 4,
+                         'now', 'now')",
+                [],
+            );
+            assert!(
+                second_open.is_err(),
+                "two open reviews of one target are still refused"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// The version 10 backfill moves the `done` reviews of a merged,
+    /// non-releasing target to `released`. On the version 5 index two of them
+    /// for one target collided, so a database at version 9 could not be opened
+    /// at all by a build that shipped the fix. The index is widened before the
+    /// backfill runs.
+    #[test]
+    fn a_version_nine_database_with_two_reviews_of_one_target_still_upgrades() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sqlite.db");
+
+        let legacy = Connection::open(&path).unwrap();
+        for batch in [SCHEMA_V1, SCHEMA_V2] {
+            legacy.execute_batch(batch).unwrap();
+        }
+        super::rebuild_tasks_without_the_product_key(&legacy).unwrap();
+        for batch in [
+            SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+        ] {
+            legacy.execute_batch(batch).unwrap();
+        }
+        legacy
+            .execute_batch(
+                "INSERT INTO products (id, repository, releases, created_at, updated_at)
+                 VALUES ('c/d', 'https://example.test/c/d.git', 0, 'early', 'early');
+                 INSERT INTO tasks (id, title, status, kind, product_id, created_at, updated_at)
+                 VALUES ('t-keep', 'landed for good', 'merged', 'normal', 'c/d', 'early', 'late');
+                 INSERT INTO tasks (id, title, status, kind, product_id,
+                                    review_target_task_id, review_attempt, review_verdict,
+                                    created_at, updated_at)
+                 VALUES ('review:t-keep', 'first', 'done', 'review', 'c/d', 't-keep', 1,
+                         'request_changes', 'early', 'early'),
+                        ('review:t-keep~2', 'second', 'done', 'review', 'c/d', 't-keep', 2,
+                         'approve', 'early', 'early');",
+            )
+            .unwrap();
+        let before: i64 = legacy
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, 9, "the fixture must start at version 9");
+        drop(legacy);
+
+        let db = Db::open(&path).expect("the upgrade must not collide on the review index");
+        assert_eq!(user_version(&db), 12);
+        db.with_conn(|conn| {
+            let released: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM tasks WHERE review_target_task_id = 't-keep'
+                     AND status = 'released'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(released, 2, "both finished reviews followed their target");
+            let target: String = conn
+                .query_row("SELECT status FROM tasks WHERE id = 't-keep'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(target, "released");
+            Ok(())
+        })
+        .unwrap();
+    }
+
     /// Version 11 adds `depends_on` and nothing else: every row comes across
     /// with the column empty, because nothing that already existed waits.
     #[test]
@@ -1639,7 +1842,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 11);
+        assert_eq!(user_version(&db), 12);
         db.with_conn(|conn| {
             assert!(column_names(conn, "tasks").contains(&"depends_on".to_owned()));
             let depends_on: Option<String> = conn
