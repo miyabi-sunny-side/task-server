@@ -51,6 +51,38 @@ fn write(path: &Path, body: &str) {
     fs::write(path, body).expect("write");
 }
 
+/// Commit `.github/workflows/release.yml` on `main` of the clone at `dir`, so the
+/// walk finds the workflows where it looks for them: the committed tree, not the
+/// checkout.
+fn commit_workflows(dir: &Path) {
+    use gix::objs::tree::EntryKind;
+
+    let repo = gix::open_opts(dir.join(".git"), gix::open::Options::isolated()).expect("open");
+    let blob = repo.write_blob("on: push\n").expect("blob").detach();
+    let mut tree = repo.edit_tree(repo.empty_tree().id()).expect("edit");
+    tree.upsert(".github/workflows/release.yml", EntryKind::Blob, blob)
+        .expect("upsert");
+    let tree = tree.write().expect("tree").detach();
+    let signature = gix::actor::SignatureRef {
+        name: "fixture".into(),
+        email: "fixture@example.com".into(),
+        time: "0 +0000",
+    };
+    let commit = repo
+        .new_commit_as(
+            signature,
+            signature,
+            "fixture",
+            tree,
+            gix::commit::NO_PARENT_IDS,
+        )
+        .expect("commit");
+    write(
+        &dir.join(".git/refs/heads/main"),
+        &format!("{}\n", commit.id),
+    );
+}
+
 /// The timestamps and the archive mark are not on the API surface, so the test
 /// reads them from the file the server writes.
 fn stamps(dir: &TempDir) -> Vec<(String, String, String, Option<String>)> {
@@ -74,7 +106,7 @@ fn tree(root: &Path) {
         "git@github.com:miyabisun/viewer.git",
     );
     write(&viewer.join("README.md"), "# a viewer of things\n\nbody\n");
-    write(&viewer.join(".github/workflows/release.yml"), "on: push\n");
+    commit_workflows(&viewer);
 
     // Tagged, and with no `.github/workflows`: a version was cut here by hand,
     // and nothing in the repository builds a release.

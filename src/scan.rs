@@ -5,11 +5,15 @@
 //! this reads them instead — the directories under `APP_PROJECTS_DIR`, two levels
 //! deep, as `<org>/<repo>`.
 //!
-//! Read-only, and git-binary-free. The remote comes from `.git/config`. A normal
-//! clone keeps the working-tree `README.md` and `.github/workflows` authoritative;
-//! a bare repository has no working tree, so the same metadata comes from its
-//! clean tree at `HEAD`. Shelling out to `git` would need a writable `HOME` and a
-//! git binary, neither of which a read-only container mount has.
+//! Read-only, and git-binary-free. The remote comes from `.git/config`. Whether a
+//! product releases is read from the tree of its default branch — the tip of
+//! `refs/remotes/origin/HEAD`, or `HEAD` when there is no remote-tracking
+//! default — never from the working tree: a bare clone has no working tree, and
+//! a clone whose local branch fell behind origin would otherwise answer for a
+//! commit nobody is shipping. A normal clone still describes itself from its
+//! working-tree `README.md`; a bare one from the same default-branch tree.
+//! Shelling out to `git` would need a writable `HOME` and a git binary, neither
+//! of which a read-only container mount has.
 //!
 //! The tree is also the boundary. Every path this opens is canonicalised and has
 //! to sit under the canonical root: git directories, worktree pointers, refs,
@@ -89,9 +93,27 @@ pub struct Report {
     /// The products, ordered by id.
     pub products: Vec<Product>,
     pub skipped: Vec<Skipped>,
+    /// Products whose default-branch tree could not be read (no commit yet, a
+    /// ref that is missing, an object that will not open). Their `releases`
+    /// in `products` is a placeholder (`false`); the caller keeps the value it
+    /// already holds for them rather than turning a release off on a bad read.
+    pub releases_unknown: Vec<String>,
 }
 
 impl Report {
+    /// The products with every unreadable `releases` replaced by what `previous`
+    /// answers for that id — the value the catalogue already holds — or left
+    /// off when it holds nothing. A bad read never switches a release off.
+    #[must_use]
+    pub fn with_previous_releases(mut self, previous: impl Fn(&str) -> Option<bool>) -> Self {
+        for id in &self.releases_unknown {
+            if let Some(product) = self.products.iter_mut().find(|product| &product.id == id) {
+                product.releases = previous(id).unwrap_or(false);
+            }
+        }
+        self
+    }
+
     /// How many entries each reason accounts for, for one summary log line.
     #[must_use]
     pub fn skipped_by_reason(&self) -> BTreeMap<&'static str, usize> {
@@ -173,7 +195,24 @@ struct Dirs {
 #[derive(Default)]
 struct Metadata {
     readme: Option<String>,
-    releases: bool,
+    /// `None` when the default-branch tree could not be read.
+    releases: Option<bool>,
+}
+
+/// The tree of the default branch, with the object directories every object it
+/// names has to sit in.
+struct DefaultTree<'repo> {
+    tree: gix::Tree<'repo>,
+    object_dirs: Vec<PathBuf>,
+}
+
+/// What resolving the default branch found.
+enum Resolved<'repo> {
+    Tree(DefaultTree<'repo>),
+    /// No commit to read (an empty repository, or a ref that points nowhere).
+    Nothing,
+    /// A ref or object resolves outside the catalogue root.
+    Outside,
 }
 
 enum BareMetadata {
@@ -232,7 +271,12 @@ impl Walk {
             for repo in entries(&org.path)? {
                 let name = format!("{}/{}", org.name, repo.name);
                 match self.look_at(&name, &repo)? {
-                    Outcome::Product(product) => report.products.push(product),
+                    Outcome::Product(product, releases_known) => {
+                        if !releases_known {
+                            report.releases_unknown.push(product.id.clone());
+                        }
+                        report.products.push(product);
+                    }
                     Outcome::Skip(reason) => report.skipped.push(Skipped { name, reason }),
                     Outcome::Ignore => {}
                 }
@@ -241,6 +285,7 @@ impl Walk {
         report
             .products
             .sort_by(|left, right| left.id.cmp(&right.id));
+        report.releases_unknown.sort();
         Ok(report)
     }
 
@@ -271,23 +316,26 @@ impl Walk {
         let metadata = match self.bare_metadata(&dirs, &config)? {
             BareMetadata::NotBare => Metadata {
                 readme: self.read_within(&entry.path.join("README.md"))?,
-                releases: self.releases(&entry.path)?,
+                releases: self.releases(&dirs)?,
             },
             BareMetadata::Outside => return Ok(Outcome::Skip(SkipReason::OutsideRoot)),
             BareMetadata::Head(metadata) => metadata,
         };
-        Ok(Outcome::Product(Product {
-            id: id.to_owned(),
-            repository: normalize_remote_url(url),
-            description: metadata
-                .readme
-                .as_deref()
-                .map(first_heading_line)
-                .unwrap_or_default(),
-            releases: metadata.releases,
-            // On disk is what the walk means, so nothing it finds is archived.
-            archived: false,
-        }))
+        Ok(Outcome::Product(
+            Product {
+                id: id.to_owned(),
+                repository: normalize_remote_url(url),
+                description: metadata
+                    .readme
+                    .as_deref()
+                    .map(first_heading_line)
+                    .unwrap_or_default(),
+                releases: metadata.releases.unwrap_or(false),
+                // On disk is what the walk means, so nothing it finds is archived.
+                archived: false,
+            },
+            metadata.releases.is_some(),
+        ))
     }
 
     /// The directories holding this repository's `HEAD`, config and refs.
@@ -399,48 +447,23 @@ impl Walk {
             return Ok(BareMetadata::Outside);
         };
 
-        let repo = gix::open::Options::isolated()
-            // Replacement refs can redirect a pre-checked object id to another
-            // loose object. Catalogue metadata is the literal HEAD tree, so keep
-            // the ids we validate identical to the ids gix reads.
-            .config_overrides(["core.useReplaceRefs=true"])
-            .open_path_as_is(true)
-            .strict_config(true)
-            .open(&dirs.git)
-            .map_err(|err| git_error(&dirs.git, &err))?
-            .to_thread_local();
+        let repo = Self::open(&dirs.git)?;
         if !repo.is_bare() {
             return Ok(BareMetadata::NotBare);
         }
-
-        let head = repo.head().map_err(|err| git_error(&dirs.git, &err))?;
-        let Some(commit_id) = head.id().map(gix::Id::detach) else {
-            return Ok(BareMetadata::Head(Metadata::default()));
+        let default = match self.default_tree(&repo, &dirs.git, object_dirs)? {
+            Resolved::Tree(default) => default,
+            Resolved::Nothing => return Ok(BareMetadata::Head(Metadata::default())),
+            Resolved::Outside => return Ok(BareMetadata::Outside),
         };
-        if !self.object_is_within(&object_dirs, &commit_id)? {
-            return Ok(BareMetadata::Outside);
-        }
-        let commit = repo
-            .find_commit(commit_id)
-            .map_err(|err| git_error(&dirs.git, &err))?;
-        let tree_id = commit
-            .tree_id()
-            .map_err(|err| git_error(&dirs.git, &err))?
-            .detach();
-        if !self.object_is_within(&object_dirs, &tree_id)? {
-            return Ok(BareMetadata::Outside);
-        }
-        let tree = repo
-            .find_tree(tree_id)
-            .map_err(|err| git_error(&dirs.git, &err))?;
-        tree.decode().map_err(|err| git_error(&dirs.git, &err))?;
 
-        let readme = if let Some(entry) = tree
+        let readme = if let Some(entry) = default
+            .tree
             .find_entry("README.md")
             .filter(|entry| entry.mode().is_blob())
         {
             let id = entry.object_id();
-            if !self.object_is_within(&object_dirs, &id)? {
+            if !self.object_is_within(&default.object_dirs, &id)? {
                 return Ok(BareMetadata::Outside);
             }
             let mut blob = repo
@@ -453,41 +476,122 @@ impl Walk {
             None
         };
 
-        let releases = if let Some(entry) = tree
+        let Some(releases) = self.workflows_in(&repo, &dirs.git, &default)? else {
+            return Ok(BareMetadata::Outside);
+        };
+        Ok(BareMetadata::Head(Metadata {
+            readme,
+            releases: Some(releases),
+        }))
+    }
+
+    /// Open the repository at `git_dir` for reading, isolated from the user's
+    /// git configuration.
+    fn open(git_dir: &Path) -> Result<gix::Repository, Error> {
+        Ok(gix::open::Options::isolated()
+            // Replacement refs can redirect a pre-checked object id to another
+            // loose object. Catalogue metadata is the literal tree, so keep the
+            // ids we validate identical to the ids gix reads.
+            .config_overrides(["core.useReplaceRefs=true"])
+            .open_path_as_is(true)
+            .strict_config(true)
+            .open(git_dir)
+            .map_err(|err| git_error(git_dir, &err))?
+            .to_thread_local())
+    }
+
+    /// The tree at the tip of the default branch.
+    ///
+    /// The default branch is what origin says it is — `refs/remotes/origin/HEAD`
+    /// — because that is the branch releases are cut from. A clone's own `HEAD`
+    /// is the fallback for a repository with no remote-tracking default (a
+    /// fixture, a repository that was never fetched): a bare clone's local
+    /// `refs/heads/main` stops moving once nobody checks it out, while a fetch
+    /// keeps `origin/main` current, so asking `HEAD` first would describe the
+    /// commit the clone was made at rather than the one being shipped.
+    ///
+    /// Every object is checked against the root before it is read.
+    fn default_tree<'repo>(
+        &self,
+        repo: &'repo gix::Repository,
+        git_dir: &Path,
+        object_dirs: Vec<PathBuf>,
+    ) -> Result<Resolved<'repo>, Error> {
+        let commit_id = match repo
+            .try_find_reference("refs/remotes/origin/HEAD")
+            .map_err(|err| git_error(git_dir, &err))?
+        {
+            Some(mut reference) => match reference.peel_to_id() {
+                Ok(id) => Some(id.detach()),
+                // A dangling symbolic ref (origin/HEAD naming a branch that
+                // was never fetched) is not an error, just no default there.
+                Err(_) => None,
+            },
+            None => None,
+        };
+        let commit_id = if let Some(id) = commit_id {
+            id
+        } else {
+            let head = repo.head().map_err(|err| git_error(git_dir, &err))?;
+            match head.id().map(gix::Id::detach) {
+                Some(id) => id,
+                None => return Ok(Resolved::Nothing),
+            }
+        };
+        if !self.object_is_within(&object_dirs, &commit_id)? {
+            return Ok(Resolved::Outside);
+        }
+        let commit = repo
+            .find_commit(commit_id)
+            .map_err(|err| git_error(git_dir, &err))?;
+        let tree_id = commit
+            .tree_id()
+            .map_err(|err| git_error(git_dir, &err))?
+            .detach();
+        if !self.object_is_within(&object_dirs, &tree_id)? {
+            return Ok(Resolved::Outside);
+        }
+        let tree = repo
+            .find_tree(tree_id)
+            .map_err(|err| git_error(git_dir, &err))?;
+        tree.decode().map_err(|err| git_error(git_dir, &err))?;
+        Ok(Resolved::Tree(DefaultTree { tree, object_dirs }))
+    }
+
+    /// Whether the default-branch tree has a `.github/workflows` directory.
+    /// `None` when an object it names resolves outside the root.
+    fn workflows_in(
+        &self,
+        repo: &gix::Repository,
+        git_dir: &Path,
+        default: &DefaultTree<'_>,
+    ) -> Result<Option<bool>, Error> {
+        let Some(github) = default
+            .tree
             .find_entry(".github")
             .filter(|entry| entry.mode().is_tree())
-        {
-            let id = entry.object_id();
-            if !self.object_is_within(&object_dirs, &id)? {
-                return Ok(BareMetadata::Outside);
-            }
-            let github = repo
-                .find_tree(id)
-                .map_err(|err| git_error(&dirs.git, &err))?;
-            github.decode().map_err(|err| git_error(&dirs.git, &err))?;
-            if let Some(entry) = github
-                .find_entry("workflows")
-                .filter(|entry| entry.mode().is_tree())
-            {
-                let id = entry.object_id();
-                if !self.object_is_within(&object_dirs, &id)? {
-                    return Ok(BareMetadata::Outside);
-                }
-                let workflows = repo
-                    .find_tree(id)
-                    .map_err(|err| git_error(&dirs.git, &err))?;
-                workflows
-                    .decode()
-                    .map_err(|err| git_error(&dirs.git, &err))?;
-                true
-            } else {
-                false
-            }
-        } else {
-            false
+        else {
+            return Ok(Some(false));
         };
-
-        Ok(BareMetadata::Head(Metadata { readme, releases }))
+        let id = github.object_id();
+        if !self.object_is_within(&default.object_dirs, &id)? {
+            return Ok(None);
+        }
+        let github = repo.find_tree(id).map_err(|err| git_error(git_dir, &err))?;
+        github.decode().map_err(|err| git_error(git_dir, &err))?;
+        let Some(workflows) = github
+            .find_entry("workflows")
+            .filter(|entry| entry.mode().is_tree())
+        else {
+            return Ok(Some(false));
+        };
+        let id = workflows.object_id();
+        if !self.object_is_within(&default.object_dirs, &id)? {
+            return Ok(None);
+        }
+        let workflows = repo.find_tree(id).map_err(|err| git_error(git_dir, &err))?;
+        workflows.decode().map_err(|err| git_error(git_dir, &err))?;
+        Ok(Some(true))
     }
 
     /// Resolve the primary object directory and every alternate without ever
@@ -570,8 +674,8 @@ impl Walk {
         Ok(true)
     }
 
-    /// Whether this product ships releases: whether it has a
-    /// `.github/workflows` directory.
+    /// Whether this product ships releases: whether the tree of its default
+    /// branch has a `.github/workflows` directory.
     ///
     /// The directory is the whole test — no name is read, and an empty one still
     /// counts. A product that releases does not make its users build it: a Rust
@@ -580,13 +684,23 @@ impl Walk {
     /// releases are built for it, and what the workflows happen to be called is
     /// not a fact about the product.
     ///
-    /// Only a directory answers yes: a file of that name is not a workflow
-    /// directory, and one that resolves outside the root is not this tree's.
-    fn releases(&self, repo: &Path) -> Result<bool, Error> {
-        Ok(matches!(
-            self.dir_within(&repo.join(".github/workflows"))?,
-            Hop::Dir(_)
-        ))
+    /// The committed tree answers, not the working tree: a directory deleted
+    /// locally but still on the default branch is still shipped by CI, and a
+    /// clone whose working tree is absent (bare) or stale (a branch that fell
+    /// behind origin) has nothing else truthful to say. `None` when the tree
+    /// cannot be read at all — no commit, no readable objects, a repository gix
+    /// will not open — so the caller keeps the value it already has.
+    fn releases(&self, dirs: &Dirs) -> Result<Option<bool>, Error> {
+        let Some(object_dirs) = self.object_directories(&dirs.common.join("objects"))? else {
+            return Ok(None);
+        };
+        let Ok(repo) = Self::open(&dirs.git) else {
+            return Ok(None);
+        };
+        match self.default_tree(&repo, &dirs.git, object_dirs) {
+            Ok(Resolved::Tree(default)) => self.workflows_in(&repo, &dirs.git, &default),
+            Ok(Resolved::Nothing | Resolved::Outside) | Err(_) => Ok(None),
+        }
     }
 
     /// The canonical form of `path`, refused when it leaves the root.
@@ -630,7 +744,8 @@ impl Walk {
 
 /// What one entry at the repository level turned out to be.
 enum Outcome {
-    Product(Product),
+    /// A product, and whether its `releases` was read (false: placeholder).
+    Product(Product, bool),
     Skip(SkipReason),
     /// Not a candidate at all — a stray file rather than a project directory.
     Ignore,
@@ -860,6 +975,51 @@ mod tests {
         commit.id
     }
 
+    /// Commit `files` (path -> content) as one tree and point `reference` at it.
+    /// A working tree, if the repository has one, is left untouched: the scan is
+    /// supposed to read the commit, not the checkout.
+    fn commit_files(
+        repo: &gix::Repository,
+        files: &[(&str, &str)],
+        reference: &str,
+    ) -> gix::ObjectId {
+        use gix::objs::tree::EntryKind;
+
+        let mut tree = repo.edit_tree(repo.empty_tree().id()).unwrap();
+        for (path, content) in files {
+            let blob = repo.write_blob(content).unwrap().detach();
+            tree.upsert(*path, EntryKind::Blob, blob).unwrap();
+        }
+        let tree = tree.write().unwrap().detach();
+        let signature = gix::actor::SignatureRef {
+            name: "fixture".into(),
+            email: "fixture@example.com".into(),
+            time: "0 +0000",
+        };
+        let commit = repo
+            .new_commit_as(
+                signature,
+                signature,
+                "fixture",
+                tree,
+                gix::commit::NO_PARENT_IDS,
+            )
+            .unwrap();
+        write(repo.git_dir().join(reference), &format!("{}\n", commit.id));
+        commit.id
+    }
+
+    /// A normal clone the scan should accept, with an origin and no commit yet.
+    fn clone(root: &Path, id: &str, origin: &str) -> (PathBuf, gix::Repository) {
+        let checkout = root.join(id);
+        let repo = gix::init(&checkout).unwrap();
+        write(
+            checkout.join(".git/config"),
+            &format!("[core]\n\tbare = false\n[remote \"origin\"]\n\turl = {origin}\n"),
+        );
+        (checkout, repo)
+    }
+
     fn loose_object_path(repo: &gix::Repository, id: gix::ObjectId) -> PathBuf {
         let hex = id.to_string();
         repo.git_dir()
@@ -973,23 +1133,43 @@ mod tests {
 
         // The name of the workflow says nothing: a repository with any CI at all
         // is one whose releases are built for it.
-        let unrelated = repo(root, "org/unrelated-name", "git@github.com:org/a.git");
-        write(unrelated.join(".github/workflows/ci.yml"), "on: push\n");
+        let (_, unrelated) = clone(root, "org/unrelated-name", "git@github.com:org/a.git");
+        commit_files(
+            &unrelated,
+            &[(".github/workflows/ci.yml", "on: push\n")],
+            "refs/heads/main",
+        );
 
-        let empty = repo(root, "org/empty-workflows", "git@github.com:org/b.git");
-        fs::create_dir_all(empty.join(".github/workflows")).unwrap();
+        // A directory git keeps only by holding a file; the file's name is not read.
+        let (_, kept) = clone(root, "org/kept-workflows", "git@github.com:org/b.git");
+        commit_files(
+            &kept,
+            &[(".github/workflows/.gitkeep", "")],
+            "refs/heads/main",
+        );
 
-        let bare = repo(root, "org/no-workflows", "git@github.com:org/c.git");
-        fs::create_dir_all(bare.join(".github")).unwrap();
+        let (_, none) = clone(root, "org/no-workflows", "git@github.com:org/c.git");
+        commit_files(
+            &none,
+            &[(".github/CODEOWNERS", "* @org\n")],
+            "refs/heads/main",
+        );
 
         // Tagged to the eyeballs, and it still does not release.
-        let tagged = repo(root, "org/tagged", "git@github.com:org/d.git");
-        write(tagged.join(".git/refs/tags/v1.2.3"), "abc\n");
-        write(tagged.join(".git/packed-refs"), "abc123 refs/tags/v2.0.0\n");
+        let (tagged_dir, tagged) = clone(root, "org/tagged", "git@github.com:org/d.git");
+        let tip = commit_files(&tagged, &[("README.md", "# tagged\n")], "refs/heads/main");
+        write(
+            tagged_dir.join(".git/refs/tags/v1.2.3"),
+            &format!("{tip}\n"),
+        );
 
         // A file where the directory should be is not a directory.
-        let filed = repo(root, "org/workflows-file", "git@github.com:org/e.git");
-        write(filed.join(".github/workflows"), "not a directory\n");
+        let (_, filed) = clone(root, "org/workflows-file", "git@github.com:org/e.git");
+        commit_files(
+            &filed,
+            &[(".github/workflows", "not a directory\n")],
+            "refs/heads/main",
+        );
 
         let report = scan(root).unwrap();
         assert_eq!(
@@ -999,7 +1179,7 @@ mod tests {
                 .map(|product| (product.id.as_str(), product.releases))
                 .collect::<Vec<_>>(),
             [
-                ("org/empty-workflows", true),
+                ("org/kept-workflows", true),
                 ("org/no-workflows", false),
                 ("org/tagged", false),
                 ("org/unrelated-name", true),
@@ -1007,6 +1187,11 @@ mod tests {
             ],
             "{:?}",
             report.skipped
+        );
+        assert!(
+            report.releases_unknown.is_empty(),
+            "{:?}",
+            report.releases_unknown
         );
     }
 
@@ -1018,16 +1203,33 @@ mod tests {
     fn the_release_flag_is_re_read_on_every_walk() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path();
-        let one = repo(root, "org/one", "git@github.com:org/one.git");
+        let (checkout, one) = clone(root, "org/one", "git@github.com:org/one.git");
+        commit_files(&one, &[("README.md", "# one\n")], "refs/heads/main");
 
         let releases = |root: &Path| scan(root).unwrap().products[0].releases;
         assert!(!releases(root), "no workflows yet");
 
-        fs::create_dir_all(one.join(".github/workflows")).unwrap();
-        assert!(releases(root), "the walk reads the tree as it is now");
+        commit_files(
+            &one,
+            &[(".github/workflows/ci.yml", "on: push\n")],
+            "refs/heads/main",
+        );
+        assert!(
+            releases(root),
+            "the walk reads the default branch as it is now"
+        );
 
-        fs::remove_dir_all(one.join(".github")).unwrap();
-        assert!(!releases(root), "and again when it goes away");
+        // The working tree is not consulted: a directory deleted locally (or,
+        // as here, never checked out) does not switch releases off while the
+        // commit still ships it.
+        assert!(!checkout.join(".github").exists());
+        assert!(
+            releases(root),
+            "the committed tree answers, not the checkout"
+        );
+
+        commit_files(&one, &[("README.md", "# one\n")], "refs/heads/main");
+        assert!(!releases(root), "and again when the commit drops it");
     }
 
     /// The whole contract of one walk: two levels, git repositories only, with
@@ -1037,16 +1239,22 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let root = root.path();
 
-        let one = repo(root, "sunny-side/one", "git@github.com:miyabisun/one.git");
-        write(one.join("README.md"), "# the first product\n\nbody\n");
-        write(one.join(".github/workflows/release.yml"), "on: push\n");
+        let (one_dir, one) = clone(root, "sunny-side/one", "git@github.com:miyabisun/one.git");
+        write(one_dir.join("README.md"), "# the first product\n\nbody\n");
+        commit_files(
+            &one,
+            &[(".github/workflows/release.yml", "on: push\n")],
+            "refs/heads/main",
+        );
 
         let two = repo(root, "sunny-side/two", "https://github.com/org/two.git");
         write(two.join(".git/refs/tags/v0.3.1"), "abc123\n");
-        // Tagged, and with no workflows: releases stay off.
+        // Tagged, and with no commit to read: releases is unknown, reported as
+        // such, and the placeholder is off.
 
         let report = scan(root).unwrap();
         assert_eq!(ids(&report), ["sunny-side/one", "sunny-side/two"]);
+        assert_eq!(report.releases_unknown, ["sunny-side/two"]);
 
         let first = &report.products[0];
         assert_eq!(
@@ -1061,7 +1269,7 @@ mod tests {
         assert_eq!(second.description, "", "no README is an empty description");
         assert!(
             !second.releases,
-            "a tag is not a release pipeline: nothing here builds anything"
+            "a tag is not a release pipeline, and an unreadable tree is not a yes"
         );
         assert!(report.skipped.is_empty(), "{:?}", report.skipped);
     }
@@ -1168,15 +1376,24 @@ mod tests {
         let root = root.path();
 
         // The superproject, which owns the git storage the other two borrow.
-        let host = repo(root, "org/host", "git@github.com:org/host.git");
+        // Its default branch has no workflows; a feature branch does.
+        let (host, host_repo) = clone(root, "org/host", "git@github.com:org/host.git");
+        commit_files(&host_repo, &[("README.md", "# host\n")], "refs/heads/main");
+        commit_files(
+            &host_repo,
+            &[(".github/workflows/ci.yml", "on: push\n")],
+            "refs/heads/feature",
+        );
 
         // A worktree: the pointer leads to a per-worktree directory that defers
-        // to the superproject's `.git` for config and refs.
+        // to the superproject's `.git` for config and refs. Its HEAD is the
+        // feature branch, and nothing is checked out under it.
         let worktree_git = host.join(".git/worktrees/feature");
         write(worktree_git.join("HEAD"), "ref: refs/heads/feature\n");
         write(worktree_git.join("commondir"), "../..\n");
+        write(worktree_git.join("gitdir"), "../../../feature/.git\n");
         let feature = root.join("org/feature");
-        fs::create_dir_all(feature.join(".github/workflows")).unwrap();
+        fs::create_dir_all(&feature).unwrap();
         fs::write(
             feature.join(".git"),
             "gitdir: ../host/.git/worktrees/feature\n",
@@ -1211,7 +1428,11 @@ mod tests {
         );
         assert!(
             worktree.releases,
-            "the workflows are read from the worktree's own working copy"
+            "the workflows are read from the branch the worktree's HEAD names"
+        );
+        assert!(
+            !report.products[1].releases,
+            "the superproject's own default branch has none"
         );
 
         let submodule = &report.products[2];
@@ -1441,19 +1662,14 @@ mod tests {
         );
     }
 
-    /// A normal clone keeps the working tree as the source of catalogue metadata,
-    /// even when HEAD says something else. Uncommitted changes must remain visible
-    /// on the next scan, as they were before bare repositories were supported.
+    /// A normal clone describes itself from its working tree, but whether it
+    /// releases is read from the committed default branch: the checkout may be
+    /// stale or partial, the commit is what CI ships.
     #[test]
-    fn a_normal_clone_still_reads_catalogue_metadata_from_the_working_tree() {
+    fn a_normal_clone_describes_from_the_worktree_and_releases_from_the_commit() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path();
-        let checkout = root.join("org/working");
-        let repo = gix::init(&checkout).unwrap();
-        write(
-            checkout.join(".git/config"),
-            "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = git@github.com:org/working.git\n",
-        );
+        let (checkout, repo) = clone(root, "org/working", "git@github.com:org/working.git");
         commit_metadata(&repo, Some("# committed description\n"), true);
 
         write(checkout.join("README.md"), "# working description\n");
@@ -1464,9 +1680,84 @@ mod tests {
         let product = &report.products[0];
         assert_eq!(product.description, "working description");
         assert!(
-            !product.releases,
-            "HEAD workflows do not override the worktree"
+            product.releases,
+            "the committed workflows decide, whatever the checkout holds"
         );
+        assert!(report.releases_unknown.is_empty());
+    }
+
+    /// The default branch is origin's, not the clone's own `HEAD`. A bare clone
+    /// with worktrees keeps `refs/heads/main` where it was created and only its
+    /// remote-tracking `origin/main` follows fetches; reading `HEAD` there would
+    /// describe the bootstrap commit for ever. This is the shape of every product
+    /// on the sandbox, and the one that once filed a release-less release.
+    #[test]
+    fn releases_is_read_from_origins_default_branch_before_head() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let (_, repo) = bare_repo(root, "org/behind", "git@github.com:org/behind.git");
+        // The local branch: the bootstrap commit, README only.
+        commit_files(&repo, &[("README.md", "# bootstrap\n")], "refs/heads/main");
+        // What origin has since: the workflows landed.
+        commit_files(
+            &repo,
+            &[
+                ("README.md", "# shipped\n"),
+                (".github/workflows/release.yml", "on: push\n"),
+            ],
+            "refs/remotes/origin/main",
+        );
+        write(
+            repo.git_dir().join("refs/remotes/origin/HEAD"),
+            "ref: refs/remotes/origin/main\n",
+        );
+
+        let report = scan(root).unwrap();
+        assert_eq!(ids(&report), ["org/behind"]);
+        let product = &report.products[0];
+        assert!(
+            product.releases,
+            "origin's default branch has the workflows"
+        );
+        assert_eq!(
+            product.description, "shipped",
+            "and describes the same tree"
+        );
+        assert!(report.releases_unknown.is_empty());
+
+        // Without a remote-tracking default, HEAD is the fallback.
+        fs::remove_file(repo.git_dir().join("refs/remotes/origin/HEAD")).unwrap();
+        let report = scan(root).unwrap();
+        assert!(!report.products[0].releases, "HEAD is the bootstrap commit");
+    }
+
+    /// A tree the walk cannot read is not a `false`: the id is reported as
+    /// unknown and the caller keeps the value it already holds.
+    #[test]
+    fn an_unreadable_tree_keeps_the_previous_release_flag() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        // A repository with an origin but no commit at all.
+        clone(root, "org/empty", "git@github.com:org/empty.git");
+        let (_, shipped) = clone(root, "org/shipped", "git@github.com:org/shipped.git");
+        commit_files(
+            &shipped,
+            &[(".github/workflows/ci.yml", "on: push\n")],
+            "refs/heads/main",
+        );
+
+        let report = scan(root).unwrap();
+        assert_eq!(ids(&report), ["org/empty", "org/shipped"]);
+        assert_eq!(report.releases_unknown, ["org/empty"]);
+        assert!(!report.products[0].releases, "the placeholder is off");
+
+        let kept = report
+            .clone()
+            .with_previous_releases(|id| (id == "org/empty").then_some(true));
+        assert!(kept.products[0].releases, "the catalogue's value survives");
+        assert!(kept.products[1].releases, "a readable tree is not touched");
+        let fresh = report.with_previous_releases(|_| None);
+        assert!(!fresh.products[0].releases, "nothing held: off");
     }
 
     /// Nothing outside the root is opened, however the tree asks for it. A `.git`
@@ -1601,13 +1892,17 @@ mod tests {
         );
         assert!(
             !product.releases,
-            "a workflow directory outside the root does not turn release control on"
+            "a workflow directory in the checkout, wherever it points, is not read"
         );
 
         // The control: the same two facts, kept inside the tree, do count.
-        let two = repo(&root, "org/two", "git@github.com:org/two.git");
-        write(two.join("README.md"), "# described from inside\n");
-        fs::create_dir_all(two.join(".github/workflows")).unwrap();
+        let (two_dir, two) = clone(&root, "org/two", "git@github.com:org/two.git");
+        write(two_dir.join("README.md"), "# described from inside\n");
+        commit_files(
+            &two,
+            &[(".github/workflows/ci.yml", "on: push\n")],
+            "refs/heads/main",
+        );
         let report = scan(&root).unwrap();
         let inside = &report.products[1];
         assert_eq!(inside.description, "described from inside");

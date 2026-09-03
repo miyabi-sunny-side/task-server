@@ -100,6 +100,19 @@ fn derive_catalogue(state: &AppState, catalogue: &Catalogue) -> Result<(), Box<d
             "project skipped"
         );
     }
+    // A release flag the walk could not read keeps the value the catalogue
+    // already holds: a bad read must not switch a product's releases off.
+    for id in &scanned.releases_unknown {
+        warn!(
+            id = %id,
+            "the default-branch tree could not be read, so releases keeps its previous value"
+        );
+    }
+    let scanned = scanned.with_previous_releases(|id| {
+        task_server::product::get(&state.db, id)
+            .ok()
+            .map(|stored| stored.releases)
+    });
     let report = task_server::product::reconcile(&state.db, &scanned.products, state.clock.now())?;
     for archived in &report.archived {
         warn!(
