@@ -29,7 +29,8 @@ use crate::http::TaskSummary;
 use crate::product;
 use crate::state::AppState;
 use crate::task::{
-    self, Check, NewTask, ReportOutcome, ReviewVerdict, Task, TaskKind, TaskPatch, TaskStatus,
+    self, Check, NewTask, ReleaseLevel, ReportOutcome, ReviewVerdict, Task, TaskKind, TaskPatch,
+    TaskStatus,
 };
 
 /// What a client shows in its server list. `Implementation::from_build_env`
@@ -54,6 +55,11 @@ pub struct TaskCreateArgs {
     /// Higher is handed out first. Defaults to 0.
     #[serde(default)]
     pub priority: Option<i64>,
+    /// How far shipping this work steps the version: `patch` (the default),
+    /// `minor`, or `major`. `minor` only when the change is incompatible —
+    /// it forces existing users or their data through a migration.
+    #[serde(default)]
+    pub release_level: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -86,6 +92,11 @@ pub struct TaskUpdateArgs {
     /// The git branch the work lives on.
     #[serde(default)]
     pub branch: Option<String>,
+    /// How far shipping this work steps the version: `patch` (the default),
+    /// `minor`, or `major`. `minor` only when the change is incompatible —
+    /// it forces existing users or their data through a migration.
+    #[serde(default)]
+    pub release_level: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -126,6 +137,10 @@ pub struct TaskReportArgs {
     /// `verification` is the reason. A blocked report is kept, not refused.
     #[serde(default)]
     pub outcome: Option<String>,
+    /// The tag a release cut, `v<major>.<minor>.<patch>`. Required on a `done`
+    /// report of an `instant:release` task; `commit_sha` is what it points at.
+    #[serde(default)]
+    pub release_tag: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -219,28 +234,36 @@ impl Admin {
         description = "Register a new task. It starts in `draft`. Registration is never gated: \
                        `product_id` may name a product that is not in the catalogue yet, and the \
                        refusal arrives later, when the task is promoted to `ready`. This files \
-                       ordinary work; merge and review tasks belong to the control plane, which \
-                       issues them over HTTP (POST /api/merges, POST /api/reviews), and are not \
-                       filed here."
+                       ordinary work; merge, review and release tasks belong to the control \
+                       plane, which issues them itself (or over HTTP: POST /api/merges, \
+                       POST /api/reviews, POST /api/releases), and are not filed here. \
+                       `release_level` says how far shipping the work steps the version: \
+                       patch by default; minor only when the change is incompatible and forces \
+                       existing users or their data through a migration."
     )]
     fn task_create(&self, Parameters(args): Parameters<TaskCreateArgs>) -> CallToolResult {
         let now = self.state.clock.now();
         answer(
-            task::create(
-                &self.state.db,
-                &NewTask {
-                    id: args.id,
-                    title: args.title,
-                    body: args.body.unwrap_or_default(),
-                    product_id: args.product_id,
-                    // Not an argument: `instant:merge` belongs to the control
-                    // plane, so the model is never offered the choice.
-                    kind: TaskKind::Normal,
-                    priority: args.priority.unwrap_or(0),
-                },
-                now,
-            )
-            .and_then(|task| card(&self.state.db, &task)),
+            ReleaseLevel::parse_optional(args.release_level.as_deref())
+                .and_then(|release_level| {
+                    task::create(
+                        &self.state.db,
+                        &NewTask {
+                            id: args.id,
+                            title: args.title,
+                            body: args.body.unwrap_or_default(),
+                            product_id: args.product_id,
+                            // Not an argument: `instant:merge` belongs to the
+                            // control plane, so the model is never offered the
+                            // choice.
+                            kind: TaskKind::Normal,
+                            priority: args.priority.unwrap_or(0),
+                            release_level,
+                        },
+                        now,
+                    )
+                })
+                .and_then(|task| card(&self.state.db, &task)),
         )
     }
 
@@ -267,15 +290,25 @@ impl Admin {
 
     #[tool(
         description = "Change a task's attributes. Anything left out keeps its current value. \
-                       Status is not an attribute; move it with task_set_status."
+                       Status is not an attribute; move it with task_set_status. \
+                       `release_level` is patch by default; minor only when the change is \
+                       incompatible and forces existing users or their data through a migration."
     )]
     fn task_update(&self, Parameters(args): Parameters<TaskUpdateArgs>) -> CallToolResult {
+        let release_level = match args.release_level.as_deref() {
+            Some(raw) => match ReleaseLevel::parse(raw) {
+                Ok(level) => Some(level),
+                Err(error) => return answer(Err(error)),
+            },
+            None => None,
+        };
         let patch = TaskPatch {
             title: args.title,
             body: args.body,
             product_id: args.product_id,
             priority: args.priority,
             branch: args.branch,
+            release_level,
         };
         answer(
             task::update(&self.state.db, &args.id, &patch, self.state.clock.now())
@@ -406,6 +439,7 @@ impl Worker {
                         &args.verification,
                         &checks,
                         outcome,
+                        args.release_tag.as_deref(),
                         self.state.clock.now(),
                     )
                 })

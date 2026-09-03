@@ -25,6 +25,7 @@ fn new_task(id: &str, product_id: &str, kind: TaskKind, priority: i64) -> NewTas
         product_id: Some(product_id.into()),
         kind,
         priority,
+        release_level: task_server::task::ReleaseLevel::Patch,
     }
 }
 
@@ -105,6 +106,7 @@ fn instant_merge_task_is_claimed_before_higher_priority_normal_task() {
         "cargo test",
         &[],
         ReportOutcome::Done,
+        None,
         now(),
     )
     .unwrap();

@@ -1,7 +1,12 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/svelte";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { ControlPlane, PendingMerge, TaskSummary } from "./api";
+import type {
+  ControlPlane,
+  PendingMerge,
+  PendingRelease,
+  TaskSummary,
+} from "./api";
 import ControlPanel from "./ControlPanel.svelte";
 
 const PRODUCT = "sunny-side/task-server";
@@ -35,10 +40,30 @@ function merge(id: string, verification: string | null = null): PendingMerge {
   };
 }
 
+// A pending release is the same shape, plus how far it steps the version.
+function release(
+  id: string,
+  level: PendingRelease["release_level"] = "patch",
+  verification: string | null = null,
+  productId = PRODUCT,
+): PendingRelease {
+  return {
+    ...summary(
+      id,
+      verification === null ? "ready" : "blocked",
+      "instant:release",
+      productId,
+    ),
+    release_level: level,
+    verification,
+  };
+}
+
 function plane(over: Partial<ControlPlane> = {}): ControlPlane {
   return {
     mergeable: [],
     pending_merges: [],
+    pending_releases: [],
     pending_reviews: [],
     unreviewed: [],
     releasable: [],
@@ -54,16 +79,6 @@ function panel(): HTMLElement {
   return found;
 }
 
-function noteOf(button: HTMLElement): HTMLElement | null {
-  return document.getElementById(
-    String(button.getAttribute("aria-describedby")),
-  );
-}
-
-function releaseButton(): HTMLElement {
-  return screen.getByRole("button", { name: "release" });
-}
-
 function block(name: string): HTMLElement | null {
   return document.querySelector<HTMLElement>(`[data-block="${name}"]`);
 }
@@ -71,91 +86,35 @@ function block(name: string): HTMLElement | null {
 describe("ControlPanel", () => {
   afterEach(cleanup);
 
-  it("gives the control row one button, release, and the page's only accent", () => {
+  it("holds no control at all: the top page asks the human for nothing", () => {
     render(ControlPanel, {
       props: {
         fetchState: "ready",
         plane: plane({
-          releasable: [
-            { product_id: PRODUCT, task_count: 2 },
-            { product_id: "sunny-side/other", task_count: 1 },
-          ],
           mergeable: [summary("t-done", "done")],
           pending_merges: [merge("m-1")],
+          pending_releases: [release("release:t-1")],
           pending_reviews: [summary("r-1", "ready", "review")],
+          releasable: [{ product_id: "sunny-side/other", task_count: 1 }],
         }),
       },
     });
 
-    const row = block("control")!;
-    expect(row.querySelectorAll("button")).toHaveLength(1);
-    expect(screen.getAllByRole("button")).toHaveLength(1);
-    const release = releaseButton();
-    expect(release.classList.contains("primary")).toBe(true);
-    expect(
-      [...panel().querySelectorAll(".primary")].map((one) =>
-        one.textContent?.trim(),
-      ),
-    ).toEqual(["release"]);
-
-    const note = noteOf(release);
-    expect(note?.classList.contains("pill")).toBe(true);
-    expect(note?.textContent?.trim()).toBe("2");
-  });
-
-  it("issues no merge: no control on the panel is named for merge", () => {
-    const onrelease = vi.fn();
-    render(ControlPanel, {
-      props: {
-        fetchState: "ready",
-        plane: plane({
-          mergeable: [summary("t-a", "done"), summary("t-b", "done")],
-          pending_merges: [merge("m-1")],
-        }),
-        onrelease,
-      },
-    });
-
-    const buttons = screen.getAllByRole("button");
-    expect(buttons.map((one) => one.textContent?.trim())).toEqual(["release"]);
-    for (const one of buttons) {
-      expect(one.textContent?.toLowerCase()).not.toContain("merge");
+    expect(screen.queryAllByRole("button")).toHaveLength(0);
+    expect(panel().querySelector(".primary")).toBeNull();
+    for (const word of ["release", "merge"]) {
+      for (const one of panel().querySelectorAll("button")) {
+        expect(one.textContent?.toLowerCase()).not.toContain(word);
+      }
     }
-    expect(document.getElementById("control-merge")).toBeNull();
   });
 
-  it("drops the accent to the default treatment and names why when idle", async () => {
-    const onrelease = vi.fn();
-    render(ControlPanel, {
-      props: { fetchState: "ready", plane: plane(), onrelease },
-    });
+  it("says so in one muted line when the server is carrying nothing", () => {
+    render(ControlPanel, { props: { fetchState: "ready", plane: plane() } });
 
     expect(panel().dataset.state).toBe("empty");
-    const release = releaseButton();
-    expect(release.classList.contains("primary")).toBe(false);
-    expect(release.getAttribute("aria-disabled")).toBe("true");
-    // Still reachable and still explained: opacity alone never carries a reason.
-    expect(release.hasAttribute("disabled")).toBe(false);
-    expect(noteOf(release)?.textContent?.trim()).toBe(
-      "release 可能な product はありません",
-    );
-
-    await fireEvent.click(release);
-    expect(onrelease).not.toHaveBeenCalled();
-  });
-
-  it("opens the release flow only while a product is releasable", async () => {
-    const onrelease = vi.fn();
-    render(ControlPanel, {
-      props: {
-        fetchState: "ready",
-        plane: plane({ releasable: [{ product_id: PRODUCT, task_count: 1 }] }),
-        onrelease,
-      },
-    });
-
-    await fireEvent.click(releaseButton());
-    expect(onrelease).toHaveBeenCalledTimes(1);
+    expect(block("idle")?.textContent).toContain("運んでいるものはありません");
+    expect(screen.queryAllByRole("button")).toHaveLength(0);
   });
 
   it("renders the review queue with its count, and not at all when empty", () => {
@@ -189,12 +148,73 @@ describe("ControlPanel", () => {
     ).toEqual(["ready", "wip"]);
 
     cleanup();
-    render(ControlPanel, { props: { fetchState: "ready", plane: plane() } });
+    render(ControlPanel, {
+      props: {
+        fetchState: "ready",
+        plane: plane({ pending_merges: [merge("m-1")] }),
+      },
+    });
 
     expect(block("reviews")).toBeNull();
     expect(document.body.textContent).not.toContain("review 待ち");
-    // The control survives what the readout does not.
-    expect(releaseButton()).toBeTruthy();
+  });
+
+  it("draws the releases like the merge trains: product, level, status, and a reason when stopped", () => {
+    render(ControlPanel, {
+      props: {
+        fetchState: "ready",
+        plane: plane({
+          pending_releases: [
+            release("release:t-1", "minor"),
+            release(
+              "release:t-9",
+              "patch",
+              "bump-tag: the tag already exists",
+              "sunny-side/other",
+            ),
+          ],
+        }),
+      },
+    });
+
+    const readout = block("releases")!;
+    expect(
+      readout.querySelector<HTMLElement>("[data-count]")?.textContent?.trim(),
+    ).toBe("2");
+    const cards = [
+      ...readout.querySelectorAll<HTMLElement>('a[href^="/tasks/"]'),
+    ];
+    expect(cards.map((card) => card.getAttribute("href"))).toEqual([
+      "/tasks/release:t-1",
+      "/tasks/release:t-9",
+    ]);
+    expect(cards[0].textContent).toContain(PRODUCT);
+    expect(cards[0].querySelector("[data-level]")?.textContent?.trim()).toBe(
+      "minor",
+    );
+    expect(
+      [...cards[0].querySelectorAll(".badge")].map((badge) =>
+        badge.textContent?.trim(),
+      ),
+    ).toEqual(["minor", "ready"]);
+    expect(cards[0].querySelector("[data-reason]")).toBeNull();
+
+    const stopped = cards[1];
+    expect(stopped.textContent).toContain("sunny-side/other");
+    expect(stopped.querySelector("[data-reason]")?.textContent).toContain(
+      "the tag already exists",
+    );
+    // Neutral: a tag that could not be cut is not a failure of the app.
+    expect(stopped.classList.contains("error-banner")).toBe(false);
+
+    cleanup();
+    render(ControlPanel, {
+      props: {
+        fetchState: "ready",
+        plane: plane({ pending_merges: [merge("m-1")] }),
+      },
+    });
+    expect(block("releases")).toBeNull();
   });
 
   it("gives every readout card exactly one focus stop, the link itself", () => {
@@ -203,6 +223,7 @@ describe("ControlPanel", () => {
         fetchState: "ready",
         plane: plane({
           pending_reviews: [summary("r-1", "ready", "review")],
+          pending_releases: [release("release:t-1")],
           unreviewed: [summary("t-done", "done")],
         }),
       },
@@ -211,7 +232,7 @@ describe("ControlPanel", () => {
     const cards = [
       ...panel().querySelectorAll<HTMLElement>('a[href^="/tasks/"]'),
     ];
-    expect(cards).toHaveLength(2);
+    expect(cards).toHaveLength(3);
     for (const card of cards) {
       expect(
         card.querySelectorAll(
@@ -232,6 +253,10 @@ describe("ControlPanel", () => {
             summary("t-app-1", "approved"),
             summary("t-app-2", "approved"),
           ],
+          releasable: [
+            { product_id: PRODUCT, task_count: 2 },
+            { product_id: "sunny-side/other", task_count: 1 },
+          ],
         }),
       },
     });
@@ -245,8 +270,9 @@ describe("ControlPanel", () => {
     expect(sets.map((set) => set.dataset.readout)).toEqual([
       "unreviewed",
       "mergeable",
+      "releasable",
     ]);
-    for (const set of sets) {
+    for (const set of sets.slice(0, 2)) {
       const cards = set.querySelectorAll('a[href^="/tasks/"]');
       expect(
         set.querySelector<HTMLElement>("[data-count]")?.textContent?.trim(),
@@ -257,9 +283,23 @@ describe("ControlPanel", () => {
         expect(card.classList.contains("error-banner")).toBe(false);
       }
     }
+    // Stranded releases are counted per product, with the work each carries.
+    const products = sets[2];
+    expect(products.textContent).toContain(
+      "release が発行されていない product",
+    );
+    const rows = [...products.querySelectorAll<HTMLElement>("[data-product]")];
+    expect(rows.map((row) => row.dataset.product)).toEqual([
+      PRODUCT,
+      "sunny-side/other",
+    ]);
+    expect(
+      rows.map((row) => row.querySelector("[data-count]")?.textContent?.trim()),
+    ).toEqual(["2", "1"]);
+    expect(products.querySelector("button")).toBeNull();
   });
 
-  it("draws only the non-empty half of reconciliation, and none of it when healthy", () => {
+  it("draws only the non-empty part of reconciliation, and none of it when healthy", () => {
     render(ControlPanel, {
       props: {
         fetchState: "ready",
@@ -285,12 +325,11 @@ describe("ControlPanel", () => {
     expect(block("reconciliation")).toBeNull();
   });
 
-  it("hides the control row while loading and offers a retry on failure", async () => {
+  it("shows a spinner while loading and offers a retry on failure", async () => {
     render(ControlPanel, { props: { fetchState: "loading" } });
 
     expect(panel().dataset.state).toBe("loading");
     expect(screen.queryByRole("button")).toBeNull();
-    expect(block("control")).toBeNull();
     expect(panel().querySelector(".spinner")).not.toBeNull();
 
     cleanup();
@@ -298,7 +337,6 @@ describe("ControlPanel", () => {
     render(ControlPanel, { props: { fetchState: "error", onretry } });
 
     expect(panel().dataset.state).toBe("error");
-    expect(screen.queryByRole("button", { name: "release" })).toBeNull();
     expect(panel().querySelector(".state.error")?.textContent).toContain(
       "読み込みに失敗しました",
     );
@@ -306,35 +344,14 @@ describe("ControlPanel", () => {
     expect(onretry).toHaveBeenCalledTimes(1);
   });
 
-  it("reports an action's outcome in one live region under the control row", () => {
-    render(ControlPanel, {
-      props: {
-        fetchState: "ready",
-        plane: plane(),
-        result: { kind: "error", message: "release を拒否されました" },
-      },
-    });
-
-    const line = block("result")!;
-    expect(line.getAttribute("aria-live")).toBe("polite");
-    expect(line.querySelector('[role="alert"]')?.textContent).toContain(
-      "release を拒否されました",
-    );
-    // Blocks are ordered: what you can do, then what it did, then the readouts.
-    expect(
-      block("control")!.compareDocumentPosition(line) &
-        Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
-  });
-
   it("keeps the panel's blocks in pipeline order", () => {
     render(ControlPanel, {
       props: {
         fetchState: "ready",
         plane: plane({
-          releasable: [{ product_id: PRODUCT, task_count: 1 }],
           pending_reviews: [summary("r-1", "ready", "review")],
           pending_merges: [merge("m-1")],
+          pending_releases: [release("release:t-1")],
           unreviewed: [summary("t-done", "done")],
         }),
       },
@@ -344,6 +361,6 @@ describe("ControlPanel", () => {
       [...panel().querySelectorAll<HTMLElement>("[data-block]")].map(
         (one) => one.dataset.block,
       ),
-    ).toEqual(["control", "result", "reviews", "trains", "reconciliation"]);
+    ).toEqual(["reviews", "trains", "releases", "reconciliation"]);
   });
 });

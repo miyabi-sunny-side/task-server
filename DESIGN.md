@@ -161,11 +161,13 @@ Task Server is the household **task control plane**. It ships the Sumi
 app shell — header, menu, theme system, an operator top page and a Task
 Card detail page — so a human can read a card (body, verification,
 commit) and press an action, while workers claim and report over HTTP.
-The top page is where the one screen-level move lives: **release** (ship
-the landed work of one product under a tag), over the stretch of pipeline
-the server carries by itself — review, then merge — and the open work
-grouped by status. Review and merge are issued automatically, so
-**release is the only decision this UI asks a human to make**.
+The top page shows the stretch of pipeline the server carries by itself —
+review, then merge, then release — and the open work grouped by status.
+Review, merge and release are all issued automatically (a release is issued
+the moment work lands, at the level the work was filed with), so **the top
+page asks a human for no decision and holds no primary button**. The one
+decision this UI still asks — promoting a draft to `ready` — lives on the
+Task Card.
 
 The personality is **calm, quiet, and tool-like**: content first, chrome
 recedes into neutral ink tones, color only where it means something. The
@@ -283,11 +285,12 @@ The shell stacks three rows:
 3. **Main content**, the only scrolling region.
 
 **Screen-level controls are content, not chrome.** A screen that offers
-actions on the whole screen's subject — the top page's release
-— places them as the **first block inside the content column**. It is
-never a third band, never sticky, and never full-width: the two bands
-above stay the only bands, and main content stays the only scrolling
-region, so the controls scroll away with the work they act on.
+actions on the whole screen's subject places them as the **first block
+inside the content column** (the top page's panel sits there even though
+it now holds readouts and no control). It is never a third band, never
+sticky, and never full-width: the two bands above stay the only bands, and
+main content stays the only scrolling region, so the controls scroll away
+with the work they act on.
 
 One breakpoint: **768px**, and it moves the **vertical** rhythm only.
 The content column is `max-width: 720px`, centered at every width, with
@@ -487,60 +490,39 @@ counterpart to carry, so it earns no token pair.
   carries its own `data-state`**, so a failure or an emptiness on one
   side never masks the other.
 
-  **What the panel is.** Review and merge are issued by the server, so
-  the panel is no longer "the screen's controls". It is **the automated
-  stretch of the pipeline plus the one human decision that ends it**: the
-  release control, then what the machine is carrying — reviews waiting,
-  the merge trains, and anything the automation failed to carry. The task
-  list below it is the work still waiting for a human or a worker to pick
-  up.
+  **What the panel is.** Review, merge and release are all issued by the
+  server, so the panel is not "the screen's controls" and holds none. It
+  is **the automated stretch of the pipeline**: what the machine is
+  carrying — reviews waiting, the merge trains, the releases — and
+  anything the automation failed to carry. The task list below it is the
+  work still waiting for a human or a worker to pick up.
 
   The panel is the first block of the content column, built from the card
   recipe (surface-raised, 1px hairline, md radius, 10px padding), `--sp-3`
-  between its blocks, and it is read top-down: **what you can do**, then
-  **what is being carried for you**.
+  between its blocks, and it is read top-down in pipeline order.
 
-  **Control row — release.** One row: a button beside a note that
-  explains the button's current standing. It opens the release modal and
-  it is the top page's **single primary (accent-filled) button, and only
-  while it is enabled**; with nothing releasable it wears the default
-  treatment plus the disabled one.
+  **The top page has no primary button.** The earlier rule — the page's
+  one accent marks the human decision point — has nothing left to mark:
+  the release button died the way the merge button did, when the server
+  took the decision over. A release is issued at the landing, at the
+  `release_level` the work was filed with, and a worker cuts the tag. So
+  no `<button>` on the top page is accent-filled, and no control on it is
+  named for release or merge. Where a human decision still exists — the
+  `ready` transition on a Task Card — the accent stays with it. A move
+  the machine makes never takes the accent.
 
-  **The page's one accent marks the human decision point, not the
-  frequent move.** The earlier reading — merge is the routine daily move,
-  so merge takes the accent — died with the merge button: the server
-  issues merges now, and a control the operator never presses cannot be a
-  page's primary. Release is the only place the pipeline stops and asks a
-  person, so the accent sits there, and it stays there however routine
-  release later becomes. A move the machine makes never takes the accent
-  back.
+  **There is no toast, no timer, and no auto-dismissing message anywhere
+  in this product.** The panel reports no action either, because it makes
+  none; the reloaded readouts are the receipt for whatever the server did.
 
-  The note takes one of exactly two shapes: the **count pill** (badge
-  recipe, full radius) of what the button would act on when that count is
-  above zero, or the **muted caption naming the reason** when it is zero
-  — "release 可能な product はありません". A disabled control always says
-  why in text beside it and points at that text with `aria-describedby`;
-  opacity alone never carries the reason.
-
-  **Result line.** One live region (`aria-live="polite"`) directly under
-  the control row reports the outcome of the last control action: the
-  spinner line while an action is in flight, a muted caption on success,
-  and the error-banner recipe with `role="alert"` on failure. It persists
-  until the next action — **there is no toast, no timer, and no
-  auto-dismissing message anywhere in this product**. Every successful
-  action reloads both regions, so the changed counts and lists are the
-  real receipt.
-
-  **Readouts, and when they exist.** Below the result line the panel
-  draws what the server is carrying, in pipeline order: the review queue,
-  the merge trains, then reconciliation. Each is a muted caption with its
-  count pill beside it over the ordinary card list, exactly like a
-  status-group heading, and **a readout holding nothing is not rendered
-  at all**, caption included — the status-group rule, for the same
-  reason. A **control** is the opposite: it renders even when it can do
-  nothing, because a control that vanishes when idle teaches nothing
-  about what would bring it back. That difference is the whole rule for
-  what the panel shows when it is quiet.
+  **Readouts, and when they exist.** The panel draws what the server is
+  carrying, in pipeline order: the review queue, the merge trains, the
+  releases, then reconciliation. Each is a muted caption with its count
+  pill beside it over the ordinary card list, exactly like a status-group
+  heading, and **a readout holding nothing is not rendered at all**,
+  caption included — the status-group rule, for the same reason. When
+  every readout is empty the panel says so in one muted line instead: a
+  quiet pipeline is a state worth naming, not an empty box.
 
   A readout has no status heading over it, so **its cards wear the
   neutral outline status badge** beside the product id; a status-group
@@ -591,18 +573,33 @@ counterpart to carry, so it earns no token pair.
   a failure of the app — exactly as a review's `request_changes` is — so
   the danger tokens do not enter here.
 
+  **Releases.** The outstanding `instant:release` tasks, under the caption
+  "release": at most one per product, issued by the landing and finished
+  by the tag a worker cut. Drawn like a train's cards — the product id as
+  the name, the **level** (`patch` / `minor` / `major`) and the status as
+  outline badges, and on a `blocked` release its reason under the title
+  as body-sm text with `white-space: pre-line`, neutral like a jammed
+  merge. A stopped release holds every later landing of its product back
+  the way a jammed merge holds its train, which is why it earns the same
+  legibility: a named cause on the card that has it. No control sits
+  here; calling a stopped release off happens on its Task Card, and the
+  next one is issued by hand over the API.
+
   **Reconciliation.** The work the automation should be carrying and is
-  not: tasks that are `done` with no live review, and tasks that are
-  `approved` with no live merge. Both sets are empty in a healthy
-  pipeline, which is what makes them a different kind of thing from the
-  queues above and forbids giving them the same look. This is the panel's
+  not: tasks that are `done` with no live review, tasks that are
+  `approved` with no live merge, and products whose landed work has no
+  live release. Every set is empty in a healthy pipeline, which is what
+  makes them a different kind of thing from the queues above and forbids
+  giving them the same look. This is the panel's
   **one danger-framed block**: the error-banner recipe (danger text on
   `danger-subtle`, sm radius, 8px padding, body-sm) carrying
   `role="status"` — a standing state the operator has to notice, not the
   outcome of a request they just made, so never `role="alert"`. It holds
   one captioned line with its count pill per non-empty set — "review が
-  発行されていない task" / "merge が発行されていない task" — and under
-  each the ordinary card list, whose cards keep the neutral card recipe:
+  発行されていない task" / "merge が発行されていない task" / "release が
+  発行されていない product" — and under each the ordinary card list (for
+  the release set, one row per product carrying the count of tasks it
+  would ship), whose cards keep the neutral card recipe:
   **the danger tint frames the fact that the pipeline is holding work,
   and never tints the tasks themselves**, which are ordinary work. This
   is the single extension of the danger tokens past "a request failed",
@@ -619,13 +616,11 @@ counterpart to carry, so it earns no token pair.
 
   **Panel states.** The panel exposes
   `data-state="loading|empty|error|success"` on the same discipline as
-  the list: _loading_ is the centered spinner line with no control row
-  rendered (never a button that might be showing the wrong standing);
-  _error_ is the danger body-sm line plus a default retry button; _empty_
-  — nothing releasable, nothing pending, nothing stranded — still renders
-  **the release button, disabled, with its reason**, because a control
-  that vanishes when idle teaches nothing about what would bring it back;
-  _success_ is the panel above.
+  the list: _loading_ is the centered spinner line; _error_ is the danger
+  body-sm line plus a default retry button — the one button the panel can
+  ever hold; _empty_ — nothing pending, nothing stranded — is one muted
+  line saying so ("運んでいるものはありません"); _success_ is the panel
+  above.
 
   **Task list.** Below the panel, the open tasks grouped by status.
   Groups follow the status vocabulary order — the main line `draft`,
@@ -667,31 +662,6 @@ counterpart to carry, so it earns no token pair.
   - _error:_ danger-colored body-sm message plus a default retry button;
   - _success:_ the groups.
 
-- **Release modal:** opened by the release button; the standard centered
-  modal (lg radius, 16px padding, scrim + shadow; ×, Esc, or scrim
-  closes it and focus returns to the release button). Contents in
-  order — the product choice, the tag field, the action row:
-  - **One releasable product:** no chooser. A muted caption names the
-    product id and how many merged tasks would ship.
-  - **Several:** a `role="radiogroup"` of product rows reusing the
-    selected-radio treatment (accent-subtle fill, sm radius), each row
-    showing the product id (label) and its count pill; the first row is
-    selected when the modal opens, so the field below is always
-    meaningful.
-  - **The tag is required.** One input per the Input recipe with its
-    caption-muted label above it, focused when the modal opens. The
-    confirm button is disabled while the field is blank or whitespace,
-    with the same rule as everywhere: the reason sits in text beside it.
-  - The action row is キャンセル (default) and the confirm
-    (accent-filled). **An open modal is its own primary region**, so
-    this confirm is the modal's single accent fill and does not compete
-    with the release button that opened it, still accent-filled behind
-    the scrim in the page's own region.
-  - A refused release keeps the modal open **with the typed tag
-    intact** and shows the server's message in the error-banner recipe
-    inside the modal — a rejected tag is corrected where it was typed.
-    A successful one closes the modal and reports on the panel's result
-    line.
 - **Detail page — Task Card:** sub-header (title only) over a content
   column showing status (an outline badge — caption type, 1px border,
   muted text; neutral chrome, not a data color), `commit_sha` and
@@ -814,52 +784,48 @@ counterpart to carry, so it earns no token pair.
   10. On the top page the content column's first element child is the
       control panel and the task list follows it. Each carries its own
       `data-state`; forcing the list request to fail leaves the panel at
-      `success` with a working control row, and forcing the control request to
+      `success` with its readouts drawn, and forcing the control request to
       fail leaves the list rendering its groups.
-  11. With at least one releasable product, the page region contains
-      exactly one accent-filled control and it is the release button: its
-      computed background equals the accent (`rgb(94, 184, 199)` in Sumi,
-      `rgb(47, 111, 126)` in Kinari). Its note is a pill whose text is the
-      releasable count and whose computed `border-radius` is 9999px.
-  12. With nothing releasable, the release button's computed background
-      equals surface-raised rather than the accent, `aria-disabled` is
-      `"true"`, `opacity` computes to 0.5, `cursor` is `not-allowed`, Tab
-      still lands on it and shows the 2px accent focus ring, the element
-      its `aria-describedby` names is visible with non-empty text, and
-      activating it by click and by Enter opens no modal and fires no
-      request.
-  13. The top page issues no merge. The panel's control rows hold exactly
-      one button, its accessible name is `release`, and no `<button>` on
-      the page or in an open modal is named for merge. With the control
-      plane reporting mergeable tasks, loading the page and activating
-      every enabled button outside the release modal sends no request
+  11. The top page has no primary button. With the control plane carrying
+      pending reviews, merges and releases and reporting stranded work of
+      every kind, the page region contains no `<button>` whose computed
+      background equals the accent (`rgb(94, 184, 199)` in Sumi,
+      `rgb(47, 111, 126)` in Kinari), and outside the panel's error state
+      the page contains no `<button>` at all. No `<dialog>` or
+      `role="dialog"` element exists on the top page.
+  12. The top page issues nothing. No control on the page is named for
+      release or merge; loading the page against a control plane that
+      reports mergeable, unreviewed and releasable work sends no request
       with a method other than GET.
-  14. The release modal opens centered per the modal geometry with the
-      tag input holding focus; its confirm button is `aria-disabled`
-      while the tag is blank or whitespace and drops the attribute once
-      a non-blank tag is typed. With several releasable products a
-      `role="radiogroup"` is present, its first row selected with an
-      accent-subtle background; with exactly one there is no radiogroup
-      and the product id appears as a caption. The open modal contains
-      exactly one accent-filled control. ×, Esc, and the scrim each
-      close it and return focus to the release button.
-  15. A refused release leaves the modal open with the typed tag still
-      in the field and the server's message rendered in the error-banner
-      colors (danger text on danger-subtle) inside the modal. A
-      successful one closes the modal, leaves a non-empty result line on
-      the panel, and the released tasks are gone from the `merged` group
-      on reload.
+  13. With at least one pending release the panel renders the releases
+      readout: a muted caption whose count pill number equals the number
+      of cards under it, each card linking to its `instant:release` task,
+      naming its product id, and wearing two outline badges — the level
+      (`patch`, `minor` or `major`) and the status. A `blocked` release
+      carries its reason as body-sm text preserving newlines
+      (`white-space` is `pre-line`) on its own card; a `ready` or `wip`
+      one renders no reason element. No text color or background in the
+      readout computes to the danger pair. With no pending release the
+      readout is absent from the DOM entirely.
+  14. With a product in `releasable`, the reconciliation block renders one
+      row per stranded product carrying its id and a count pill equal to
+      the number of tasks it would ship, under the caption "release が
+      発行されていない product", with no button in the row. With
+      `releasable` empty the row set is absent.
+  15. With nothing pending and nothing stranded the panel's `data-state`
+      is `empty` and it renders exactly one muted body-sm line and no
+      button; with anything carried it is `success`.
   16. Status groups exist in the DOM only when non-empty; their document
       order is draft, ready, wip, done, approved, merged, blocked,
       cancelled, dropped; no group for `released` ever exists; each
       heading's count pill number equals the number of cards under it;
       `9999px` radius is computed only on count pills, outline badges,
       and the spinner.
-  17. At 375px the panel's button, notes, and readouts wrap without
+  17. At 375px the panel's captions and readouts wrap without
       `document.documentElement.scrollWidth` exceeding the viewport,
-      every control's hit box is at least 36px tall, and no two blocks of
-      the panel — control row, result line, review queue, merge trains,
-      reconciliation — overlap (bounding boxes disjoint). At 900px the
+      every card's hit box is at least 36px tall, and no two blocks of
+      the panel — review queue, merge trains, releases, reconciliation —
+      overlap (bounding boxes disjoint). At 900px the
       content column computes to 720px wide with 12px left and right
       padding and equal left/right margins (±1px), and the panel — its
       child — computes to 696px.
@@ -930,8 +896,7 @@ counterpart to carry, so it earns no token pair.
       number of cards under it, each card linking to its review task and
       wearing the neutral outline status badge that a status-group card
       does not. With no pending review the queue is absent from the DOM
-      entirely — no caption, no empty message — while the release button
-      is still rendered with its reason.
+      entirely — no caption, no empty message.
   26. Merge trains are per product and a jam is legible. With merges
       outstanding on two products the panel renders one group per
       product, each captioned by its product id with a count pill equal

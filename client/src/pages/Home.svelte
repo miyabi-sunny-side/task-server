@@ -1,11 +1,9 @@
 <script lang="ts">
-  import ControlPanel, { type ActionResult } from "../lib/ControlPanel.svelte";
-  import ReleaseModal from "../lib/ReleaseModal.svelte";
+  import ControlPanel from "../lib/ControlPanel.svelte";
   import StatusTaskList from "../lib/StatusTaskList.svelte";
   import {
     fetchControl,
     fetchTasks,
-    postRelease,
     type ControlPlane,
     type TaskSummary,
   } from "../lib/api";
@@ -16,11 +14,6 @@
   let controlState = $state<FetchState>("loading");
   let items = $state<TaskSummary[]>([]);
   let listState = $state<FetchState>("loading");
-
-  let busy = $state(false);
-  let result = $state<ActionResult>({ kind: "none", message: "" });
-  let modalOpen = $state(false);
-  let releaseError = $state("");
 
   let controlController: AbortController | undefined;
   let listController: AbortController | undefined;
@@ -39,12 +32,6 @@
 
   function aborted(error: unknown): boolean {
     return error instanceof DOMException && error.name === "AbortError";
-  }
-
-  function reason(error: unknown): string {
-    return error instanceof Error && error.message !== ""
-      ? error.message
-      : "原因不明のエラー";
   }
 
   // One request draws the whole panel, jam reasons included: `pending_merges`
@@ -90,39 +77,6 @@
     return Promise.all([loadControl(), loadList()]);
   }
 
-  function onrelease() {
-    if ((plane?.releasable ?? []).length === 0) {
-      return;
-    }
-    releaseError = "";
-    modalOpen = true;
-  }
-
-  function closeModal() {
-    modalOpen = false;
-    // Focus returns to the control that opened the modal (DESIGN.md, Modals).
-    queueMicrotask(() => document.getElementById("control-release")?.focus());
-  }
-
-  async function onconfirmRelease(productId: string, tag: string) {
-    busy = true;
-    releaseError = "";
-    try {
-      const released = await postRelease(productId, tag);
-      closeModal();
-      result = {
-        kind: "success",
-        message: `${released.product_id} を ${released.tag} で release しました (${released.released.length} 件)`,
-      };
-      busy = false;
-      await loadBoth();
-    } catch (error) {
-      // A refused release is corrected where the tag was typed.
-      releaseError = reason(error);
-      busy = false;
-    }
-  }
-
   function onVisibilityChange() {
     if (document.visibilityState === "visible") {
       void loadBoth();
@@ -144,9 +98,6 @@
   <ControlPanel
     fetchState={controlState}
     {plane}
-    {busy}
-    {result}
-    {onrelease}
     onretry={() => void loadControl()}
   />
   <StatusTaskList
@@ -156,13 +107,3 @@
     onretry={() => void loadList()}
   />
 </div>
-
-{#if modalOpen}
-  <ReleaseModal
-    releasable={plane?.releasable ?? []}
-    {busy}
-    error={releaseError}
-    onclose={closeModal}
-    onconfirm={(productId, tag) => void onconfirmRelease(productId, tag)}
-  />
-{/if}

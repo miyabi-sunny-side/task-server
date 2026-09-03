@@ -52,6 +52,11 @@ export interface TaskCard {
   updated_at: string;
   available_transitions: string[];
   latest_review?: ReviewOutcome;
+  // How far shipping this work steps the version; on a release task, the
+  // largest level it ships. Optional here only so fixtures written before the
+  // field existed still type-check; the server always sends it.
+  release_level?: "patch" | "minor" | "major";
+  release_task_id?: string | null;
 }
 
 // A refusal the server explained. The message is the human wording the
@@ -121,6 +126,8 @@ export function postTaskStatus(id: string, status: string): Promise<TaskCard> {
   return postJson(`/api/tasks/${encodeURIComponent(id)}/status`, { status });
 }
 
+// Landed work no release is carrying, per product: the reconciliation window
+// for releases. Empty while the automatic issuing works.
 export interface Releasable {
   product_id: string;
   task_count: number;
@@ -135,31 +142,29 @@ export interface PendingMerge extends TaskSummary {
   verification: string | null;
 }
 
-// What the top page needs to draw the automated stretch of the pipeline and
-// decide whether release is a live button. The `pending_*` lists are what the
-// server is carrying; `mergeable` and `unreviewed` are the reconciliation
-// windows, empty whenever the automatic issuing works.
+// An outstanding release, as /api/control reports it: the summary, how far it
+// steps the version, and why it stopped — the same shape as a pending merge,
+// read off the same payload.
+export interface PendingRelease extends TaskSummary {
+  release_level: "patch" | "minor" | "major";
+  // `null` while the release is running: only a blocked one has a reason.
+  verification: string | null;
+}
+
+// What the top page needs to draw the automated stretch of the pipeline. The
+// `pending_*` lists are what the server is carrying; `mergeable`, `unreviewed`
+// and `releasable` are the reconciliation windows, empty whenever the
+// automatic issuing works. Nothing here is a button: the page asks the human
+// for no decision.
 export interface ControlPlane {
   mergeable: TaskSummary[];
   pending_merges: PendingMerge[];
+  pending_releases: PendingRelease[];
   pending_reviews: TaskSummary[];
   unreviewed: TaskSummary[];
   releasable: Releasable[];
 }
 
-export interface ReleaseResult {
-  product_id: string;
-  tag: string;
-  released: TaskSummary[];
-}
-
 export function fetchControl(signal?: AbortSignal): Promise<ControlPlane> {
   return requestJson("/api/control", { signal });
-}
-
-export function postRelease(
-  productId: string,
-  tag: string,
-): Promise<ReleaseResult> {
-  return postJson("/api/releases", { product_id: productId, tag });
 }

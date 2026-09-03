@@ -249,6 +249,28 @@ PRAGMA user_version = 9;
 COMMIT;
 ";
 
+/// Version 10 puts the release on the task. `release_level` is how far shipping
+/// the work steps the version, known when the work is filed; `release_task_id`
+/// points a landed task at the release that ships it. Landing now ends work of
+/// a product that does not release, so the backfill takes the `merged` work of
+/// those products — and the finished subtasks under it — to `released` with no
+/// tag, exactly where a landing after this version leaves it.
+const SCHEMA_V10: &str = "\
+BEGIN;
+ALTER TABLE tasks ADD COLUMN release_level TEXT NOT NULL DEFAULT 'patch';
+ALTER TABLE tasks ADD COLUMN release_task_id TEXT REFERENCES tasks(id);
+UPDATE tasks SET status = 'released'
+WHERE kind = 'normal' AND status = 'merged'
+  AND product_id IN (SELECT id FROM products WHERE releases = 0);
+UPDATE tasks SET status = 'released', updated_at = target.updated_at
+FROM tasks AS target
+WHERE tasks.kind IN ('review', 'instant:merge') AND tasks.status = 'done'
+  AND target.kind = 'normal' AND target.status = 'released' AND target.release_tag IS NULL
+  AND target.id = COALESCE(tasks.review_target_task_id, tasks.merge_target_task_id);
+PRAGMA user_version = 10;
+COMMIT;
+";
+
 /// How long a writer waits for a lock before giving up, in milliseconds.
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -417,6 +439,9 @@ fn migrate(conn: &Connection) -> Result<(), Error> {
     if version < 9 {
         conn.execute_batch(SCHEMA_V9)?;
     }
+    if version < 10 {
+        conn.execute_batch(SCHEMA_V10)?;
+    }
     Ok(())
 }
 
@@ -468,7 +493,9 @@ mod tests {
     use rusqlite::Connection;
     use time::macros::datetime;
 
-    use super::{Db, SCHEMA_V1, SCHEMA_V2, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6};
+    use super::{
+        Db, SCHEMA_V1, SCHEMA_V2, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+    };
 
     fn pragma_string(db: &Db, pragma: &str) -> String {
         db.with_conn(|conn| Ok(conn.query_row(&format!("PRAGMA {pragma}"), [], |row| row.get(0))?))
@@ -559,11 +586,11 @@ mod tests {
         let named = Db::open(":memory:").unwrap();
         assert_eq!(pragma_string(&named, "journal_mode"), "memory");
         assert_eq!(pragma_int(&named, "busy_timeout"), 5000);
-        assert_eq!(user_version(&named), 9);
+        assert_eq!(user_version(&named), 10);
 
         let private = Db::open_in_memory().unwrap();
         assert_eq!(pragma_int(&private, "busy_timeout"), 5000);
-        assert_eq!(user_version(&private), 9);
+        assert_eq!(user_version(&private), 10);
 
         // A URI spelling is not one of them. Only the exact `:memory:` is
         // exempt, so a URI is an ordinary filename: it lands on disk in WAL,
@@ -584,6 +611,11 @@ mod tests {
 
     /// Every column of one task row, in schema order, as `(name, value)`. A
     /// rebuild that dropped, reordered, or blanked a column shows up here.
+    /// The columns version 10 added. Every migration test below asks about an
+    /// earlier step, and a column that arrived after it would otherwise show up
+    /// as a difference in every row comparison.
+    const V10_COLUMNS: [&str; 2] = ["release_level", "release_task_id"];
+
     fn task_row(conn: &Connection, id: &str) -> Vec<(String, String)> {
         let mut statement = conn.prepare("SELECT * FROM tasks WHERE id = ?1").unwrap();
         let names: Vec<String> = statement
@@ -600,6 +632,7 @@ mod tests {
                 let value: rusqlite::types::Value = row.get(index).unwrap();
                 (name.clone(), format!("{value:?}"))
             })
+            .filter(|(name, _)| !V10_COLUMNS.contains(&name.as_str()))
             .collect()
     }
 
@@ -646,7 +679,7 @@ mod tests {
     #[test]
     fn migration_creates_the_current_schema() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(user_version(&db), 9);
+        assert_eq!(user_version(&db), 10);
         let tables: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row(
@@ -678,7 +711,7 @@ mod tests {
         drop(db);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 9);
+        assert_eq!(user_version(&db), 10);
         let products: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row("SELECT count(*) FROM products", [], |row| row.get(0))?)
@@ -713,7 +746,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 9);
+        assert_eq!(user_version(&db), 10);
 
         let (title, status, priority, merge_target, checks): (
             String,
@@ -809,7 +842,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 9);
+        assert_eq!(user_version(&db), 10);
 
         db.with_conn(|conn| {
             let rows_after = rebuilt_rows(conn, ["t-target", "merge:t-target", "t-plain"]);
@@ -913,7 +946,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 9);
+        assert_eq!(user_version(&db), 10);
         let archived = |db: &Db| -> (usize, Option<String>) {
             db.with_conn(|conn| {
                 let columns = column_names(conn, "products");
@@ -938,7 +971,7 @@ mod tests {
         // column is not added twice and the row is not re-marked.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 9);
+        assert_eq!(user_version(&db), 10);
         assert_eq!(archived(&db), (1, None), "a second open changes nothing");
         let tasks: i64 = db
             .with_conn(|conn| {
@@ -1141,7 +1174,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 9);
+        assert_eq!(user_version(&db), 10);
         db.with_conn(|conn| {
             let columns = column_names(conn, "tasks");
             for added in ["review_target_task_id", "review_verdict"] {
@@ -1169,7 +1202,7 @@ mod tests {
         // Reopening runs the step again and must change nothing.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 9);
+        assert_eq!(user_version(&db), 10);
         let tasks: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?)
@@ -1227,7 +1260,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 9);
+        assert_eq!(user_version(&db), 10);
 
         let upgraded = Connection::open(&path).unwrap();
         assert!(
@@ -1258,7 +1291,7 @@ mod tests {
         // Reopening runs nothing again.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 9);
+        assert_eq!(user_version(&db), 10);
     }
 
     /// The step on its own: a database that already reached version 6 loses the
@@ -1305,7 +1338,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 9);
+        assert_eq!(user_version(&db), 10);
         let upgraded = Connection::open(&path).unwrap();
         assert!(
             !column_names(&upgraded, "tasks").contains(&"merge_sequence".to_owned()),
@@ -1368,7 +1401,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 9);
+        assert_eq!(user_version(&db), 10);
         db.with_conn(|conn| {
             let husk = |id: &str| -> (String, Option<String>, String) {
                 conn.query_row(
@@ -1477,5 +1510,87 @@ mod tests {
             second_merge.is_err(),
             "a landed merge still owns its target, so the two indexes differ"
         );
+    }
+
+    /// Version 10 puts the release on the task and, because landing now ends
+    /// the work of a product that does not release, takes such a product's
+    /// `merged` work — and the finished subtasks under it — to `released` with
+    /// no tag. A releasing product's merged work is left where it is: it is
+    /// stranded, and `POST /api/releases` is the handle for it.
+    #[test]
+    fn a_version_nine_database_gains_the_release_columns_and_settles_non_releasing_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sqlite.db");
+
+        let legacy = Connection::open(&path).unwrap();
+        for batch in [SCHEMA_V1, SCHEMA_V2] {
+            legacy.execute_batch(batch).unwrap();
+        }
+        super::rebuild_tasks_without_the_product_key(&legacy).unwrap();
+        for batch in [
+            SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+        ] {
+            legacy.execute_batch(batch).unwrap();
+        }
+        legacy
+            .execute_batch(
+                "INSERT INTO products (id, repository, releases, created_at, updated_at)
+                 VALUES ('a/b', 'https://example.test/a/b.git', 1, 'early', 'early'),
+                        ('c/d', 'https://example.test/c/d.git', 0, 'early', 'early');
+                 INSERT INTO tasks (id, title, status, kind, product_id, created_at, updated_at)
+                 VALUES ('t-ships', 'still shipping', 'merged', 'normal', 'a/b', 'early', 'late'),
+                        ('t-keep', 'landed for good', 'merged', 'normal', 'c/d', 'early', 'late'),
+                        ('t-open', 'not landed', 'done', 'normal', 'c/d', 'early', 'late');
+                 INSERT INTO tasks (id, title, status, kind, product_id, merge_target_task_id,
+                                    created_at, updated_at)
+                 VALUES ('merge:t-keep', 'landing it', 'done', 'instant:merge', 'c/d', 't-keep',
+                         'early', 'earlyish');",
+            )
+            .unwrap();
+        let before: i64 = legacy
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, 9, "the fixture must start at version 9");
+        drop(legacy);
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(user_version(&db), 10);
+        db.with_conn(|conn| {
+            let names = column_names(conn, "tasks");
+            for column in V10_COLUMNS {
+                assert!(names.contains(&column.to_owned()), "{column} arrived");
+            }
+            let row = |id: &str| -> (String, Option<String>, String, Option<String>) {
+                conn.query_row(
+                    "SELECT status, release_tag, release_level, release_task_id
+                     FROM tasks WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                row("t-keep"),
+                ("released".into(), None, "patch".into(), None),
+                "merged work of a product that does not release is settled with no tag"
+            );
+            assert_eq!(
+                row("merge:t-keep"),
+                ("released".into(), None, "patch".into(), None),
+                "and its landed merge follows it"
+            );
+            assert_eq!(
+                row("t-open").0,
+                "done",
+                "work that has not landed is left alone"
+            );
+            assert_eq!(
+                row("t-ships").0,
+                "merged",
+                "merged work of a releasing product waits for a release to be issued"
+            );
+            Ok(())
+        })
+        .unwrap();
     }
 }

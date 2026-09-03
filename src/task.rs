@@ -10,7 +10,7 @@ use crate::product::{self, check_product_id};
 const COLUMNS: &str = "id, title, body, status, kind, product_id, priority, branch, claimed_by, \
                        claim_id, claimed_at, claim_expires_at, commit_sha, verification, \
                        release_tag, created_at, updated_at, merge_target_task_id, checks_json, \
-                       review_target_task_id, review_verdict";
+                       review_target_task_id, review_verdict, release_level, release_task_id";
 
 /// Every status, in vocabulary order. Used to enumerate legal transitions.
 pub(crate) const ALL_STATUSES: [TaskStatus; 10] = [
@@ -86,6 +86,10 @@ pub enum TaskKind {
     /// A reading of finished work, answered with a verdict rather than a commit.
     #[serde(rename = "review")]
     Review,
+    /// The shipping of one product's landed work: a worker bumps the version
+    /// at the card's `release_level` and reports the tag it cut.
+    #[serde(rename = "instant:release")]
+    InstantRelease,
 }
 
 impl TaskKind {
@@ -95,6 +99,7 @@ impl TaskKind {
             Self::Normal => "normal",
             Self::InstantMerge => "instant:merge",
             Self::Review => "review",
+            Self::InstantRelease => "instant:release",
         }
     }
 
@@ -105,6 +110,7 @@ impl TaskKind {
             Self::Normal => None,
             Self::InstantMerge => Some("POST /api/merges"),
             Self::Review => Some("POST /api/reviews"),
+            Self::InstantRelease => Some("POST /api/releases"),
         }
     }
 
@@ -113,9 +119,64 @@ impl TaskKind {
             "normal" => Ok(Self::Normal),
             "instant:merge" => Ok(Self::InstantMerge),
             "review" => Ok(Self::Review),
+            "instant:release" => Ok(Self::InstantRelease),
             other => Err(Error::Invalid(format!("invalid kind: {other}"))),
         }
     }
+}
+
+/// How much a release of this work moves the version: the semver component a
+/// `bump-tag` run steps. Known when the work is filed, which is why it lives on
+/// the task rather than being asked for at release time. The order is the
+/// order of the components, so the level of a release is the largest level of
+/// the work it ships.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ReleaseLevel {
+    #[default]
+    Patch,
+    Minor,
+    Major,
+}
+
+impl ReleaseLevel {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Patch => "patch",
+            Self::Minor => "minor",
+            Self::Major => "major",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self, Error> {
+        match raw {
+            "patch" => Ok(Self::Patch),
+            "minor" => Ok(Self::Minor),
+            "major" => Ok(Self::Major),
+            other => Err(Error::Invalid(format!(
+                "invalid release_level: {other} (one of patch, minor, major)"
+            ))),
+        }
+    }
+
+    /// The default when nothing was said, and what an absent value decodes to.
+    pub fn parse_optional(raw: Option<&str>) -> Result<Self, Error> {
+        raw.map_or(Ok(Self::Patch), Self::parse)
+    }
+}
+
+/// The shape a release tag has to take: `v<major>.<minor>.<patch>`. A worker
+/// reports the tag `bump-tag` cut, and a tag that is not one is not a release.
+fn is_release_tag(raw: &str) -> bool {
+    let Some(rest) = raw.strip_prefix('v') else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// How a review answered the work it read.
@@ -214,7 +275,7 @@ pub struct Check {
     pub exit_code: i64,
 }
 
-/// A product with merged work waiting for a release tag.
+/// A product with landed work that no release is carrying.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Releasable {
     pub product_id: String,
@@ -255,6 +316,13 @@ pub struct Task {
     /// Decoded from `checks_json`; the column itself is never exposed.
     #[serde(default)]
     pub checks: Vec<Check>,
+    /// How far a release of this work steps the version. On a subtask, inherited
+    /// from its target at issue; on a release task, the largest level it ships.
+    #[serde(default)]
+    pub release_level: ReleaseLevel,
+    /// Set on a `normal` task once a release task was issued to ship it.
+    #[serde(default)]
+    pub release_task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,6 +333,8 @@ pub struct NewTask {
     pub product_id: Option<String>,
     pub kind: TaskKind,
     pub priority: i64,
+    #[serde(default)]
+    pub release_level: ReleaseLevel,
 }
 
 /// The attributes a PATCH may change. A `None` field is left as it is.
@@ -276,6 +346,7 @@ pub struct TaskPatch {
     pub product_id: Option<String>,
     pub priority: Option<i64>,
     pub branch: Option<String>,
+    pub release_level: Option<ReleaseLevel>,
 }
 
 /// Create a task in `draft`.
@@ -305,8 +376,9 @@ pub fn create(db: &Db, new: &NewTask, now: OffsetDateTime) -> Result<Task, Error
     let stamp = format_z(now);
     db.with_conn(|conn| {
         conn.execute(
-            "INSERT INTO tasks (id, title, body, status, kind, product_id, priority, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+            "INSERT INTO tasks (id, title, body, status, kind, product_id, priority, release_level,
+                                created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
             rusqlite::params![
                 new.id,
                 new.title,
@@ -315,6 +387,7 @@ pub fn create(db: &Db, new: &NewTask, now: OffsetDateTime) -> Result<Task, Error
                 new.kind.as_str(),
                 new.product_id,
                 new.priority,
+                new.release_level.as_str(),
                 stamp,
             ],
         )?;
@@ -378,7 +451,7 @@ pub fn update(db: &Db, id: &str, patch: &TaskPatch, now: OffsetDateTime) -> Resu
         let task = read(tx, id)?;
         tx.execute(
             "UPDATE tasks SET title = ?2, body = ?3, product_id = ?4, priority = ?5, branch = ?6,
-                    updated_at = ?7
+                    release_level = ?7, updated_at = ?8
              WHERE id = ?1",
             rusqlite::params![
                 id,
@@ -387,6 +460,7 @@ pub fn update(db: &Db, id: &str, patch: &TaskPatch, now: OffsetDateTime) -> Resu
                 patch.product_id.as_deref().or(task.product_id.as_deref()),
                 patch.priority.unwrap_or(task.priority),
                 patch.branch.as_deref().or(task.branch.as_deref()),
+                patch.release_level.unwrap_or(task.release_level).as_str(),
                 stamp,
             ],
         )?;
@@ -528,12 +602,18 @@ fn operator_refusal(task: &Task, to: TaskStatus) -> Option<Error> {
     // as a claimed one does, and the same two presses — `cancelled` and
     // `dropped` — still release it, so nothing is stranded. Refusing it would
     // reach past the hazard.
-    if task.kind == TaskKind::InstantMerge && matches!(to, TaskStatus::Done | TaskStatus::Blocked) {
+    // A release attempt is the same shape: `done` is the tag `bump-tag` cut and
+    // the shipping of every task it carries, `blocked` is the reason it could
+    // not — both are evidence only `report` produces.
+    if matches!(task.kind, TaskKind::InstantMerge | TaskKind::InstantRelease)
+        && matches!(to, TaskStatus::Done | TaskStatus::Blocked)
+    {
         return Some(Error::Invalid(format!(
-            "merge task {} ends the way its worker reports it ended \
+            "{} task {} ends the way its worker reports it ended \
              (POST /worker/report, outcome done or blocked), not by a status change: \
              {} pressed by hand would record an attempt that ran with no checks \
              behind it",
+            attempt_noun(task.kind),
             task.id,
             to.as_str()
         )));
@@ -559,18 +639,28 @@ fn operator_refusal(task: &Task, to: TaskStatus) -> Option<Error> {
     // for a new merge, which `mergeable` then offers and `issue_merge` files
     // under a fresh id (`merge:{target}~2`). One human press, one new attempt,
     // and the failed one stays on the record saying why.
-    if task.kind == TaskKind::InstantMerge
+    if matches!(task.kind, TaskKind::InstantMerge | TaskKind::InstantRelease)
         && task.status == TaskStatus::Blocked
         && to == TaskStatus::Ready
     {
         return Some(Error::Invalid(format!(
-            "merge task {} is blocked: a merge attempt that could not be integrated is not \
+            "{noun} task {} is blocked: a {noun} attempt that could not be integrated is not \
              restarted, it is called off (cancelled or dropped) and issued again against the \
              target as a new attempt",
-            task.id
+            task.id,
+            noun = attempt_noun(task.kind),
         )));
     }
     None
+}
+
+/// The word a refusal uses for an attempt the control plane issued.
+fn attempt_noun(kind: TaskKind) -> &'static str {
+    match kind {
+        TaskKind::InstantRelease => "release",
+        TaskKind::InstantMerge => "merge",
+        TaskKind::Normal | TaskKind::Review => "task",
+    }
 }
 
 /// Whether the owning product ships releases. A task without a product does not.
@@ -965,6 +1055,11 @@ fn kind_filter(kinds: &[TaskKind]) -> String {
 /// than leaving the work finished and invisible to reviewers.
 ///
 /// `outcome` is how the worker says it could not finish; see [`ReportOutcome`].
+/// `release_tag` is read on an `instant:release` task only, where a `done`
+/// report is the tag the worker cut.
+// One wire body, one function: every field of `/worker/report` arrives here as
+// it is, so the two transports cannot disagree about what a report carries.
+#[allow(clippy::too_many_arguments)]
 pub fn report(
     db: &Db,
     claim_id: &str,
@@ -972,6 +1067,7 @@ pub fn report(
     verification: &str,
     checks: &[Check],
     outcome: ReportOutcome,
+    release_tag: Option<&str>,
     now: OffsetDateTime,
 ) -> Result<Task, Error> {
     if commit_sha.trim().is_empty() || verification.trim().is_empty() {
@@ -1009,9 +1105,26 @@ pub fn report(
         // checks" on the idempotent path. It guards success only — a worker
         // that says it was blocked is *reporting* the red check, not claiming
         // it as a pass.
-        if task.kind == TaskKind::InstantMerge {
+        if matches!(task.kind, TaskKind::InstantMerge | TaskKind::InstantRelease) {
             check_gate(&task, checks)?;
         }
+        // A release is finished by the tag it cut. Nothing else on the report
+        // says which version shipped, and a report without one — or with one
+        // that is not a version — is refused rather than filed as a release of
+        // nothing.
+        let release_tag = match task.kind {
+            TaskKind::InstantRelease => match release_tag.map(str::trim) {
+                Some(tag) if is_release_tag(tag) => Some(tag),
+                _ => {
+                    return Err(Error::Invalid(format!(
+                        "release task {} is reported with the tag it cut: release_tag \
+                         must match v<major>.<minor>.<patch>",
+                        task.id
+                    )));
+                }
+            },
+            _ => None,
+        };
         match task.status {
             TaskStatus::Wip => {
                 tx.execute(
@@ -1023,6 +1136,10 @@ pub fn report(
                 match task.kind {
                     TaskKind::InstantMerge => land_merge_target(tx, &task, &stamp)?,
                     TaskKind::Normal => ensure_review(tx, &task.id, &stamp)?,
+                    TaskKind::InstantRelease => {
+                        let tag = release_tag.unwrap_or_default();
+                        ship_release(tx, &task, tag, &stamp)?;
+                    }
                     TaskKind::Review => unreachable!("a review is refused above"),
                 }
                 read(tx, &task.id)
@@ -1031,6 +1148,14 @@ pub fn report(
             // second time, so it issues nothing either: the review the first
             // one filed is still the review of this commit.
             TaskStatus::Done if task.commit_sha.as_deref() == Some(commit_sha) => Ok(task),
+            // A release that shipped left `done` for `released` in the same
+            // write, so its repeat arrives at a released row.
+            TaskStatus::Released
+                if task.kind == TaskKind::InstantRelease
+                    && task.commit_sha.as_deref() == Some(commit_sha) =>
+            {
+                Ok(task)
+            }
             TaskStatus::Done => Err(Error::Invalid(format!(
                 "task {} was already reported with a different commit",
                 task.id
@@ -1233,7 +1358,244 @@ fn land_merge_target(tx: &Connection, merge: &Task, stamp: &str) -> Result<(), E
         "UPDATE tasks SET status = 'merged', updated_at = ?2 WHERE id = ?1",
         rusqlite::params![target_id, stamp],
     )?;
+    // Landing is where the release is decided. A product that ships has its
+    // release issued here, in the same transaction, the way a report issues
+    // its review; one that does not ship is done the moment it lands.
+    let Some(product_id) = target.product_id.as_deref() else {
+        return Ok(());
+    };
+    match product::read(tx, product_id) {
+        Ok(product) if releases(&product) => {
+            ensure_release(tx, product_id, stamp)?;
+        }
+        Ok(product) if !product.releases => release_without_tag(tx, target_id, stamp)?,
+        // Archived: the flag cannot be re-read and the workflows cannot run.
+        // The work stays merged, and `releasable` shows it as stranded.
+        Ok(_) | Err(Error::NotFound) => {}
+        Err(other) => return Err(other),
+    }
     Ok(())
+}
+
+/// The statuses in which a release attempt still holds its product: issued and
+/// waiting, running, or stopped and waiting for a person. A product carries at
+/// most one of these at a time, and while one is there no second release is
+/// issued — the report that ends it calls [`ensure_release`] again and picks
+/// up whatever merged in the meantime.
+const RELEASE_IS_OPEN: &str = "('ready', 'wip', 'blocked')";
+
+/// The `normal` work of a product that has landed and has no live release
+/// carrying it: never issued one, or issued one that was called off. What
+/// [`ensure_release`] gathers, what `POST /api/releases` gathers by hand, and
+/// what [`releasable`] reports as stranded — one predicate, three readers.
+///
+/// Newest first, so the first row names the release: `release:<newest target>`.
+const RELEASE_TARGETS: &str = "kind = 'normal' AND status = 'merged' AND product_id = ?1
+                               AND (release_task_id IS NULL OR NOT EXISTS (
+                                 SELECT 1 FROM tasks carrier
+                                 WHERE carrier.id = tasks.release_task_id
+                                   AND carrier.status NOT IN ('cancelled', 'dropped')
+                               ))";
+
+/// Whether some release attempt of `product_id` is still open.
+fn has_open_release(conn: &Connection, product_id: &str) -> Result<bool, Error> {
+    Ok(conn.query_row(
+        &format!(
+            "SELECT EXISTS(
+               SELECT 1 FROM tasks
+               WHERE kind = 'instant:release' AND product_id = ?1
+                 AND status IN {RELEASE_IS_OPEN}
+             )"
+        ),
+        [product_id],
+        |row| row.get(0),
+    )?)
+}
+
+fn release_targets(conn: &Connection, product_id: &str) -> Result<Vec<Task>, Error> {
+    query_all(
+        conn,
+        &format!(
+            "SELECT {COLUMNS} FROM tasks
+             WHERE {RELEASE_TARGETS}
+             ORDER BY created_at DESC, id DESC"
+        ),
+        &[&product_id],
+    )
+}
+
+/// See to it that the landed work of `product_id` has a release carrying it,
+/// issuing one if it has none and there is something to ship.
+///
+/// Skips while a release is open: that attempt either ships, and its report
+/// comes back here, or it is called off, and the next merge or a hand-issued
+/// release gathers everything again. Skips too when nothing merged is waiting.
+fn ensure_release(tx: &Connection, product_id: &str, stamp: &str) -> Result<Option<Task>, Error> {
+    if has_open_release(tx, product_id)? {
+        return Ok(None);
+    }
+    let targets = release_targets(tx, product_id)?;
+    if targets.is_empty() {
+        return Ok(None);
+    }
+    issue_release_for(tx, product_id, &targets, stamp).map(Some)
+}
+
+/// Write the release task that ships `targets` and point each of them at it.
+///
+/// The level is the largest level among the work shipped, the id is derived
+/// from the newest target, and the priority is the highest the work carried, so
+/// a release is never handed out behind the work that earned it.
+fn issue_release_for(
+    tx: &Connection,
+    product_id: &str,
+    targets: &[Task],
+    stamp: &str,
+) -> Result<Task, Error> {
+    let newest = targets.first().ok_or_else(|| {
+        Error::Conflict(format!(
+            "product {product_id} has no merged task to release"
+        ))
+    })?;
+    let level = targets
+        .iter()
+        .map(|task| task.release_level)
+        .max()
+        .unwrap_or_default();
+    let priority = targets.iter().map(|task| task.priority).max().unwrap_or(0);
+    let (id, _attempt) = free_attempt_id(tx, &release_task_id(&newest.id))?;
+    tx.execute(
+        "INSERT INTO tasks (id, title, body, status, kind, product_id, priority, release_level,
+                            created_at, updated_at)
+         VALUES (?1, ?2, '', 'ready', 'instant:release', ?3, ?4, ?5, ?6, ?6)",
+        rusqlite::params![
+            id,
+            format!("release {product_id}: {}", level.as_str()),
+            product_id,
+            priority,
+            level.as_str(),
+            stamp,
+        ],
+    )?;
+    for target in targets {
+        tx.execute(
+            "UPDATE tasks SET release_task_id = ?2, updated_at = ?3 WHERE id = ?1",
+            rusqlite::params![target.id, id, stamp],
+        )?;
+    }
+    read(tx, &id)
+}
+
+/// Issue the release of `product_id` by hand: the reconciliation handle for a
+/// product whose landed work lost its release — an attempt that was called off
+/// — or that merged before releases were issued automatically.
+///
+/// A product that does not ship, one with an attempt still open, and one with
+/// nothing waiting each answer with a conflict; the request is well formed and
+/// the world refuses it.
+pub fn issue_release(db: &Db, product_id: &str, now: OffsetDateTime) -> Result<Task, Error> {
+    let stamp = format_z(now);
+    db.with_tx(|tx| {
+        let product = product::read(tx, product_id)?;
+        if !releases(&product) {
+            return Err(Error::Conflict(format!(
+                "product {product_id} does not release"
+            )));
+        }
+        if has_open_release(tx, product_id)? {
+            return Err(Error::Conflict(format!(
+                "product {product_id} already has a release in flight"
+            )));
+        }
+        let targets = release_targets(tx, product_id)?;
+        if targets.is_empty() {
+            return Err(Error::Conflict(format!(
+                "product {product_id} has no merged task to release"
+            )));
+        }
+        issue_release_for(tx, product_id, &targets, &stamp)
+    })
+}
+
+/// Ship what `release` carries under `tag`: the release task itself, every
+/// `normal` task pointing at it, and the finished `review` and `instant:merge`
+/// subtasks of those — all to `released`, one tag, one transaction. Then look
+/// again: work that landed while this release ran gets the next one.
+fn ship_release(tx: &Connection, release: &Task, tag: &str, stamp: &str) -> Result<(), Error> {
+    tx.execute(
+        "UPDATE tasks SET status = 'released', release_tag = ?2, updated_at = ?3
+         WHERE kind = 'normal' AND status = 'merged' AND release_task_id = ?1",
+        rusqlite::params![release.id, tag, stamp],
+    )?;
+    release_subtasks_of(
+        tx,
+        "release_task_id = ?1",
+        &[&release.id, &Some(tag), &stamp],
+    )?;
+    tx.execute(
+        "UPDATE tasks SET status = 'released', release_tag = ?2, updated_at = ?3 WHERE id = ?1",
+        rusqlite::params![release.id, tag, stamp],
+    )?;
+    if let Some(product_id) = release.product_id.as_deref() {
+        ensure_release(tx, product_id, stamp)?;
+    }
+    Ok(())
+}
+
+/// A product that does not ship ends at the landing: the work and its finished
+/// subtasks go straight to `released`, with no tag, because there is none.
+fn release_without_tag(tx: &Connection, target_id: &str, stamp: &str) -> Result<(), Error> {
+    tx.execute(
+        "UPDATE tasks SET status = 'released', updated_at = ?2 WHERE id = ?1",
+        rusqlite::params![target_id, stamp],
+    )?;
+    release_subtasks_of(tx, "id = ?1", &[&target_id, &None::<&str>, &stamp])
+}
+
+/// Carry the finished `review` and `instant:merge` subtasks of the `normal`
+/// tasks selected by `targets_where` (bound to `?1`) to `released` under `?2`,
+/// stamped `?3`. A subtask left at `done` after its target shipped is a husk:
+/// the verdict lives on the target's `latest_review` and the merge landed.
+fn release_subtasks_of(
+    tx: &Connection,
+    targets_where: &str,
+    params: &[&dyn ToSql],
+) -> Result<(), Error> {
+    tx.execute(
+        &format!(
+            "UPDATE tasks SET status = 'released', release_tag = ?2, updated_at = ?3
+             WHERE status = 'done' AND kind IN ('review', 'instant:merge')
+               AND COALESCE(review_target_task_id, merge_target_task_id) IN (
+                 SELECT id FROM tasks WHERE kind = 'normal' AND status = 'released'
+                   AND {targets_where}
+               )"
+        ),
+        params,
+    )?;
+    Ok(())
+}
+
+/// Release tasks that have been issued and not finished yet, oldest first: what
+/// a screen shows as "shipping", with the reason on a stopped one.
+pub fn pending_releases(db: &Db) -> Result<Vec<Task>, Error> {
+    db.with_conn(|conn| {
+        query_all(
+            conn,
+            &format!(
+                "SELECT {COLUMNS} FROM tasks
+                 WHERE kind = 'instant:release'
+                   AND status IN {RELEASE_IS_OPEN}
+                 ORDER BY created_at ASC, id ASC"
+            ),
+            &[],
+        )
+    })
+}
+
+/// The id of the first release task shipping `newest_target_id`.
+#[must_use]
+pub fn release_task_id(newest_target_id: &str) -> String {
+    format!("release:{newest_target_id}")
 }
 
 /// The tasks a human may press "merge" on: approved normal work that carries
@@ -1420,9 +1782,9 @@ fn issue_merge_in_tx(tx: &Connection, target_id: &str, stamp: &str) -> Result<Ta
     let (id, _attempt) = free_attempt_id(tx, &merge_task_id(target_id))?;
     tx.execute(
         "INSERT INTO tasks (id, title, body, status, kind, product_id, priority, branch,
-                            commit_sha, merge_target_task_id,
+                            commit_sha, merge_target_task_id, release_level,
                             created_at, updated_at)
-         VALUES (?1, ?2, '', 'ready', 'instant:merge', ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+         VALUES (?1, ?2, '', 'ready', 'instant:merge', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
         rusqlite::params![
             id,
             format!("merge {target_id}: {}", target.title),
@@ -1431,6 +1793,7 @@ fn issue_merge_in_tx(tx: &Connection, target_id: &str, stamp: &str) -> Result<Ta
             branch,
             commit_sha,
             target_id,
+            target.release_level.as_str(),
             stamp,
         ],
     )
@@ -1494,9 +1857,9 @@ fn issue_review_in_tx(tx: &Connection, target_id: &str, stamp: &str) -> Result<T
     let (id, attempt) = free_attempt_id(tx, &review_task_id(target_id))?;
     tx.execute(
         "INSERT INTO tasks (id, title, body, status, kind, product_id, priority, branch,
-                            commit_sha, review_target_task_id, review_attempt,
+                            commit_sha, review_target_task_id, review_attempt, release_level,
                             created_at, updated_at)
-         VALUES (?1, ?2, '', 'ready', 'review', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+         VALUES (?1, ?2, '', 'ready', 'review', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
         rusqlite::params![
             id,
             format!("review {target_id}: {}", target.title),
@@ -1506,6 +1869,7 @@ fn issue_review_in_tx(tx: &Connection, target_id: &str, stamp: &str) -> Result<T
             commit_sha,
             target_id,
             attempt,
+            target.release_level.as_str(),
             stamp,
         ],
     )
@@ -1717,21 +2081,39 @@ fn latest_review_of(conn: &Connection, target_id: &str) -> Result<Option<ReviewO
     }))
 }
 
-/// Merged work waiting for a release tag, per releasing product.
+/// Landed work with no release carrying it, per releasing product.
 ///
-/// An archived product is left out for the reason [`releases`] gives: it could
-/// not be released if it were pressed, so offering the button would be an
-/// invitation to a refusal.
+/// Work that lands while a release of its product is still open is not
+/// stranded — the report that ends that release gathers it — so a product with
+/// an open release is left out.
+///
+/// This is an alarm, not a queue. A landing issues its own release, so in a
+/// healthy control plane this list is empty; anything in it is work whose
+/// release was called off, or that merged before releases were issued
+/// automatically, and `POST /api/releases` is the handle that clears it. An
+/// archived product is left out for the reason [`releases`] gives: it could not
+/// be released if it were asked, so offering it would be an invitation to a
+/// refusal.
 pub fn releasable(db: &Db) -> Result<Vec<Releasable>, Error> {
     db.with_conn(|conn| {
-        let mut statement = conn.prepare(
+        let mut statement = conn.prepare(&format!(
             "SELECT tasks.product_id, count(*) FROM tasks
              JOIN products ON products.id = tasks.product_id
              WHERE products.releases = 1 AND products.archived_at IS NULL
                AND tasks.kind = 'normal' AND tasks.status = 'merged'
+               AND (tasks.release_task_id IS NULL OR NOT EXISTS (
+                 SELECT 1 FROM tasks carrier
+                 WHERE carrier.id = tasks.release_task_id
+                   AND carrier.status NOT IN ('cancelled', 'dropped')
+               ))
+               AND NOT EXISTS (
+                 SELECT 1 FROM tasks open
+                 WHERE open.kind = 'instant:release' AND open.product_id = tasks.product_id
+                   AND open.status IN {RELEASE_IS_OPEN}
+               )
              GROUP BY tasks.product_id
-             ORDER BY tasks.product_id ASC",
-        )?;
+             ORDER BY tasks.product_id ASC"
+        ))?;
         let rows = statement.query_map([], |row| {
             Ok(Releasable {
                 product_id: row.get(0)?,
@@ -1739,68 +2121,6 @@ pub fn releasable(db: &Db) -> Result<Vec<Releasable>, Error> {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
-    })
-}
-
-/// Stamp every merged task of `product_id` with `tag` and move it to
-/// `released`, and with it every `review` and `instant:merge` subtask that
-/// finished reading or landing one of those tasks. All of them or none: one
-/// transaction, one tag.
-///
-/// A subtask left at `done` after its target ships is a husk: the review's
-/// verdict already lives on the target's `latest_review`, and the merge
-/// already landed, so neither carries information release withholds by
-/// staying behind. A migration sweeps the husks a database already has when
-/// it opens; this is what keeps a new one from forming.
-pub fn release_product(
-    db: &Db,
-    product_id: &str,
-    tag: &str,
-    now: OffsetDateTime,
-) -> Result<Vec<Task>, Error> {
-    if tag.trim().is_empty() {
-        return Err(Error::Invalid("tag is required".into()));
-    }
-    let stamp = format_z(now);
-    db.with_tx(|tx| {
-        let product = product::read(tx, product_id)?;
-        if !releases(&product) {
-            return Err(Error::Conflict(format!(
-                "product {product_id} does not release"
-            )));
-        }
-        let sql = format!(
-            "SELECT {COLUMNS} FROM tasks
-             WHERE product_id = ?1 AND kind = 'normal' AND status = 'merged'
-             ORDER BY created_at ASC, id ASC"
-        );
-        let targets = query_all(tx, &sql, &[&product_id])?;
-        if targets.is_empty() {
-            return Err(Error::Conflict(format!(
-                "product {product_id} has no merged task to release"
-            )));
-        }
-        tx.execute(
-            "UPDATE tasks SET status = 'released', release_tag = ?2, updated_at = ?3
-             WHERE product_id = ?1 AND kind = 'normal' AND status = 'merged'",
-            rusqlite::params![product_id, tag, stamp],
-        )?;
-        tx.execute(
-            "UPDATE tasks SET status = 'released', release_tag = ?2, updated_at = ?3
-             WHERE status = 'done' AND kind IN ('review', 'instant:merge')
-               AND (
-                 review_target_task_id IN (
-                   SELECT id FROM tasks
-                   WHERE product_id = ?1 AND kind = 'normal' AND status = 'released' AND release_tag = ?2
-                 )
-                 OR merge_target_task_id IN (
-                   SELECT id FROM tasks
-                   WHERE product_id = ?1 AND kind = 'normal' AND status = 'released' AND release_tag = ?2
-                 )
-               )",
-            rusqlite::params![product_id, tag, stamp],
-        )?;
-        targets.iter().map(|task| read(tx, &task.id)).collect()
     })
 }
 
@@ -1874,6 +2194,8 @@ fn from_row(row: &Row<'_>) -> Result<Task, Error> {
         checks: decode_checks(row.get::<_, Option<String>>(18)?.as_deref())?,
         review_target_task_id: row.get(19)?,
         review_verdict: decode_verdict(row.get::<_, Option<String>>(20)?.as_deref())?,
+        release_level: ReleaseLevel::parse(&row.get::<_, String>(21)?)?,
+        release_task_id: row.get(22)?,
     })
 }
 
@@ -1893,11 +2215,12 @@ mod tests {
     use time::macros::datetime;
 
     use super::{
-        ALL_STATUSES, Check, NewTask, Releasable, ReportOutcome, ReviewVerdict, Task, TaskKind,
-        TaskPatch, TaskStatus, available_transitions, can_transition, claim, create, get,
-        issue_merge, issue_review, latest_review, list, list_active, list_by_status, merge_task_id,
-        mergeable, pending_merges, pending_reviews, releasable, release_product, report,
-        review_report, review_task_id, set_status, set_status_by_operator, unreviewed, update,
+        ALL_STATUSES, Check, NewTask, Releasable, ReleaseLevel, ReportOutcome, ReviewVerdict, Task,
+        TaskKind, TaskPatch, TaskStatus, available_transitions, can_transition, claim, create, get,
+        issue_merge, issue_release, issue_review, latest_review, list, list_active, list_by_status,
+        merge_task_id, mergeable, pending_merges, pending_releases, pending_reviews, releasable,
+        release_task_id, report, review_report, review_task_id, set_status, set_status_by_operator,
+        unreviewed, update,
     };
     use crate::clock::format_z;
     use crate::db::Db;
@@ -1937,6 +2260,7 @@ mod tests {
             product_id: Some("a/b".into()),
             kind,
             priority,
+            release_level: ReleaseLevel::Patch,
         }
     }
 
@@ -2063,6 +2387,7 @@ mod tests {
             "cargo test",
             &[],
             ReportOutcome::Done,
+            None,
             now(),
         )
         .unwrap();
@@ -2076,6 +2401,7 @@ mod tests {
             "cargo test",
             &[],
             ReportOutcome::Done,
+            None,
             now(),
         )
         .unwrap();
@@ -2089,6 +2415,7 @@ mod tests {
                 "cargo test",
                 &[],
                 ReportOutcome::Done,
+                None,
                 now()
             ),
             Err(Error::Invalid(_))
@@ -2101,6 +2428,7 @@ mod tests {
                 "cargo test",
                 &[],
                 ReportOutcome::Done,
+                None,
                 now()
             ),
             Err(Error::ClaimMismatch)
@@ -2113,6 +2441,7 @@ mod tests {
                 "cargo test",
                 &[],
                 ReportOutcome::Done,
+                None,
                 now()
             ),
             Err(Error::Invalid(_))
@@ -2514,6 +2843,7 @@ mod tests {
                     "cargo test",
                     &[],
                     ReportOutcome::Done,
+                    None,
                     expired
                 ),
                 Err(Error::ClaimMismatch)
@@ -2528,6 +2858,7 @@ mod tests {
                 "cargo test",
                 &[],
                 ReportOutcome::Done,
+                None,
                 expired
             )
             .unwrap()
@@ -2614,6 +2945,7 @@ mod tests {
             "cargo test",
             &[],
             ReportOutcome::Done,
+            None,
             now(),
         )
         .unwrap();
@@ -2737,6 +3069,7 @@ mod tests {
                         "cargo test",
                         &checks,
                         ReportOutcome::Done,
+                        None,
                         later()
                     ),
                     Err(Error::Invalid(_))
@@ -2754,6 +3087,7 @@ mod tests {
             "cargo test",
             &green(),
             ReportOutcome::Done,
+            None,
             later(),
         )
         .unwrap();
@@ -2769,6 +3103,7 @@ mod tests {
             "cargo test",
             &green(),
             ReportOutcome::Done,
+            None,
             later(),
         )
         .unwrap();
@@ -2796,6 +3131,7 @@ mod tests {
             "cargo test",
             &green(),
             ReportOutcome::Done,
+            None,
             later(),
         )
         .unwrap();
@@ -2818,6 +3154,7 @@ mod tests {
                         "cargo test",
                         &checks,
                         ReportOutcome::Done,
+                        None,
                         later()
                     ),
                     Err(Error::Invalid(_))
@@ -2843,6 +3180,7 @@ mod tests {
             "cargo test",
             &green(),
             ReportOutcome::Done,
+            None,
             later(),
         )
         .unwrap();
@@ -2909,6 +3247,7 @@ mod tests {
                 "cargo test",
                 &green(),
                 ReportOutcome::Done,
+                None,
                 later()
             ),
             Err(Error::Invalid(_))
@@ -2938,6 +3277,7 @@ mod tests {
             "cargo test",
             &green(),
             ReportOutcome::Done,
+            None,
             now(),
         )
         .unwrap();
@@ -2946,8 +3286,151 @@ mod tests {
         assert_eq!(get(&db, "t-1").unwrap().checks, green());
     }
 
+    fn claim_release(db: &Db) -> Task {
+        claim(db, "shipper", &[TaskKind::InstantRelease], later(), 60)
+            .unwrap()
+            .expect("a release must be waiting to be claimed")
+    }
+
+    fn ship(db: &Db, release: &Task, tag: Option<&str>) -> Result<Task, Error> {
+        report(
+            db,
+            release.claim_id.as_deref().expect("claim_id"),
+            "abc9999",
+            "bump-tag",
+            &green(),
+            ReportOutcome::Done,
+            tag,
+            later(),
+        )
+    }
+
+    /// The landing is where the release is decided: the merge that lands the
+    /// work issues the release that ships it, in the same transaction, and
+    /// points the work at it. Nothing is stranded and nobody pressed anything.
     #[test]
-    fn release_stamps_only_the_merged_tasks_of_a_releasing_product() {
+    fn landing_issues_the_release_and_points_the_work_at_it() {
+        let db = db_with_product();
+        let merge = merge_waiting_for(&db, "t-1", "a/b");
+        assert_eq!(
+            get(&db, &merge.id).unwrap().release_level,
+            ReleaseLevel::Patch,
+            "a subtask inherits the level of its target"
+        );
+        merge_into(&db, &merge.id, TaskStatus::Done);
+
+        let release = get(&db, &release_task_id("t-1")).unwrap();
+        assert_eq!(release.kind, TaskKind::InstantRelease);
+        assert_eq!(release.status, TaskStatus::Ready);
+        assert_eq!(release.product_id.as_deref(), Some("a/b"));
+        assert_eq!(release.release_level, ReleaseLevel::Patch);
+        assert_eq!(release.title, "release a/b: patch");
+        assert!(release.commit_sha.is_none());
+        assert_eq!(
+            get(&db, "t-1").unwrap().release_task_id.as_deref(),
+            Some(release.id.as_str())
+        );
+        assert_eq!(
+            pending_releases(&db)
+                .unwrap()
+                .iter()
+                .map(|task| task.id.clone())
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&release.id)
+        );
+        assert!(
+            releasable(&db).unwrap().is_empty(),
+            "work with a release carrying it is not stranded"
+        );
+        assert!(
+            matches!(issue_release(&db, "a/b", later()), Err(Error::Conflict(_))),
+            "a release in flight is not issued twice"
+        );
+    }
+
+    /// While a release is open, the next landing issues nothing; the report
+    /// that ends the release ships everything it carried — and its subtasks —
+    /// under the tag it cut, then gathers what landed in the meantime.
+    #[test]
+    fn a_release_report_ships_its_work_and_gathers_what_landed_meanwhile() {
+        let db = db_with_product();
+        let first = merge_waiting_for(&db, "t-1", "a/b");
+        merge_into(&db, &first.id, TaskStatus::Done);
+        let release = claim_release(&db);
+        assert_eq!(release.id, release_task_id("t-1"));
+
+        create(
+            &db,
+            &NewTask {
+                release_level: ReleaseLevel::Minor,
+                ..new_task("t-2", TaskKind::Normal, 0)
+            },
+            now(),
+        )
+        .unwrap();
+        work_to_approved(&db, "t-2");
+        let second = issued_merge(&db, "t-2");
+        merge_into(&db, &second.id, TaskStatus::Done);
+        assert_eq!(get(&db, "t-2").unwrap().status, TaskStatus::Merged);
+        assert!(
+            get(&db, "t-2").unwrap().release_task_id.is_none(),
+            "an open release holds the next landing back"
+        );
+        assert_eq!(pending_releases(&db).unwrap().len(), 1);
+        assert!(
+            releasable(&db).unwrap().is_empty(),
+            "work waiting on an open release is not stranded"
+        );
+
+        let shipped = ship(&db, &release, Some("v0.1.1")).unwrap();
+        assert_eq!(shipped.status, TaskStatus::Released);
+        assert_eq!(shipped.release_tag.as_deref(), Some("v0.1.1"));
+        assert_eq!(shipped.commit_sha.as_deref(), Some("abc9999"));
+        for id in ["t-1", &review_task_id("t-1"), &first.id] {
+            let task = get(&db, id).unwrap();
+            assert_eq!(task.status, TaskStatus::Released, "{id}");
+            assert_eq!(task.release_tag.as_deref(), Some("v0.1.1"), "{id}");
+        }
+
+        // The repeat of the same report is accepted and moves nothing.
+        assert_eq!(
+            ship(&db, &release, Some("v0.1.1")).unwrap().status,
+            TaskStatus::Released
+        );
+
+        let next = get(&db, &release_task_id("t-2")).unwrap();
+        assert_eq!(next.status, TaskStatus::Ready);
+        assert_eq!(next.release_level, ReleaseLevel::Minor);
+        assert_eq!(
+            get(&db, "t-2").unwrap().release_task_id.as_deref(),
+            Some(next.id.as_str())
+        );
+        assert_eq!(get(&db, "t-2").unwrap().status, TaskStatus::Merged);
+    }
+
+    /// A release is finished by the tag it cut and by nothing else: no tag, or
+    /// one that is not a version, is refused and the row does not move.
+    #[test]
+    fn a_release_report_without_a_version_tag_is_refused() {
+        let db = db_with_product();
+        let merge = merge_waiting_for(&db, "t-1", "a/b");
+        merge_into(&db, &merge.id, TaskStatus::Done);
+        let release = claim_release(&db);
+
+        for tag in [None, Some(""), Some("1.2.3"), Some("v1.2"), Some("v1.2.x")] {
+            assert!(
+                matches!(ship(&db, &release, tag), Err(Error::Invalid(_))),
+                "{tag:?} is not a release tag"
+            );
+        }
+        assert_eq!(get(&db, &release.id).unwrap().status, TaskStatus::Wip);
+        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Merged);
+    }
+
+    /// A product that does not release ends at the landing: the work and its
+    /// finished subtasks are released with no tag, and no release is issued.
+    #[test]
+    fn a_product_that_does_not_release_ends_at_the_landing() {
         let db = db_with_product();
         product::upsert(
             &db,
@@ -2961,119 +3444,125 @@ mod tests {
             now(),
         )
         .unwrap();
+        let merge = merge_waiting_for(&db, "t-keep", "c/d");
+        assert_eq!(
+            claim_merge(&db, "luna", later()).as_deref(),
+            Some(merge.id.as_str())
+        );
+        land_merge(&db, &merge.id, "abc1234");
 
-        for (id, product_id) in [
-            ("t-ship-1", "a/b"),
-            ("t-ship-2", "a/b"),
-            ("t-open", "a/b"),
-            ("t-keep", "c/d"),
-        ] {
-            create(
-                &db,
-                &NewTask {
-                    product_id: Some(product_id.into()),
-                    ..new_task(id, TaskKind::Normal, 0)
-                },
-                now(),
-            )
+        for id in ["t-keep", &review_task_id("t-keep"), &merge.id] {
+            let task = get(&db, id).unwrap();
+            assert_eq!(task.status, TaskStatus::Released, "{id}");
+            assert!(task.release_tag.is_none(), "{id}");
+        }
+        assert!(pending_releases(&db).unwrap().is_empty());
+        assert!(matches!(
+            get(&db, &release_task_id("t-keep")),
+            Err(Error::NotFound)
+        ));
+        assert!(matches!(
+            issue_release(&db, "c/d", later()),
+            Err(Error::Conflict(_))
+        ));
+    }
+
+    /// A release that was called off leaves its work merged with no carrier,
+    /// and the next landing gathers all of it under one release whose level
+    /// is the largest of the work it ships and whose id names the newest.
+    #[test]
+    fn the_release_level_is_the_largest_of_the_work_it_ships() {
+        let db = db_with_product();
+        let first = merge_waiting_for(&db, "t-1", "a/b");
+        merge_into(&db, &first.id, TaskStatus::Done);
+        set_status_by_operator(&db, &release_task_id("t-1"), TaskStatus::Cancelled, later())
             .unwrap();
-        }
-        for id in ["t-ship-1", "t-ship-2", "t-keep"] {
-            for to in [
-                TaskStatus::Ready,
-                TaskStatus::Wip,
-                TaskStatus::Done,
-                TaskStatus::Approved,
-                TaskStatus::Merged,
-            ] {
-                set_status(&db, id, to, now()).unwrap();
-            }
-        }
-        for to in [TaskStatus::Ready, TaskStatus::Wip, TaskStatus::Done] {
-            set_status(&db, "t-open", to, now()).unwrap();
-        }
-
         assert_eq!(
             releasable(&db).unwrap(),
             vec![Releasable {
                 product_id: "a/b".into(),
-                task_count: 2,
+                task_count: 1,
             }],
-            "a product that does not release never queues one"
+            "work whose release was called off is stranded"
         );
 
+        create(
+            &db,
+            &NewTask {
+                release_level: ReleaseLevel::Major,
+                ..new_task("t-2", TaskKind::Normal, 3)
+            },
+            later(),
+        )
+        .unwrap();
+        work_to_approved(&db, "t-2");
+        merge_into(&db, &issued_merge(&db, "t-2").id, TaskStatus::Done);
+
+        let release = get(&db, &release_task_id("t-2")).unwrap();
+        assert_eq!(release.release_level, ReleaseLevel::Major);
+        assert_eq!(
+            release.priority, 3,
+            "a release is not handed out behind its work"
+        );
+        for id in ["t-1", "t-2"] {
+            assert_eq!(
+                get(&db, id).unwrap().release_task_id.as_deref(),
+                Some(release.id.as_str()),
+                "{id} is carried by the new release"
+            );
+        }
+        assert!(releasable(&db).unwrap().is_empty());
+    }
+
+    /// A blocked release is written down like a blocked merge: the work stays
+    /// merged, the row keeps the reason, and the way out is calling the attempt
+    /// off and issuing a new one by hand.
+    #[test]
+    fn a_blocked_release_keeps_its_work_merged_and_is_reissued_by_hand() {
+        let db = db_with_product();
+        let merge = merge_waiting_for(&db, "t-1", "a/b");
+        merge_into(&db, &merge.id, TaskStatus::Done);
+        let release = claim_release(&db);
+
+        let blocked = report(
+            &db,
+            release.claim_id.as_deref().unwrap(),
+            "abc1234",
+            "bump-tag: the tag already exists",
+            &[Check {
+                name: "bump-tag".into(),
+                exit_code: 1,
+            }],
+            ReportOutcome::Blocked,
+            None,
+            later(),
+        )
+        .unwrap();
+        assert_eq!(blocked.status, TaskStatus::Blocked);
+        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Merged);
+        assert_eq!(
+            available_transitions(&blocked),
+            [TaskStatus::Cancelled, TaskStatus::Dropped],
+            "a blocked release is called off, never restarted"
+        );
         assert!(matches!(
-            release_product(&db, "c/d", "v1", later()),
+            issue_release(&db, "a/b", later()),
             Err(Error::Conflict(_))
         ));
         assert!(matches!(
-            release_product(&db, "a/b", "  ", later()),
-            Err(Error::Invalid(_))
-        ));
-        assert!(matches!(
-            release_product(&db, "x/y", "v1", later()),
+            issue_release(&db, "x/y", later()),
             Err(Error::NotFound)
         ));
 
-        let released = release_product(&db, "a/b", "v0.2.0", later()).unwrap();
-        let ids: Vec<String> = released.iter().map(|t| t.id.clone()).collect();
-        assert_eq!(ids, ["t-ship-1", "t-ship-2"]);
-        for task in &released {
-            assert_eq!(task.status, TaskStatus::Released);
-            assert_eq!(task.release_tag.as_deref(), Some("v0.2.0"));
-            assert_eq!(task.updated_at, "2026-03-04T05:06:08Z");
-        }
-
-        assert_eq!(get(&db, "t-open").unwrap().status, TaskStatus::Done);
-        assert!(get(&db, "t-open").unwrap().release_tag.is_none());
-        assert_eq!(get(&db, "t-keep").unwrap().status, TaskStatus::Merged);
-        assert!(get(&db, "t-keep").unwrap().release_tag.is_none());
-
-        assert!(releasable(&db).unwrap().is_empty());
-        assert!(
-            matches!(
-                release_product(&db, "a/b", "v0.2.1", later()),
-                Err(Error::Conflict(_))
-            ),
-            "a release with nothing merged is a conflict"
-        );
+        set_status_by_operator(&db, &release.id, TaskStatus::Dropped, later()).unwrap();
+        let again = issue_release(&db, "a/b", later()).unwrap();
+        assert_eq!(again.id, format!("{}~2", release_task_id("t-1")));
+        assert_eq!(again.status, TaskStatus::Ready);
         assert_eq!(
-            get(&db, "t-ship-1").unwrap().release_tag.as_deref(),
-            Some("v0.2.0"),
-            "the refused release must not have restamped anything"
+            get(&db, "t-1").unwrap().release_task_id.as_deref(),
+            Some(again.id.as_str()),
+            "the work is pointed at the new attempt"
         );
-    }
-
-    /// A shipped task leaves behind a `review` and an `instant:merge` subtask
-    /// that already finished their job — the verdict is read, the merge is
-    /// landed. Release carries them to `released` too, so none of them is a
-    /// husk `done` card release forgot.
-    #[test]
-    fn release_also_releases_the_finished_review_and_merge_of_what_it_ships() {
-        let db = db_with_product();
-        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
-        work_to_approved(&db, "t-1");
-        let merge_id = issued_merge(&db, "t-1").id;
-        merge_into(&db, &merge_id, TaskStatus::Done);
-
-        let review_id = review_task_id("t-1");
-        assert_eq!(get(&db, &review_id).unwrap().status, TaskStatus::Done);
-        assert_eq!(get(&db, &merge_id).unwrap().status, TaskStatus::Done);
-        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Merged);
-
-        let released = release_product(&db, "a/b", "v1.0.0", later()).unwrap();
-        assert_eq!(
-            released.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
-            ["t-1"]
-        );
-
-        let review = get(&db, &review_id).unwrap();
-        assert_eq!(review.status, TaskStatus::Released);
-        assert_eq!(review.release_tag.as_deref(), Some("v1.0.0"));
-
-        let merge = get(&db, &merge_id).unwrap();
-        assert_eq!(merge.status, TaskStatus::Released);
-        assert_eq!(merge.release_tag.as_deref(), Some("v1.0.0"));
     }
 
     /// An archived product releases nothing, whatever its stored `releases`
@@ -3083,9 +3572,9 @@ mod tests {
     /// longer be checked. Releasing is also the one operation that most needs
     /// the working copy: the CI that builds the artefacts runs from it.
     ///
-    /// So the archive mark is read where the question is asked rather than
-    /// written over `releases`: the stored flag stays untouched, and a clone put
-    /// back releases again on the next walk without anyone re-entering anything.
+    /// So the landing leaves the work merged and issues nothing, and a clone put
+    /// back makes it releasable again on the next walk with nobody re-entering
+    /// anything.
     #[test]
     fn an_archived_product_releases_nothing_until_its_clone_is_back() {
         let db = db_with_product();
@@ -3104,16 +3593,7 @@ mod tests {
             archived: false,
         };
 
-        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
-        for to in [
-            TaskStatus::Ready,
-            TaskStatus::Wip,
-            TaskStatus::Done,
-            TaskStatus::Approved,
-            TaskStatus::Merged,
-        ] {
-            set_status(&db, "t-1", to, now()).unwrap();
-        }
+        let merge = merge_waiting_for(&db, "t-1", "a/b");
 
         // The walk no longer finds `a/b`, so its row is archived.
         product::reconcile(&db, std::slice::from_ref(&elsewhere), later()).unwrap();
@@ -3124,23 +3604,21 @@ mod tests {
             "the stored flag is left exactly as the last walk wrote it"
         );
 
+        merge_into(&db, &merge.id, TaskStatus::Done);
+        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Merged);
+        assert!(pending_releases(&db).unwrap().is_empty());
         assert!(
             releasable(&db).unwrap().is_empty(),
             "an archived product is not offered as release-ready"
         );
         assert!(matches!(
-            release_product(&db, "a/b", "v0.2.0", later()),
+            issue_release(&db, "a/b", later()),
             Err(Error::Conflict(_))
         ));
         assert!(matches!(
             set_status(&db, "t-1", TaskStatus::Released, later()),
             Err(Error::Invalid(_))
         ));
-        assert_eq!(
-            get(&db, "t-1").unwrap().status,
-            TaskStatus::Merged,
-            "the refused release leaves the task where it was"
-        );
 
         // The clone comes back, and so does the release.
         product::reconcile(&db, &[elsewhere, on_disk], later()).unwrap();
@@ -3151,12 +3629,9 @@ mod tests {
                 task_count: 1,
             }]
         );
-        assert_eq!(
-            release_product(&db, "a/b", "v0.2.0", later())
-                .unwrap()
-                .len(),
-            1
-        );
+        let release = issue_release(&db, "a/b", later()).unwrap();
+        assert_eq!(release.id, release_task_id("t-1"));
+        assert!(releasable(&db).unwrap().is_empty());
     }
 
     /// Registration files ordinary work. A merge is issued by the control plane
@@ -3213,6 +3688,7 @@ mod tests {
             "cargo test",
             &green(),
             ReportOutcome::Done,
+            None,
             later(),
         )
         .expect_err("a merge with no target lands nothing");
@@ -3471,6 +3947,7 @@ mod tests {
             "cargo test",
             &[],
             ReportOutcome::Done,
+            None,
             later(),
         )
         .unwrap();
@@ -3546,6 +4023,7 @@ mod tests {
             "cargo test",
             &[],
             ReportOutcome::Done,
+            None,
             later(),
         )
         .unwrap();
@@ -3576,6 +4054,7 @@ mod tests {
             "cargo test",
             &green(),
             ReportOutcome::Done,
+            None,
             later(),
         )
         .expect_err("a merge of a commit the parent left behind must be refused");
@@ -3611,6 +4090,7 @@ mod tests {
             "cargo test",
             &green(),
             ReportOutcome::Done,
+            None,
             later(),
         )
         .unwrap();
@@ -3650,6 +4130,7 @@ mod tests {
                 "cargo test",
                 &[],
                 ReportOutcome::Done,
+                None,
                 later(),
             )
             .unwrap();
@@ -3777,6 +4258,7 @@ mod tests {
             "cargo test",
             &[],
             ReportOutcome::Done,
+            None,
             later(),
         )
         .unwrap();
@@ -3890,6 +4372,7 @@ mod tests {
             "cargo test",
             &[],
             ReportOutcome::Done,
+            None,
             later(),
         )
         .unwrap();
@@ -4098,6 +4581,7 @@ mod tests {
             "cargo test",
             &green(),
             ReportOutcome::Done,
+            None,
             later(),
         )
         .unwrap();
@@ -4121,6 +4605,7 @@ mod tests {
             "cargo test",
             &green(),
             ReportOutcome::Done,
+            None,
             later(),
         )
         .expect_err("a review is not finished by a work report");
@@ -4249,6 +4734,7 @@ mod tests {
             "cargo test",
             &[],
             ReportOutcome::Done,
+            None,
             later(),
         )
         .unwrap();
@@ -4307,6 +4793,7 @@ mod tests {
             "cargo test",
             &[],
             ReportOutcome::Done,
+            None,
             later(),
         )
         .unwrap();
@@ -4348,6 +4835,7 @@ mod tests {
             "cargo test",
             &[],
             ReportOutcome::Done,
+            None,
             later(),
         )
         .expect("an open review must not cost the worker its report");
@@ -4394,6 +4882,7 @@ mod tests {
             "cargo test",
             &[],
             ReportOutcome::Done,
+            None,
             later(),
         )
         .expect_err("work that cannot be reviewed cannot be finished");
@@ -4544,6 +5033,7 @@ mod tests {
             "cargo test",
             &green(),
             ReportOutcome::Done,
+            None,
             later(),
         )
         .unwrap();
@@ -4585,6 +5075,7 @@ mod tests {
                 exit_code: 1,
             }],
             ReportOutcome::Blocked,
+            None,
             later(),
         )
         .unwrap();
@@ -4733,6 +5224,7 @@ mod tests {
                 exit_code: 0,
             }],
             ReportOutcome::Done,
+            None,
             later(),
         )
         .unwrap()
@@ -5061,6 +5553,7 @@ mod tests {
             "rebase onto main conflicts",
             &[],
             ReportOutcome::Blocked,
+            None,
             later(),
         )
         .unwrap();
@@ -5119,6 +5612,7 @@ mod tests {
             "cargo test failed on the rebased branch",
             &red,
             ReportOutcome::Blocked,
+            None,
             later(),
         )
         .expect("a worker reporting a red check is not itself an error");
@@ -5148,6 +5642,7 @@ mod tests {
             "cargo test failed on the rebased branch",
             &red,
             ReportOutcome::Blocked,
+            None,
             later(),
         )
         .unwrap();
@@ -5163,6 +5658,7 @@ mod tests {
                 "actually it was a rebase conflict",
                 &red,
                 ReportOutcome::Blocked,
+                None,
                 later(),
             ),
             Err(Error::Invalid(_))
@@ -5177,6 +5673,7 @@ mod tests {
                 "cargo test",
                 &green(),
                 ReportOutcome::Done,
+                None,
                 later(),
             ),
             Err(Error::Invalid(_))
@@ -5205,6 +5702,7 @@ mod tests {
                     "cargo test",
                     &[],
                     ReportOutcome::Done,
+                    None,
                     later(),
                 ),
                 Err(Error::Invalid(_))
@@ -5218,6 +5716,7 @@ mod tests {
             "rebase onto main conflicts in src/task.rs",
             &[],
             ReportOutcome::Blocked,
+            None,
             later(),
         )
         .expect("a conflict is reported without checks");
@@ -5327,6 +5826,7 @@ mod tests {
             "cargo test",
             &[],
             ReportOutcome::Done,
+            None,
             later(),
         )
         .unwrap();

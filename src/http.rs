@@ -9,8 +9,8 @@ use crate::error::Error;
 use crate::product::{self, Product};
 use crate::state::AppState;
 use crate::task::{
-    self, Check, NewTask, Releasable, ReportOutcome, ReviewOutcome, ReviewVerdict, Task, TaskKind,
-    TaskPatch, TaskStatus,
+    self, Check, NewTask, Releasable, ReleaseLevel, ReportOutcome, ReviewOutcome, ReviewVerdict,
+    Task, TaskKind, TaskPatch, TaskStatus,
 };
 
 /// A row in the task list: enough to render a card in a list, no body.
@@ -69,6 +69,27 @@ impl From<Task> for PendingMerge {
     }
 }
 
+/// A release the control plane is carrying: the summary, how far it steps the
+/// version, and why it stopped if it did — the same shape as [`PendingMerge`],
+/// for the same screen.
+#[derive(Debug, Serialize)]
+pub struct PendingRelease {
+    #[serde(flatten)]
+    pub summary: TaskSummary,
+    pub release_level: ReleaseLevel,
+    pub verification: Option<String>,
+}
+
+impl From<Task> for PendingRelease {
+    fn from(task: Task) -> Self {
+        Self {
+            release_level: task.release_level,
+            verification: task.verification.clone(),
+            summary: task.into(),
+        }
+    }
+}
+
 /// The full task plus the transitions a human may actually press and, for work
 /// a review has answered, what that review said.
 #[derive(Debug, Serialize)]
@@ -109,6 +130,10 @@ pub struct ReportBody {
     /// to be kept on the task rather than thrown away with a refusal.
     #[serde(default)]
     pub outcome: Option<String>,
+    /// The tag a release cut. Required on a `done` report of an
+    /// `instant:release` task, and meaningless on every other kind.
+    #[serde(default)]
+    pub release_tag: Option<String>,
 }
 
 /// A review's completion. Deliberately not [`ReportBody`]: a verdict is not a
@@ -132,31 +157,23 @@ pub struct MergeBody {
 #[derive(Debug, Deserialize)]
 pub struct ReleaseBody {
     pub product_id: String,
-    pub tag: String,
 }
 
-/// What the admin screen needs to show the queue and decide whether "release"
-/// is a live button.
+/// What the admin screen needs to show what the control plane is carrying.
 ///
-/// Reviews and merges are issued by the control plane itself, so the two
-/// `pending_*` lists are what is in flight rather than what a human is being
-/// asked to press. `mergeable` and `unreviewed` are reconciliation windows: both
-/// are empty while the automatic issuing works, and anything in either of them
-/// is work that lost its next step.
+/// Reviews, merges, and releases are issued by the control plane itself, so the
+/// three `pending_*` lists are what is in flight rather than what a human is
+/// being asked to press. `mergeable`, `unreviewed`, and `releasable` are
+/// reconciliation windows: all are empty while the automatic issuing works, and
+/// anything in any of them is work that lost its next step.
 #[derive(Debug, Serialize)]
 pub struct ControlPlane {
     pub mergeable: Vec<TaskSummary>,
     pub pending_merges: Vec<PendingMerge>,
+    pub pending_releases: Vec<PendingRelease>,
     pub pending_reviews: Vec<TaskSummary>,
     pub unreviewed: Vec<TaskSummary>,
     pub releasable: Vec<Releasable>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ReleaseResult {
-    pub product_id: String,
-    pub tag: String,
-    pub released: Vec<TaskSummary>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,6 +188,8 @@ pub struct CreateTaskBody {
     pub kind: Option<String>,
     #[serde(default)]
     pub priority: Option<i64>,
+    #[serde(default)]
+    pub release_level: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -308,6 +327,7 @@ pub async fn api_create_task(
             product_id: body.product_id,
             kind,
             priority: body.priority.unwrap_or(0),
+            release_level: ReleaseLevel::parse_optional(body.release_level.as_deref())?,
         },
         state.clock.now(),
     )?;
@@ -360,6 +380,10 @@ pub async fn api_control(
             .into_iter()
             .map(PendingMerge::from)
             .collect(),
+        pending_releases: task::pending_releases(&state.db)?
+            .into_iter()
+            .map(PendingRelease::from)
+            .collect(),
         pending_reviews: summaries(task::pending_reviews(&state.db)?),
         unreviewed: summaries(task::unreviewed(&state.db)?),
         releasable: task::releasable(&state.db)?,
@@ -386,19 +410,16 @@ pub async fn api_issue_review(
     Ok((StatusCode::CREATED, Json(card(&state.db, issued)?)).into_response())
 }
 
+/// Reconciliation: issue the release of one product by hand. The ordinary flow
+/// issues it at the landing.
 pub async fn api_release(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<ReleaseBody>,
-) -> Result<Json<ReleaseResult>, Error> {
+) -> Result<Response, Error> {
     require_human_mutation(&headers, &state)?;
-    let released =
-        task::release_product(&state.db, &body.product_id, &body.tag, state.clock.now())?;
-    Ok(Json(ReleaseResult {
-        product_id: body.product_id,
-        tag: body.tag,
-        released: summaries(released),
-    }))
+    let issued = task::issue_release(&state.db, &body.product_id, state.clock.now())?;
+    Ok((StatusCode::CREATED, Json(card(&state.db, issued)?)).into_response())
 }
 
 pub async fn api_products(
@@ -488,6 +509,7 @@ pub async fn worker_report(
         &body.verification,
         &body.checks,
         outcome,
+        body.release_tag.as_deref(),
         state.clock.now(),
     )?;
     Ok(Json(card(&state.db, reported)?))

@@ -712,6 +712,96 @@ async fn task_create_has_no_kind_and_cannot_file_a_merge() {
     }
 }
 
+/// `release_level` is filed with the task: patch when nothing is said, and
+/// refused outside its vocabulary — the same answer HTTP gives.
+#[tokio::test]
+async fn task_create_files_the_release_level_and_defaults_it_to_patch() {
+    let (_dir, state) = file_backed_state();
+    let router = task_server::app(state);
+    catalogue(&router, "sunny-side/task-server").await;
+
+    let mut admin = McpClient::new(&router, "/mcp", STALE_MCP_CAPABILITY);
+    admin.initialize().await;
+
+    let schema = admin.tool_schema("task_create").await;
+    assert!(
+        schema["properties"]
+            .as_object()
+            .expect("properties")
+            .contains_key("release_level"),
+        "task_create offers release_level: {schema}"
+    );
+
+    let created = admin
+        .call(
+            "task_create",
+            json!({
+                "id": "t-1",
+                "title": "nothing said about the level",
+                "product_id": "sunny-side/task-server",
+            }),
+        )
+        .await;
+    assert_eq!(created["isError"], json!(false), "{created}");
+    assert_eq!(
+        created["structuredContent"]["task"]["release_level"], "patch",
+        "{created}"
+    );
+
+    let created = admin
+        .call(
+            "task_create",
+            json!({
+                "id": "t-2",
+                "title": "a breaking change",
+                "product_id": "sunny-side/task-server",
+                "release_level": "major",
+            }),
+        )
+        .await;
+    assert_eq!(
+        created["structuredContent"]["task"]["release_level"], "major",
+        "{created}"
+    );
+
+    let refused = admin
+        .call(
+            "task_create",
+            json!({
+                "id": "t-3",
+                "title": "outside the vocabulary",
+                "product_id": "sunny-side/task-server",
+                "release_level": "huge",
+            }),
+        )
+        .await;
+    assert_eq!(refused["isError"], json!(true), "{refused}");
+    assert_eq!(refused["structuredContent"]["code"], "invalid", "{refused}");
+
+    let updated = admin
+        .call(
+            "task_update",
+            json!({ "id": "t-1", "release_level": "minor" }),
+        )
+        .await;
+    assert_eq!(
+        updated["structuredContent"]["task"]["release_level"], "minor",
+        "{updated}"
+    );
+    let refused = admin
+        .call(
+            "task_update",
+            json!({ "id": "t-1", "release_level": "tiny" }),
+        )
+        .await;
+    assert_eq!(refused["isError"], json!(true), "{refused}");
+    assert_eq!(
+        admin.call("task_get", json!({ "id": "t-1" })).await["structuredContent"]["task"]["release_level"],
+        "minor",
+        "a refused update changes nothing"
+    );
+}
+
 /// The refusal of `approved`, `merged`, and `released` is one domain rule, so
 /// pressing it over MCP answers exactly what pressing it over HTTP answers, and
 /// moves nothing. `approved` matters most here: a model that could press it

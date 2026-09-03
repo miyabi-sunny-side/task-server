@@ -134,19 +134,36 @@ JSON API, the MCP endpoints, and the compiled client.
 - The transition table carries no `done → ready`. Work leaves `done` backwards
   only through a review that requested changes, which has its own atomic
   operation, so no human can reopen finished work by hand.
-- Only the control plane issues `instant:merge` and `review`. `task::create`
-  refuses every kind it owns, so `POST /api/tasks` answers 400 with code
-  `invalid` and the MCP `task_create` tool has no `kind` argument to choose
-  from. Those tasks are written by `task::issue_merge` and `task::issue_review`
-  alone, against a target they name; an orphan would be claimed, could never be
+- Only the control plane issues `instant:merge`, `review`, and
+  `instant:release`. `task::create` refuses every kind it owns, so `POST
+  /api/tasks` answers 400 with code `invalid` and the MCP `task_create` tool has
+  no `kind` argument to choose from. Those tasks are written by
+  `task::issue_merge`, `task::issue_review`, and `task::ensure_release` alone,
+  against targets they name; an orphan would be claimed, could never be
   reported, and would block the queue.
-- **Reviews and merges are issued by the machine, not by a person.** The human
-  judgement point is `POST /api/releases` and nothing else. A `done` report on a
-  `normal` task issues that task's review in the same transaction, and an
-  approving verdict issues that task's merge in the same transaction. `POST
-  /api/reviews` and `POST /api/merges` still exist, but only as reconciliation
-  handles for work that lost its next step; nothing in the ordinary flow calls
-  them.
+- **Reviews, merges, and releases are issued by the machine, not by a person.**
+  A `done` report on a `normal` task issues that task's review in the same
+  transaction, an approving verdict issues that task's merge in the same
+  transaction, and a landing issues the product's release in the same
+  transaction. `POST /api/reviews`, `POST /api/merges`, and `POST /api/releases`
+  exist only as reconciliation handles for work that lost its next step;
+  nothing in the ordinary flow calls them.
+- Every task carries a `release_level` (`patch` by default, `minor`, `major`)
+  from the moment it is filed, and its subtasks inherit it at issue. A release
+  task's level is the largest among the work it ships, its id is
+  `release:<newest target>`, and each shipped `normal` task points at it through
+  `release_task_id`. A product carries at most one open (`ready`, `wip`,
+  `blocked`) release; while one is open the next landing issues nothing, and the
+  report that ends it calls `ensure_release` again to gather what landed.
+- A `done` report on an `instant:release` task must carry `release_tag` matching
+  `v<major>.<minor>.<patch>` and green `checks`; it moves the release task, the
+  work pointing at it, and their finished subtasks to `released` under that tag
+  in one transaction. A `blocked` report is kept like a blocked merge — reason on
+  the row, work still `merged` — and the attempt is called off and reissued by
+  hand, never restarted; `task::operator_refusal` treats a release exactly as it
+  treats a merge. A product with `releases` unset ends at the landing: the work
+  and its finished subtasks go to `released` with no tag, and no release is
+  issued.
 - A review is issued against a `normal` task that is `done` with a `branch` and a
   `commit_sha`. It inherits the target's product, branch and priority and
   snapshots the target's `commit_sha` as the subject of the review; its own
@@ -285,9 +302,9 @@ JSON API, the MCP endpoints, and the compiled client.
   question rather than written over `releases`, so the stored flag stays and a
   restored clone releases again on the next walk. An archived product is left out
   of `releasable` too.
-  `POST /api/releases` moves every `merged` normal task of one product to
-  `released` under a single `release_tag`, in one transaction. A product that
-  does not release, or one with nothing merged, is 409.
+  `POST /api/releases` issues the release task of one product by hand. A
+  product that does not release, one with a release already open, or one with
+  nothing merged and uncarried, is 409.
 - Claim hands out the next `ready` task, `instant:merge` first, then higher
   `priority`, then oldest — subject to the merge train, which is what keeps a
   product's merges strictly serial. The row is only taken while it is still
@@ -386,7 +403,7 @@ and `dropped`.
 | PATCH | `/api/tasks/{id}` | human mutation |
 | POST | `/api/tasks/{id}/status` | human mutation |
 | GET | `/api/control` | read |
-| POST | `/api/reviews`, `/api/merges`, `/api/releases` | human mutation |
+| POST | `/api/reviews`, `/api/merges`, `/api/releases` | human mutation (reconciliation handles) |
 | GET | `/api/products`, `/api/products/{id}` | read |
 | PUT | `/api/products/{id}` | human mutation |
 | POST | `/worker/claim`, `/worker/report`, `/worker/review-report` | trusted network; no application auth |
@@ -398,11 +415,11 @@ the full task plus `available_transitions`, and `latest_review` when a review
 has answered for it.
 
 `GET /api/control` answers
-`{ mergeable, pending_merges, pending_reviews, unreviewed, releasable }`: the
-two `pending_*` lists are what the control plane has in flight, the release
-button is live while `releasable` carries the product, and `mergeable` and
-`unreviewed` are reconciliation windows — both stay empty while the automatic
-issuing works.
+`{ mergeable, pending_merges, pending_releases, pending_reviews, unreviewed,
+releasable }`: the three `pending_*` lists are what the control plane has in
+flight, and `mergeable`, `unreviewed`, and `releasable` are reconciliation
+windows — all stay empty while the automatic issuing works. Each
+`pending_releases` row is the summary plus `release_level` and `verification`.
 
 `pending_merges` is in a stable reading order — oldest first, ties broken by id
 — and each row is the ordinary summary plus `verification`: the reason that merge stopped, or `null` while it

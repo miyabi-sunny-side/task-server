@@ -324,16 +324,38 @@ async fn post_merge(state: &AppState, task_id: &str) -> (StatusCode, Value) {
     .await
 }
 
-async fn post_release(state: &AppState, product_id: &str, tag: &str) -> (StatusCode, Value) {
+async fn post_release(state: &AppState, product_id: &str) -> (StatusCode, Value) {
     send(
         state,
-        human(
-            "POST",
-            "/api/releases",
-            &json!({"product_id": product_id, "tag": tag}),
-        ),
+        human("POST", "/api/releases", &json!({"product_id": product_id})),
     )
     .await
+}
+
+/// Claim the release the landing of `product_id`'s work issued, and report the
+/// tag it cut, the way a release worker does. Nobody files it: landing is what
+/// puts it in front of the worker.
+async fn ship_release(state: &AppState, product_id: &str, tag: &str) -> Value {
+    let (status, lease) = claim_kind(state, "shipper", &json!(["instant:release"])).await;
+    assert_eq!(status, StatusCode::OK, "claim release: {lease}");
+    assert_eq!(lease["kind"], "instant:release", "{lease}");
+    assert_eq!(lease["product_id"], product_id, "{lease}");
+    let claim_id = claim_id_of(&lease);
+    let (status, shipped) = post_report(
+        state,
+        &json!({
+            "claim_id": claim_id,
+            "commit_sha": "fff0000",
+            "verification": "bump-tag",
+            "checks": [{"name": "bump-tag", "exit_code": 0}],
+            "release_tag": tag,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "ship {product_id}: {shipped}");
+    assert_eq!(shipped["status"], "released", "{shipped}");
+    assert_eq!(shipped["release_tag"], tag, "{shipped}");
+    shipped
 }
 
 /// Lease the next task and assert the scheduler handed out the expected one.
@@ -461,6 +483,56 @@ async fn drive_to_merged(state: &AppState, id: &str, product_id: &str, commit_sh
     let (status, target) = get_task(state, id).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(target["status"], "merged", "{id} must be merged: {target}");
+    merge_id
+}
+
+/// The landing issued the release and nobody pressed anything: the work is
+/// pointed at it, it is in flight, nothing is stranded, and a second issue is
+/// refused.
+async fn assert_release_was_issued_for(state: &AppState, merged: &Value, release_id: &str) {
+    assert_eq!(
+        merged["release_task_id"], release_id,
+        "the landed work is pointed at its release: {merged}"
+    );
+    let plane = control(state).await;
+    assert_eq!(ids_of(&plane["pending_releases"]), [release_id]);
+    assert_eq!(plane["pending_releases"][0]["release_level"], "patch");
+    assert_eq!(plane["releasable"], json!([]), "{plane}");
+    let product = merged["product_id"].as_str().expect("product id");
+    let (status, refused) = post_release(state, product).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a release in flight is not issued twice: {refused}"
+    );
+}
+
+/// Drive one task of a product that does not release through its landing. The
+/// target ends `released` rather than `merged`, so this returns the merge id
+/// without asserting the status `drive_to_merged` asserts.
+async fn drive_to_merged_or_released(
+    state: &AppState,
+    id: &str,
+    product_id: &str,
+    commit_sha: &str,
+) -> String {
+    create_task(
+        state,
+        &json!({"id": id, "title": format!("task {id}"), "product_id": product_id}),
+    )
+    .await;
+    set_status(state, id, "ready").await;
+    work_to_done(state, id, commit_sha).await;
+    approve_task(state, id, commit_sha).await;
+    let merge = issued_merge(state, id).await;
+    let merge_id = merge["id"].as_str().expect("merge id").to_owned();
+    let claim_id = claim_next(state, &merge_id).await;
+    let (status, landed) = post_report(
+        state,
+        &report_with_checks(&claim_id, commit_sha, &green_checks()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "land {merge_id}: {landed}");
     merge_id
 }
 
@@ -611,11 +683,8 @@ async fn http_alone_drives_a_task_from_creation_to_release() {
         "released is granted by the release API, not by a status change: {merged}"
     );
 
-    let (status, released) = post_release(&state, PRODUCT, "v0.2.0").await;
-    assert_eq!(status, StatusCode::OK, "release: {released}");
-    assert_eq!(released["product_id"], PRODUCT);
-    assert_eq!(released["tag"], "v0.2.0");
-    assert_eq!(ids_of(&released["released"]), ["t-cutover"]);
+    assert_release_was_issued_for(&state, &merged, "release:t-cutover").await;
+    ship_release(&state, PRODUCT, "v0.2.0").await;
 
     let state = reopen(&dir, state);
     let (status, final_card) = get_task(&state, "t-cutover").await;
@@ -958,99 +1027,270 @@ async fn a_cancelled_merge_can_be_issued_again() {
     assert_eq!(target["status"], "merged", "the retry lands: {target}");
 }
 
-#[tokio::test]
-async fn release_stamps_every_merged_task_of_a_releasing_product() {
-    let (_dir, state) = file_backed_state();
-    put_product(&state, PRODUCT, true).await;
-    put_product(&state, KEEPER, false).await;
+/// Two landings of the releasing product, the second while the release the
+/// first issued is still open; and one landing of a product that does not
+/// release, which ends there. Returns the merge id of that last one.
+async fn land_two_behind_one_open_release(state: &AppState) -> String {
+    put_product(state, PRODUCT, true).await;
+    put_product(state, KEEPER, false).await;
+    let keeper_merge = drive_to_merged_or_released(state, "t-keep-1", KEEPER, "ccc3333").await;
 
-    drive_to_merged(&state, "t-rel-1", PRODUCT, "aaa1111").await;
-    drive_to_merged(&state, "t-rel-2", PRODUCT, "bbb2222").await;
-    drive_to_merged(&state, "t-keep-1", KEEPER, "ccc3333").await;
-
-    // A done task of the same product is not part of a release.
+    drive_to_merged(state, "t-rel-1", PRODUCT, "aaa1111").await;
     create_task(
-        &state,
-        &json!({"id": "t-open", "title": "not merged yet", "product_id": PRODUCT}),
+        state,
+        &json!({
+            "id": "t-rel-2",
+            "title": "task t-rel-2",
+            "product_id": PRODUCT,
+            "release_level": "minor",
+            // Above the release now waiting, so the kind-less claims the
+            // helpers make below take this work and not the release.
+            "priority": 5,
+        }),
     )
     .await;
-    set_status(&state, "t-open", "ready").await;
-    work_to_done(&state, "t-open", "ddd4444").await;
+    set_status(state, "t-rel-2", "ready").await;
+    work_to_done(state, "t-rel-2", "bbb2222").await;
+    approve_task(state, "t-rel-2", "bbb2222").await;
+    let second = issued_merge(state, "t-rel-2").await;
+    land_merge(state, second["id"].as_str().unwrap(), "bbb2222").await;
+    keeper_merge
+}
 
+#[tokio::test]
+async fn landing_issues_one_release_per_product_and_ends_work_that_does_not_release() {
+    let (_dir, state) = file_backed_state();
+    let keeper_merge = land_two_behind_one_open_release(&state).await;
+
+    // A product that does not release ended at the landing, with no tag.
+    for id in ["t-keep-1", &keeper_merge, "review:t-keep-1"] {
+        let (status, card) = get_task(&state, id).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(card["status"], "released", "{id}: {card}");
+        assert_eq!(card["release_tag"], Value::Null, "{id}: {card}");
+    }
+
+    // The releasing product got its release at the first landing, and the
+    // second landing waited for it.
+    let (_, waiting) = get_task(&state, "t-rel-2").await;
+    assert_eq!(waiting["status"], "merged");
+    assert_eq!(waiting["release_task_id"], Value::Null, "{waiting}");
     let plane = control(&state).await;
+    assert_eq!(ids_of(&plane["pending_releases"]), ["release:t-rel-1"]);
+    assert_eq!(plane["pending_releases"][0]["status"], "ready");
+    assert_eq!(plane["pending_releases"][0]["verification"], Value::Null);
     assert_eq!(
         plane["releasable"],
-        json!([{"product_id": PRODUCT, "task_count": 2}]),
-        "only a releasing product accumulates a release: {plane}"
+        json!([]),
+        "nothing is stranded: {plane}"
     );
 
-    for (product_id, tag, expected, why) in [
+    for (product_id, expected, why) in [
         (
             KEEPER,
-            "v9",
             StatusCode::CONFLICT,
             "a product that does not release",
         ),
-        (PRODUCT, "  ", StatusCode::BAD_REQUEST, "a blank tag"),
+        (
+            PRODUCT,
+            StatusCode::CONFLICT,
+            "a product with a release in flight",
+        ),
         (
             "sunny-side/missing",
-            "v1",
             StatusCode::NOT_FOUND,
             "an unknown product",
         ),
     ] {
-        let (status, refused) = post_release(&state, product_id, tag).await;
+        let (status, refused) = post_release(&state, product_id).await;
         assert_eq!(status, expected, "{why} must be refused: {refused}");
     }
+}
 
-    let (status, released) = post_release(&state, PRODUCT, "v0.2.0").await;
-    assert_eq!(status, StatusCode::OK, "release: {released}");
-    assert_eq!(released["product_id"], PRODUCT);
-    assert_eq!(released["tag"], "v0.2.0");
-    assert_eq!(ids_of(&released["released"]), ["t-rel-1", "t-rel-2"]);
+#[tokio::test]
+async fn a_release_report_ships_everything_it_carries_and_gathers_the_rest() {
+    let (_dir, state) = file_backed_state();
+    land_two_behind_one_open_release(&state).await;
 
-    for id in ["t-rel-1", "t-rel-2"] {
+    // The claim card carries the level, and a report without a tag is refused.
+    let (status, lease) = claim_kind(&state, "shipper", &json!(["instant:release"])).await;
+    assert_eq!(status, StatusCode::OK, "{lease}");
+    assert_eq!(lease["id"], "release:t-rel-1");
+    assert_eq!(lease["release_level"], "patch");
+    let claim_id = claim_id_of(&lease);
+    for tag in [Value::Null, json!("0.2.0"), json!("v0.2")] {
+        let (status, refused) = post_report(
+            &state,
+            &json!({
+                "claim_id": claim_id,
+                "commit_sha": "fff0000",
+                "verification": "bump-tag",
+                "checks": [{"name": "bump-tag", "exit_code": 0}],
+                "release_tag": tag,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{tag} is not a release tag: {refused}"
+        );
+    }
+    let (status, shipped) = post_report(
+        &state,
+        &json!({
+            "claim_id": claim_id,
+            "commit_sha": "fff0000",
+            "verification": "bump-tag",
+            "checks": [{"name": "bump-tag", "exit_code": 0}],
+            "release_tag": "v0.2.0",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "ship: {shipped}");
+    assert_eq!(shipped["status"], "released");
+    assert_eq!(shipped["release_tag"], "v0.2.0");
+
+    for id in ["t-rel-1", "review:t-rel-1", "merge:t-rel-1"] {
         let (status, card) = get_task(&state, id).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(card["status"], "released", "{id}: {card}");
         assert_eq!(card["release_tag"], "v0.2.0", "{id}: {card}");
     }
 
-    let (status, keeper) = get_task(&state, "t-keep-1").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        keeper["status"], "merged",
-        "another product is untouched: {keeper}"
-    );
-    assert_eq!(keeper["release_tag"], Value::Null);
-
-    let (status, open) = get_task(&state, "t-open").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        open["status"], "done",
-        "a done task is not released: {open}"
-    );
-    assert_eq!(open["release_tag"], Value::Null);
-
+    // The report gathered what landed meanwhile: the next release, one level up.
     let plane = control(&state).await;
-    assert_eq!(
-        plane["releasable"],
-        json!([]),
-        "the release emptied the queue: {plane}"
-    );
+    assert_eq!(ids_of(&plane["pending_releases"]), ["release:t-rel-2"]);
+    assert_eq!(plane["pending_releases"][0]["release_level"], "minor");
+    let (_, carried) = get_task(&state, "t-rel-2").await;
+    assert_eq!(carried["status"], "merged");
+    assert_eq!(carried["release_task_id"], "release:t-rel-2");
 
-    let (status, empty) = post_release(&state, PRODUCT, "v0.2.1").await;
+    ship_release(&state, PRODUCT, "v0.3.0").await;
+    let (_, card) = get_task(&state, "t-rel-2").await;
+    assert_eq!(card["status"], "released");
+    assert_eq!(card["release_tag"], "v0.3.0");
+    let plane = control(&state).await;
+    assert_eq!(plane["pending_releases"], json!([]), "{plane}");
+    let (status, empty) = post_release(&state, PRODUCT).await;
     assert_eq!(
         status,
         StatusCode::CONFLICT,
         "a release with nothing merged conflicts: {empty}"
     );
+}
 
-    for id in ["t-rel-1", "t-rel-2"] {
-        let (status, card) = get_task(&state, id).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(card["release_tag"], "v0.2.0", "{id} keeps its tag: {card}");
-    }
+/// A blocked release stops with its reason on the row and its work still
+/// merged; it is called off and reissued by hand, never restarted.
+#[tokio::test]
+async fn a_blocked_release_is_called_off_and_reissued_by_hand() {
+    let (_dir, state) = file_backed_state();
+    put_product(&state, PRODUCT, true).await;
+    drive_to_merged(&state, "t-1", PRODUCT, "aaa1111").await;
+
+    let (status, lease) = claim_kind(&state, "shipper", &json!(["instant:release"])).await;
+    assert_eq!(status, StatusCode::OK, "{lease}");
+    let claim_id = claim_id_of(&lease);
+    let (status, blocked) = post_report(
+        &state,
+        &json!({
+            "claim_id": claim_id,
+            "commit_sha": "aaa1111",
+            "verification": "bump-tag: the tag already exists",
+            "checks": [{"name": "bump-tag", "exit_code": 1}],
+            "outcome": "blocked",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{blocked}");
+    assert_eq!(blocked["status"], "blocked");
+    assert_eq!(transitions(&blocked), ["cancelled", "dropped"]);
+
+    let plane = control(&state).await;
+    assert_eq!(ids_of(&plane["pending_releases"]), ["release:t-1"]);
+    assert_eq!(
+        plane["pending_releases"][0]["verification"], "bump-tag: the tag already exists",
+        "the screen reads the reason off the same payload: {plane}"
+    );
+    let (_, target) = get_task(&state, "t-1").await;
+    assert_eq!(target["status"], "merged", "nothing shipped: {target}");
+
+    let (status, refused) = post_release(&state, PRODUCT).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    let (status, refused) = post_status(&state, "release:t-1", "ready").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["code"], "invalid");
+
+    set_status(&state, "release:t-1", "cancelled").await;
+    let plane = control(&state).await;
+    assert_eq!(
+        plane["releasable"],
+        json!([{"product_id": PRODUCT, "task_count": 1}]),
+        "work whose release was called off is stranded: {plane}"
+    );
+    let (status, again) = post_release(&state, PRODUCT).await;
+    assert_eq!(status, StatusCode::CREATED, "reissue: {again}");
+    assert_eq!(again["id"], "release:t-1~2");
+    let (_, target) = get_task(&state, "t-1").await;
+    assert_eq!(target["release_task_id"], "release:t-1~2");
+    ship_release(&state, PRODUCT, "v0.2.1").await;
+}
+
+/// `release_level` is on every task from the moment it is filed, defaults to
+/// patch, and refuses anything outside its vocabulary.
+#[tokio::test]
+async fn release_level_is_filed_with_the_task_and_defaults_to_patch() {
+    let (_dir, state) = file_backed_state();
+    put_product(&state, PRODUCT, true).await;
+
+    let created = create_task(
+        &state,
+        &json!({"id": "t-default", "title": "no level said", "product_id": PRODUCT}),
+    )
+    .await;
+    assert_eq!(created["release_level"], "patch", "{created}");
+
+    let created = create_task(
+        &state,
+        &json!({
+            "id": "t-major",
+            "title": "a breaking change",
+            "product_id": PRODUCT,
+            "release_level": "major",
+        }),
+    )
+    .await;
+    assert_eq!(created["release_level"], "major", "{created}");
+
+    let (status, refused) = send(
+        &state,
+        human(
+            "POST",
+            "/api/tasks",
+            &json!({"id": "t-bad", "title": "x", "product_id": PRODUCT, "release_level": "huge"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["code"], "invalid");
+
+    let (status, patched) = send(
+        &state,
+        human(
+            "PATCH",
+            "/api/tasks/t-default",
+            &json!({"release_level": "minor"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    assert_eq!(patched["release_level"], "minor");
+
+    // The subtasks inherit it.
+    set_status(&state, "t-default", "ready").await;
+    work_to_done(&state, "t-default", "abc1234").await;
+    let (_, review) = get_task(&state, "review:t-default").await;
+    assert_eq!(review["release_level"], "minor", "{review}");
 }
 
 #[tokio::test]
@@ -1121,8 +1361,7 @@ async fn claim_prefers_instant_merge_and_listing_hides_released() {
     assert_eq!(status, StatusCode::CREATED, "reissue merge: {retry}");
     let retry_id = retry["id"].as_str().expect("merge id").to_owned();
     land_merge(&state, &retry_id, "abc1234").await;
-    let (status, released) = post_release(&state, PRODUCT, "v0.2.0").await;
-    assert_eq!(status, StatusCode::OK, "release: {released}");
+    ship_release(&state, PRODUCT, "v0.2.0").await;
 
     // The review and the landed retry both finished reading or landing
     // `t-merged`, so release carries them to `released` with it, and the
@@ -1147,7 +1386,12 @@ async fn claim_prefers_instant_merge_and_listing_hides_released() {
     assert_eq!(status, StatusCode::OK);
     let mut released_ids = ids_of(&released);
     released_ids.sort_unstable();
-    let mut expected_released = vec!["t-merged", "review:t-merged", retry_id.as_str()];
+    let mut expected_released = vec![
+        "t-merged",
+        "review:t-merged",
+        "release:t-merged",
+        retry_id.as_str(),
+    ];
     expected_released.sort_unstable();
     assert_eq!(released_ids, expected_released);
 

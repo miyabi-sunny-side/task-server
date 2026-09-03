@@ -23,9 +23,15 @@ type Summary = {
 // /api/control sends it: the queue and the jam arrive together.
 type PendingMerge = Summary & { verification: string | null };
 
+// A pending release is the same shape plus how far it steps the version.
+type PendingRelease = PendingMerge & {
+  release_level: "patch" | "minor" | "major";
+};
+
 type Plane = {
   mergeable: Summary[];
   pending_merges: PendingMerge[];
+  pending_releases: PendingRelease[];
   pending_reviews: Summary[];
   unreviewed: Summary[];
   releasable: { product_id: string; task_count: number }[];
@@ -80,6 +86,7 @@ const TASKS: Summary[] = [
 const EMPTY_PLANE: Plane = {
   mergeable: [],
   pending_merges: [],
+  pending_releases: [],
   pending_reviews: [],
   unreviewed: [],
   releasable: [],
@@ -99,7 +106,6 @@ function jsonResponse(payload: unknown, status = 200): Response {
 interface Scenario {
   control?: () => Response | Promise<Response>;
   tasks?: () => Response | Promise<Response>;
-  release?: (body: { product_id: string; tag: string }) => Response;
 }
 
 function stubFetch(scenario: Scenario) {
@@ -118,17 +124,6 @@ function stubFetch(scenario: Scenario) {
       throw new Error(
         `unexpected task card request: ${decodeURIComponent(url.slice("/api/tasks/".length))}`,
       );
-    }
-    if (url === "/api/releases" && method === "POST") {
-      const body = JSON.parse(String(init?.body)) as {
-        product_id: string;
-        tag: string;
-      };
-      return (
-        scenario.release ??
-        ((sent: { product_id: string; tag: string }) =>
-          jsonResponse({ ...sent, released: [] }))
-      )(body);
     }
     throw new Error(`unexpected request: ${method} ${url}`);
   });
@@ -171,14 +166,6 @@ function setVisibility(state: DocumentVisibilityState) {
   document.dispatchEvent(new Event("visibilitychange"));
 }
 
-function resultLine(): HTMLElement {
-  const found = document.querySelector<HTMLElement>("[data-result]");
-  if (!found) {
-    throw new Error("result line was not found");
-  }
-  return found;
-}
-
 describe("Home", () => {
   afterEach(() => {
     cleanup();
@@ -186,11 +173,19 @@ describe("Home", () => {
   });
 
   it("the two regions load and fail independently", async () => {
-    // The list request fails; the control panel must still work.
+    // The list request fails; the control panel must still draw.
     stubFetch({
       control: () =>
         jsonResponse(
-          plane({ releasable: [{ product_id: PRODUCT, task_count: 1 }] }),
+          plane({
+            pending_releases: [
+              {
+                ...pendingMerge("release:t-1", "ready", null),
+                kind: "instant:release",
+                release_level: "patch",
+              },
+            ],
+          }),
         ),
       tasks: () => Promise.reject(new Error("offline")),
     });
@@ -203,11 +198,9 @@ describe("Home", () => {
       expect(region("control").dataset.state).toBe("success"),
     );
     await waitFor(() => expect(region("tasks").dataset.state).toBe("error"));
-
-    const release = screen.getByRole("button", { name: "release" });
-    expect(release.getAttribute("aria-disabled")).toBeNull();
-    await fireEvent.click(release);
-    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(
+      region("control").querySelector('a[href="/tasks/release:t-1"]'),
+    ).not.toBeNull();
 
     cleanup();
     vi.unstubAllGlobals();
@@ -244,7 +237,7 @@ describe("Home", () => {
     ).toBe("/tasks/t-ready-1");
   });
 
-  it("sends nothing but GETs, however much is mergeable", async () => {
+  it("sends nothing but GETs and holds no primary button, however much is carried", async () => {
     const fetchMock = stubFetch({
       control: () =>
         jsonResponse(
@@ -262,24 +255,12 @@ describe("Home", () => {
       expect(region("control").dataset.state).toBe("success"),
     );
 
-    // Every enabled button on the page, pressed. Mergeable work is drawn, and
-    // there is nothing on the page that would act on it.
-    const buttons = screen
-      .getAllByRole("button")
-      .filter((button) => button.getAttribute("aria-disabled") !== "true");
-    expect(buttons.map((button) => button.textContent?.trim())).toEqual([
-      "release",
-    ]);
-    for (const button of buttons) {
-      await fireEvent.click(button);
-    }
-
+    // Stranded work is drawn, and there is nothing on the page that would
+    // act on it: no button at all, and so no primary one.
+    expect(screen.queryAllByRole("button")).toHaveLength(0);
+    expect(document.querySelector(".primary")).toBeNull();
+    expect(screen.queryByRole("dialog")).toBeNull();
     expect(writes(fetchMock)).toHaveLength(0);
-    // Not on the page, and not in the modal the one button opened either.
-    expect(screen.getByRole("dialog")).toBeTruthy();
-    for (const button of screen.getAllByRole("button")) {
-      expect(button.textContent?.toLowerCase()).not.toContain("merge");
-    }
   });
 
   it("leaves the tasks the panel draws out of the status groups", async () => {
@@ -371,98 +352,6 @@ describe("Home", () => {
       expect(document.querySelector("[data-reason]")).toBeNull(),
     );
     expect(region("control").textContent).not.toContain("src/task.rs");
-  });
-
-  it("release posts product and tag, and keeps the modal open on refusal", async () => {
-    let refuse = true;
-    const fetchMock = stubFetch({
-      control: () =>
-        jsonResponse(
-          plane({
-            releasable: [
-              { product_id: "sunny-side/one", task_count: 2 },
-              { product_id: "sunny-side/two", task_count: 3 },
-            ],
-          }),
-        ),
-      release: (body) =>
-        refuse
-          ? jsonResponse(
-              {
-                error: "product sunny-side/two has nothing to release",
-                code: "conflict",
-              },
-              409,
-            )
-          : jsonResponse({ ...body, released: [summary("t-x", "released")] }),
-    });
-
-    render(Home);
-    await waitFor(() =>
-      expect(region("control").dataset.state).toBe("success"),
-    );
-
-    await fireEvent.click(screen.getByRole("button", { name: "release" }));
-    const dialog = screen.getByRole("dialog");
-    expect(dialog).toBeTruthy();
-
-    const confirm = screen.getByRole("button", { name: "release する" });
-    expect(confirm.getAttribute("aria-disabled")).toBe("true");
-
-    const radios = screen.getAllByRole("radio");
-    expect(radios).toHaveLength(2);
-    expect(radios[0].getAttribute("aria-checked")).toBe("true");
-    await fireEvent.click(radios[1]);
-
-    const tag = screen.getByLabelText("tag");
-    await fireEvent.input(tag, { target: { value: "   " } });
-    expect(
-      screen
-        .getByRole("button", { name: "release する" })
-        .getAttribute("aria-disabled"),
-    ).toBe("true");
-
-    await fireEvent.input(tag, { target: { value: "v0.2.0" } });
-    expect(
-      screen
-        .getByRole("button", { name: "release する" })
-        .getAttribute("aria-disabled"),
-    ).toBeNull();
-
-    await fireEvent.click(screen.getByRole("button", { name: "release する" }));
-
-    await waitFor(() =>
-      expect(callsTo(fetchMock, "/api/releases", "POST")).toHaveLength(1),
-    );
-    expect(
-      JSON.parse(
-        String(callsTo(fetchMock, "/api/releases", "POST")[0][1]?.body),
-      ),
-    ).toEqual({ product_id: "sunny-side/two", tag: "v0.2.0" });
-
-    // Refused: the modal stays open, the tag survives, the reason is inside.
-    await waitFor(() => {
-      const banner = screen.getByRole("dialog").querySelector('[role="alert"]');
-      expect(banner?.textContent).toContain("nothing to release");
-    });
-    expect(screen.getByLabelText<HTMLInputElement>("tag").value).toBe("v0.2.0");
-
-    refuse = false;
-    const controlBefore = callsTo(fetchMock, "/api/control").length;
-    const tasksBefore = callsTo(fetchMock, "/api/tasks").length;
-    await fireEvent.click(screen.getByRole("button", { name: "release する" }));
-
-    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    expect(resultLine().textContent?.trim()).not.toBe("");
-    await waitFor(() =>
-      expect(callsTo(fetchMock, "/api/control").length).toBe(controlBefore + 1),
-    );
-    await waitFor(() =>
-      expect(callsTo(fetchMock, "/api/tasks").length).toBe(tasksBefore + 1),
-    );
-    expect(document.activeElement).toBe(
-      screen.getByRole("button", { name: "release" }),
-    );
   });
 
   it("shows the empty state for an empty list", async () => {

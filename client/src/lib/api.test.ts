@@ -4,7 +4,6 @@ import {
   ApiError,
   fetchControl,
   fetchTasks,
-  postRelease,
   postTaskStatus,
   type TaskCard,
 } from "./api";
@@ -84,6 +83,7 @@ describe("api", () => {
     const plane = {
       mergeable: [],
       pending_merges: [],
+      pending_releases: [],
       pending_reviews: [],
       unreviewed: [],
       releasable: [{ product_id: "sunny-side/task-server", task_count: 3 }],
@@ -99,62 +99,6 @@ describe("api", () => {
     expect(String(input)).toBe("/api/control");
     expect(init?.method).toBeUndefined();
     expect(control).toEqual(plane);
-  });
-
-  it("posts a release with product and tag and returns the released set", async () => {
-    setSessionCsrf("csrf-token-3");
-    const result = {
-      product_id: "sunny-side/task-server",
-      tag: "v0.2.0",
-      released: [],
-    };
-    const fetchMock = vi
-      .fn<typeof fetch>()
-      .mockResolvedValue(jsonResponse(result));
-    vi.stubGlobal("fetch", fetchMock);
-
-    const released = await postRelease("sunny-side/task-server", "v0.2.0");
-
-    const [input, init] = fetchMock.mock.calls[0];
-    expect(String(input)).toBe("/api/releases");
-    expect(init?.method).toBe("POST");
-    expect(init?.body).toBe(
-      JSON.stringify({ product_id: "sunny-side/task-server", tag: "v0.2.0" }),
-    );
-    const headers = new Headers(init?.headers);
-    expect(headers.get("content-type")).toBe("application/json");
-    expect(headers.get("X-CSRF-Token")).toBe("csrf-token-3");
-    expect(released).toEqual(result);
-  });
-
-  it("carries the server's refusal message and code to the caller", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn<typeof fetch>().mockResolvedValue(
-        new Response(
-          JSON.stringify({
-            error: "product sunny-side/task-server has nothing to release",
-            code: "conflict",
-          }),
-          { status: 409, headers: { "content-type": "application/json" } },
-        ),
-      ),
-    );
-
-    const error = await postRelease("sunny-side/task-server", "v0.2.0").then(
-      () => {
-        throw new Error("postRelease resolved but the server refused");
-      },
-      (rejected: unknown) => rejected,
-    );
-
-    expect(error).toBeInstanceOf(ApiError);
-    const refusal = error as ApiError;
-    expect(refusal.status).toBe(409);
-    expect(refusal.code).toBe("conflict");
-    expect(refusal.message).toBe(
-      "product sunny-side/task-server has nothing to release",
-    );
   });
 
   it("rejects when the server refuses the transition", async () => {

@@ -36,14 +36,14 @@ creates the database (and its parent directory) on first start.
 | GET | `/api/health` | `{"status":"ok"}` |
 | GET | `/api/session` | the caller's identity and CSRF token |
 | GET | `/api/tasks` | task summaries; `released` is hidden unless `?status=` asks for it |
-| POST | `/api/tasks` | create a task in `draft`, returns 201 |
+| POST | `/api/tasks` | create a task in `draft` (optional `release_level`: `patch` by default, `minor`, `major`), returns 201 |
 | GET | `/api/tasks/{id}` | Task Card: the task plus `available_transitions` and `latest_review` |
-| PATCH | `/api/tasks/{id}` | edit `title`, `body`, `product_id`, `priority`, `branch` |
+| PATCH | `/api/tasks/{id}` | edit `title`, `body`, `product_id`, `priority`, `branch`, `release_level` |
 | POST | `/api/tasks/{id}/status` | move the task to `{"status": "..."}`; `approved`, `merged`, and `released` are refused |
-| GET | `/api/control` | `{ mergeable, pending_merges, pending_reviews, unreviewed, releasable }`; each `pending_merges` row adds `verification`, the reason a blocked merge stopped |
+| GET | `/api/control` | `{ mergeable, pending_merges, pending_releases, pending_reviews, unreviewed, releasable }`; each `pending_merges` and `pending_releases` row adds `verification`, the reason a blocked one stopped, and a release row its `release_level` |
 | POST | `/api/reviews` | reconciliation: `{"task_id": "..."}` issues a review task by hand, returns 201 |
 | POST | `/api/merges` | reconciliation: `{"task_id": "..."}` issues a merge task by hand, returns 201 |
-| POST | `/api/releases` | `{"product_id": "...", "tag": "..."}` releases everything merged |
+| POST | `/api/releases` | reconciliation: `{"product_id": "..."}` issues the release task of a product whose landed work has none, returns 201 |
 | GET | `/api/products` | product list |
 | GET | `/api/products/{id}` | one product |
 | PUT | `/api/products/{id}` | create or replace a product |
@@ -567,15 +567,30 @@ and code `merge_subject_changed`, and neither the merge nor the task moves —
 read one nobody signed off. Cancel it, and the work becomes a merge candidate
 again for the commit the review actually approved.
 
-Merged work then piles up per product. For a product with `releases` set,
-`GET /api/control` reports how much is waiting, and `POST /api/releases` stamps
-every merged task of that product with one `release_tag` and moves them all to
-`released`. A product that does not release, or one with nothing merged,
-answers 409. An archived product does not release either, whatever its stored
-`releases` says: the flag is derived from a clone that is no longer in the tree,
-and the workflows that would build the release run from that clone. It is left
-out of `releasable` and refused at `released`, and putting the clone back is the
-whole remedy — the next walk re-reads the flag.
+Landing is where the release is decided. For a product with `releases` set, the
+merge that lands the work issues an `instant:release` task in the same
+transaction — unless one is already open, in which case the report that ends it
+gathers what landed meanwhile. The release ships every `merged` task of the
+product that no live release carries yet, points each at itself
+(`release_task_id`), and takes its `release_level` from the largest level among
+them; every task carries a level (`patch` by default, `minor`, `major`) from the
+moment it is filed, and its review and merge subtasks inherit it. A release
+worker claims the task with `kinds: ["instant:release"]`, runs the bump at that
+level, and reports `release_tag` (`v<major>.<minor>.<patch>`) with the commit the
+tag points at and green checks; the report moves the release task, the work it
+carried, and their finished subtasks to `released` under that tag. A `blocked`
+report keeps the work merged with the reason on the release task; the attempt is
+called off (`cancelled` or `dropped`) and `POST /api/releases` issues the next
+one by hand, re-pointing the work at it. `GET /api/control` lists open releases
+in `pending_releases`; `releasable` is the reconciliation window for landed work
+no live release carries, empty while the issuing works.
+
+A product that does not release ends at the landing: the work and its finished
+subtasks go straight to `released` with no tag. An archived product releases
+nothing, whatever its stored `releases` says: the flag is derived from a clone
+that is no longer in the tree, and the workflows that would build the release run
+from that clone. Its landed work stays `merged`, out of `releasable`, and putting
+the clone back is the whole remedy — the next walk re-reads the flag.
 
 Stop the service with <kbd>Ctrl</kbd>+<kbd>C</kbd>.
 
@@ -598,8 +613,8 @@ Ingress identity, `Origin`, and CSRF checks do not run on MCP. An obsolete
 `Authorization` header is ignored so old and new clients can overlap during
 rollout. Worker reports remain bound to their leases by `claim_id`.
 
-Catalogue writes and releases stay off MCP and are made over HTTP. Review and
-merge issuance remains owned by the control plane; their HTTP routes are
+Catalogue writes stay off MCP and are made over HTTP. Review, merge and release
+issuance remains owned by the control plane; their HTTP routes are
 reconciliation handles, not worker tools. There is no delete tool, just as there
 is no delete route. `task_create` therefore files ordinary work and takes no
 `kind`, and `task_set_status` refuses `merged` and `released` with the same code
