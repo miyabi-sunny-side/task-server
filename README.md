@@ -919,6 +919,33 @@ cargo test --locked
 cargo build --locked --release
 ```
 
+## Releases
+
+Continuous integration checks pushes to `main` and pull requests, and every push
+to `main` also builds the container image and publishes it to
+`ghcr.io/miyabi-sunny-side/task-server` as `sha-<short-sha>` and `edge` after
+the image smoke test passed. Pull request runs build the same image but never
+push it. The Dockerfile splits the Rust build with cargo-chef, so a change to
+the sources alone reuses the cached dependency layer, and the workflows keep
+that cache in GitHub Actions (`type=gha`).
+
+A release is three steps in one run: **tag → image retag → GitHub Release**.
+Pushing a SemVer tag (`bump-tag` does this) starts **Release container**, which
+does not rebuild the image: it looks for the `sha-<short-sha>` image that CI
+already pushed for the tagged commit and, when found, retags it as `<version>`
+and `latest` with `docker buildx imagetools create` — no compilation happens
+and the run ends in seconds. If that image is missing (CI on `main` never ran
+for that commit, failed, or its cache expired), the workflow falls back to
+building and pushing the image itself. The same run then creates the GitHub
+Release for the tag with generated notes and one line naming the image it
+published (`ghcr.io/miyabi-sunny-side/task-server:vX.Y.Z@sha256:…`), so a
+person reading the Release knows what to deploy and a listener on release
+notifications (version-server) can act on it. Re-running the workflow for a
+tag that already has a Release leaves that Release as it is. `latest` keeps its
+meaning — the newest release — which is what the sandbox's watchtower follows.
+Only tag a commit after its CI checks pass; use a new SemVer tag for
+corrections instead of moving an existing release tag.
+
 ## Configuration
 
 | Variable | Default | Purpose |

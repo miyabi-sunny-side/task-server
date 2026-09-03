@@ -7,9 +7,23 @@ RUN npm ci
 COPY client/ ./
 RUN npm run build
 
-FROM rust:1.96-bookworm AS backend
+# cargo-chef splits the Rust build into a dependency layer (cooked from the
+# recipe, cached as long as Cargo.toml/Cargo.lock do not change) and the crate's
+# own build, so a source-only change does not recompile every dependency.
+FROM rust:1.96-bookworm AS chef
 WORKDIR /app
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY rust-toolchain.toml ./
+RUN cargo install cargo-chef --locked
+
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS backend
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --locked --release --recipe-path recipe.json
+COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 RUN cargo build --locked --release
 

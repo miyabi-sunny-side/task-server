@@ -87,12 +87,43 @@ jobs:
 
   container:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha
+            type=edge,branch=main
+
+      # Built once into the local daemon for the smoke test below; the push
+      # afterwards is a cache hit on the same layers (gha cache).
       - name: Build container image
-        run: docker build --tag task-server:test .
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: task-server:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       # Continuous backup is a sidecar a deployment adds, never something the
       # image needs. The default image, given no backup variables at all, still
@@ -120,3 +151,16 @@ jobs:
           # The database and its write-ahead log are what a sidecar replicates.
           docker exec task-server-smoke sh -c 'test -s /app/data/task-server.db'
           docker exec task-server-smoke sh -c 'test -e /app/data/task-server.db-wal'
+
+      # Every push to main publishes the image CI just tested as `sha-<short>`
+      # and `edge`; the release workflow retags that image instead of rebuilding.
+      # Pull requests build but never push (forked PRs carry no packages: write).
+      - name: Publish the tested image
+        if: github.event_name == 'push'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
