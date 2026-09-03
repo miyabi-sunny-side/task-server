@@ -180,6 +180,25 @@ export interface PendingRelease extends TaskSummary {
 // and `releasable` are the reconciliation windows, empty whenever the
 // automatic issuing works. Nothing here is a button: the page asks the human
 // for no decision.
+// Why the server counts a task as stuck. A fixed vocabulary, worn as a badge.
+export type StuckReason =
+  | "unclaimed"
+  | "lease-expired"
+  | "no-subtask"
+  | "subtask-unclaimed"
+  | "blocked"
+  | "release-stalled";
+
+// One task the control plane is holding past its threshold. `since` is the
+// stored timestamp the wait is measured from.
+export interface Stuck {
+  task_id: string;
+  kind: string;
+  status: string;
+  since: string;
+  reason: StuckReason;
+}
+
 export interface ControlPlane {
   mergeable: TaskSummary[];
   pending_merges: PendingMerge[];
@@ -187,6 +206,7 @@ export interface ControlPlane {
   pending_reviews: TaskSummary[];
   unreviewed: TaskSummary[];
   releasable: Releasable[];
+  stuck: Stuck[];
 }
 
 export function fetchControl(signal?: AbortSignal): Promise<ControlPlane> {

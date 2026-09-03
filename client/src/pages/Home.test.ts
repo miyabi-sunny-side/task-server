@@ -35,6 +35,7 @@ type Plane = {
   pending_reviews: Summary[];
   unreviewed: Summary[];
   releasable: { product_id: string; task_count: number }[];
+  stuck: unknown[];
 };
 
 const PRODUCT = "sunny-side/task-server";
@@ -90,6 +91,7 @@ const EMPTY_PLANE: Plane = {
   pending_reviews: [],
   unreviewed: [],
   releasable: [],
+  stuck: [],
 };
 
 function plane(over: Partial<Plane> = {}): Plane {

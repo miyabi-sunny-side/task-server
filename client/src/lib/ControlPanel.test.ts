@@ -67,6 +67,7 @@ function plane(over: Partial<ControlPlane> = {}): ControlPlane {
     pending_reviews: [],
     unreviewed: [],
     releasable: [],
+    stuck: [],
     ...over,
   };
 }
@@ -362,5 +363,55 @@ describe("ControlPanel", () => {
         (one) => one.dataset.block,
       ),
     ).toEqual(["reviews", "trains", "releases", "reconciliation"]);
+  });
+
+  it("names stuck work with its reason, as a row linking to the task and no button", () => {
+    render(ControlPanel, {
+      props: {
+        fetchState: "ready",
+        plane: plane({
+          stuck: [
+            {
+              task_id: "t-old",
+              kind: "normal",
+              status: "ready",
+              since: "2026-09-03T10:00:00Z",
+              reason: "unclaimed",
+            },
+            {
+              task_id: "release:t-9",
+              kind: "instant:release",
+              status: "wip",
+              since: "2026-09-03T09:00:00Z",
+              reason: "release-stalled",
+            },
+          ],
+        }),
+      },
+    });
+
+    const stranded = block("reconciliation")!;
+    expect(stranded.getAttribute("role")).toBe("status");
+    const set = stranded.querySelector<HTMLElement>('[data-readout="stuck"]')!;
+    expect(set.textContent).toContain("動いていない task");
+    const rows = set.querySelectorAll<HTMLAnchorElement>('a[href^="/tasks/"]');
+    expect(rows).toHaveLength(2);
+    expect(set.querySelector("[data-count]")?.textContent?.trim()).toBe("2");
+    expect(rows[0].getAttribute("href")).toBe("/tasks/t-old");
+    expect(rows[0].dataset.reason).toBe("unclaimed");
+    expect(rows[0].querySelector(".badge")?.textContent).toBe("unclaimed");
+    expect(rows[1].getAttribute("href")).toBe("/tasks/release:t-9");
+    expect(rows[1].dataset.reason).toBe("release-stalled");
+    expect(stranded.querySelectorAll("button")).toHaveLength(0);
+  });
+
+  it("draws no stuck readout while the server reports none", () => {
+    render(ControlPanel, {
+      props: {
+        fetchState: "ready",
+        plane: plane({ unreviewed: [summary("t-done", "done")] }),
+      },
+    });
+    expect(document.querySelector('[data-readout="stuck"]')).toBeNull();
   });
 });

@@ -625,6 +625,19 @@ counterpart to carry, so it earns no token pair.
   and it is earned: the automation dropping work silently is the only
   other thing in this product that must never go unread.
 
+  **Stuck, inside reconciliation.** The server also measures waiting:
+  `GET /api/control` carries `stuck`, one row per task that has sat past
+  a threshold, each with a fixed `reason` (`unclaimed`, `lease-expired`,
+  `no-subtask`, `subtask-unclaimed`, `blocked`, `release-stalled`). The
+  block renders it as its last readout under the caption "動いていない
+  task" with the count pill, one ordinary card per row linking to the
+  task, wearing the reason and the status as outline badges and the
+  `since` timestamp as the muted tail. The judgment is the server's
+  (a clock and a threshold), never the screen's: the readout states the
+  rows, sorts nothing, holds no button, and follows the same rule as
+  `releasable` — issued by nobody, pressed by nobody. It is absent from
+  the DOM while `stuck` is empty.
+
   Reconciliation is also where the **cancelled blocked merge** surfaces.
   Cancelling a blocked merge frees the rest of that product's train, but
   its target is not re-issued — it falls back to `approved` with no merge
@@ -1073,6 +1086,12 @@ counterpart to carry, so it earns no token pair.
       verification excerpt holds a 40-character unbroken token still
       leaves `document.documentElement.scrollWidth` within the
       viewport.
+  34. Stuck work is stated, not handled. With `stuck` non-empty the
+      reconciliation block renders a readout captioned "動いていない task"
+      whose count pill equals its rows; each row is an ordinary card link
+      to `/tasks/<task_id>` carrying `data-reason` and two outline badges
+      (reason, status), and the block holds no `<button>`. With `stuck`
+      empty the readout is absent from the DOM.
 
 ## Do's and Don'ts
 

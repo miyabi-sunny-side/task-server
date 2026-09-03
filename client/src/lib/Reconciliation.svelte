@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Releasable, TaskSummary } from "./api";
+  import type { Releasable, Stuck, TaskSummary } from "./api";
   import Readout from "./Readout.svelte";
 
   // The work the automation should be carrying and is not. Every set is
@@ -11,14 +11,16 @@
     unreviewed = [],
     mergeable = [],
     releasable = [],
+    stuck = [],
   }: {
     unreviewed?: TaskSummary[];
     mergeable?: TaskSummary[];
     releasable?: Releasable[];
+    stuck?: Stuck[];
   } = $props();
 
   let stranded = $derived(
-    unreviewed.length + mergeable.length + releasable.length,
+    unreviewed.length + mergeable.length + releasable.length + stuck.length,
   );
 </script>
 
@@ -61,6 +63,37 @@
                   <span class="pill" data-count>{item.task_count}</span>
                 </span>
               </span>
+            </li>
+          {/each}
+        </ul>
+      </div>
+    {/if}
+    {#if stuck.length > 0}
+      <!-- Work the server measured as waiting past its threshold. The server
+           decided (clock and threshold); the screen only states it, one row per
+           task with the reason as a badge. No button: the rescue is a person's
+           or a script's, never this page's. -->
+      <div class="readout" data-readout="stuck">
+        <p class="head">
+          <span class="caption danger">動いていない task</span>
+          <span class="pill" data-count>{stuck.length}</span>
+        </p>
+        <ul class="cards">
+          {#each stuck as item (`${item.reason}:${item.task_id}`)}
+            <li>
+              <a
+                class="card"
+                href={`/tasks/${item.task_id}`}
+                data-task={item.task_id}
+                data-reason={item.reason}
+              >
+                <span class="name">{item.task_id}</span>
+                <span class="tail">
+                  <span class="badge">{item.reason}</span>
+                  <span class="badge">{item.status}</span>
+                  <span class="product">{item.since}</span>
+                </span>
+              </a>
             </li>
           {/each}
         </ul>

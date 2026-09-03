@@ -40,7 +40,7 @@ creates the database (and its parent directory) on first start.
 | GET | `/api/tasks/{id}` | Task Card: the task plus `available_transitions` and `latest_review` |
 | PATCH | `/api/tasks/{id}` | edit `title`, `body`, `product_id`, `priority`, `branch`, `release_level` |
 | POST | `/api/tasks/{id}/status` | move the task to `{"status": "..."}`; `approved`, `merged`, and `released` are refused |
-| GET | `/api/control` | `{ mergeable, pending_merges, pending_releases, pending_reviews, unreviewed, releasable }`; each `pending_merges` and `pending_releases` row adds `verification`, the reason a blocked one stopped, and a release row its `release_level` |
+| GET | `/api/control` | `{ mergeable, pending_merges, pending_releases, pending_reviews, unreviewed, releasable, stuck }`; each `pending_merges` and `pending_releases` row adds `verification`, the reason a blocked one stopped, and a release row its `release_level`; `stuck` rows are `{task_id, kind, status, since, reason}` with `reason` one of `unclaimed`, `lease-expired`, `no-subtask`, `subtask-unclaimed`, `blocked`, `release-stalled` (thresholds: `APP_STUCK_*_SECS`), oldest first within each reason |
 | POST | `/api/reviews` | reconciliation: `{"task_id": "..."}` issues a review task by hand, returns 201 |
 | POST | `/api/merges` | reconciliation: `{"task_id": "..."}` issues a merge task by hand, returns 201 |
 | POST | `/api/releases` | reconciliation: `{"product_id": "..."}` issues the release task of a product whose landed work has none, returns 201 |
@@ -953,6 +953,9 @@ corrections instead of moving an existing release tag.
 | `APP_DB_PATH` | `data/task-server.db` | SQLite database, for the server and for `import-markdown` alike. Created with its parent directory on first use. |
 | `APP_BIND_ADDR` | `127.0.0.1:3000` | HTTP listener. Keep loopback unless you are sure you want otherwise. |
 | `CLAIM_TTL_SECS` | `3600` | Lease lifetime for a claim. |
+| `APP_STUCK_UNCLAIMED_SECS` | `900` | How long a `ready` task (or an issued review / merge / release / rework) may wait unclaimed before `GET /api/control` lists it in `stuck`. |
+| `APP_STUCK_SUBTASK_SECS` | `300` | How long `done` may go without a review, `approved` without a merge, or `merged` without a release before it is `stuck` (`no-subtask`). |
+| `APP_STUCK_RELEASE_SECS` | `1800` | How long an `instant:release` may stay `wip` before it is `stuck` (`release-stalled`). |
 | `APP_CSRF_TOKEN` | `dev-csrf` | Required on human mutation as `X-CSRF-Token`. |
 | `APP_STATIC_DIR` | `client/dist` | Directory of the production frontend. |
 | `APP_PROJECTS_DIR` | (unset) | Root of the `<org>/<repo>` project tree the catalogue is derived from at startup. Unset means nothing is walked and the catalogue is curated over the API alone; set and unreadable refuses the start. |
