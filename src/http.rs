@@ -23,6 +23,8 @@ pub struct TaskSummary {
     pub product_id: Option<String>,
     pub priority: i64,
     pub updated_at: String,
+    /// The task this one waits for, so a list can say why a draft is waiting.
+    pub depends_on: Option<String>,
 }
 
 impl From<Task> for TaskSummary {
@@ -35,6 +37,7 @@ impl From<Task> for TaskSummary {
             product_id: task.product_id,
             priority: task.priority,
             updated_at: task.updated_at,
+            depends_on: task.depends_on,
         }
     }
 }
@@ -101,6 +104,10 @@ pub struct TaskCard {
     /// Absent while nothing has reviewed it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_review: Option<ReviewOutcome>,
+    /// The status of the dependency this task is still waiting for. Absent
+    /// when it has none or that task has landed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dependency_status: Option<TaskStatus>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,6 +197,8 @@ pub struct CreateTaskBody {
     pub priority: Option<i64>,
     #[serde(default)]
     pub release_level: Option<String>,
+    #[serde(default)]
+    pub depends_on: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,10 +268,12 @@ fn card(db: &Db, task: Task) -> Result<TaskCard, Error> {
     } else {
         None
     };
+    let dependency_status = task::dependency_status(db, &task)?;
     Ok(TaskCard {
         task,
         available_transitions,
         latest_review,
+        dependency_status,
     })
 }
 
@@ -328,6 +339,7 @@ pub async fn api_create_task(
             kind,
             priority: body.priority.unwrap_or(0),
             release_level: ReleaseLevel::parse_optional(body.release_level.as_deref())?,
+            depends_on: body.depends_on,
         },
         state.clock.now(),
     )?;

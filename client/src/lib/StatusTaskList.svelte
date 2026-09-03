@@ -88,6 +88,12 @@
               <a class="card" href={`/tasks/${item.id}`}>
                 <span class="name">{item.title}</span>
                 <span class="tail">
+                  {#if item.depends_on}
+                    <!-- Why a draft is still a draft, read off the list. -->
+                    <span class="product" data-depends-on={item.depends_on}
+                      >← {item.depends_on}</span
+                    >
+                  {/if}
                   <span class="product">{item.product_id}</span>
                 </span>
               </a>

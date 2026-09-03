@@ -271,6 +271,16 @@ PRAGMA user_version = 10;
 COMMIT;
 ";
 
+/// Version 11 lets a task wait for another: `depends_on` names the task whose
+/// landing promotes this one to `ready`. A column only — nothing a database
+/// already holds waits for anything.
+const SCHEMA_V11: &str = "\
+BEGIN;
+ALTER TABLE tasks ADD COLUMN depends_on TEXT REFERENCES tasks(id);
+PRAGMA user_version = 11;
+COMMIT;
+";
+
 /// How long a writer waits for a lock before giving up, in milliseconds.
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -442,6 +452,9 @@ fn migrate(conn: &Connection) -> Result<(), Error> {
     if version < 10 {
         conn.execute_batch(SCHEMA_V10)?;
     }
+    if version < 11 {
+        conn.execute_batch(SCHEMA_V11)?;
+    }
     Ok(())
 }
 
@@ -495,6 +508,7 @@ mod tests {
 
     use super::{
         Db, SCHEMA_V1, SCHEMA_V2, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+        SCHEMA_V10,
     };
 
     fn pragma_string(db: &Db, pragma: &str) -> String {
@@ -586,11 +600,11 @@ mod tests {
         let named = Db::open(":memory:").unwrap();
         assert_eq!(pragma_string(&named, "journal_mode"), "memory");
         assert_eq!(pragma_int(&named, "busy_timeout"), 5000);
-        assert_eq!(user_version(&named), 10);
+        assert_eq!(user_version(&named), 11);
 
         let private = Db::open_in_memory().unwrap();
         assert_eq!(pragma_int(&private, "busy_timeout"), 5000);
-        assert_eq!(user_version(&private), 10);
+        assert_eq!(user_version(&private), 11);
 
         // A URI spelling is not one of them. Only the exact `:memory:` is
         // exempt, so a URI is an ordinary filename: it lands on disk in WAL,
@@ -611,10 +625,10 @@ mod tests {
 
     /// Every column of one task row, in schema order, as `(name, value)`. A
     /// rebuild that dropped, reordered, or blanked a column shows up here.
-    /// The columns version 10 added. Every migration test below asks about an
-    /// earlier step, and a column that arrived after it would otherwise show up
-    /// as a difference in every row comparison.
-    const V10_COLUMNS: [&str; 2] = ["release_level", "release_task_id"];
+    /// The columns versions 10 and 11 added. Every migration test below asks
+    /// about an earlier step, and a column that arrived after it would
+    /// otherwise show up as a difference in every row comparison.
+    const V10_COLUMNS: [&str; 3] = ["release_level", "release_task_id", "depends_on"];
 
     fn task_row(conn: &Connection, id: &str) -> Vec<(String, String)> {
         let mut statement = conn.prepare("SELECT * FROM tasks WHERE id = ?1").unwrap();
@@ -679,7 +693,7 @@ mod tests {
     #[test]
     fn migration_creates_the_current_schema() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(user_version(&db), 10);
+        assert_eq!(user_version(&db), 11);
         let tables: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row(
@@ -711,7 +725,7 @@ mod tests {
         drop(db);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 10);
+        assert_eq!(user_version(&db), 11);
         let products: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row("SELECT count(*) FROM products", [], |row| row.get(0))?)
@@ -746,7 +760,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 10);
+        assert_eq!(user_version(&db), 11);
 
         let (title, status, priority, merge_target, checks): (
             String,
@@ -842,7 +856,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 10);
+        assert_eq!(user_version(&db), 11);
 
         db.with_conn(|conn| {
             let rows_after = rebuilt_rows(conn, ["t-target", "merge:t-target", "t-plain"]);
@@ -946,7 +960,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 10);
+        assert_eq!(user_version(&db), 11);
         let archived = |db: &Db| -> (usize, Option<String>) {
             db.with_conn(|conn| {
                 let columns = column_names(conn, "products");
@@ -971,7 +985,7 @@ mod tests {
         // column is not added twice and the row is not re-marked.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 10);
+        assert_eq!(user_version(&db), 11);
         assert_eq!(archived(&db), (1, None), "a second open changes nothing");
         let tasks: i64 = db
             .with_conn(|conn| {
@@ -1174,7 +1188,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 10);
+        assert_eq!(user_version(&db), 11);
         db.with_conn(|conn| {
             let columns = column_names(conn, "tasks");
             for added in ["review_target_task_id", "review_verdict"] {
@@ -1202,7 +1216,7 @@ mod tests {
         // Reopening runs the step again and must change nothing.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 10);
+        assert_eq!(user_version(&db), 11);
         let tasks: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?)
@@ -1260,7 +1274,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 10);
+        assert_eq!(user_version(&db), 11);
 
         let upgraded = Connection::open(&path).unwrap();
         assert!(
@@ -1291,7 +1305,7 @@ mod tests {
         // Reopening runs nothing again.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 10);
+        assert_eq!(user_version(&db), 11);
     }
 
     /// The step on its own: a database that already reached version 6 loses the
@@ -1338,7 +1352,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 10);
+        assert_eq!(user_version(&db), 11);
         let upgraded = Connection::open(&path).unwrap();
         assert!(
             !column_names(&upgraded, "tasks").contains(&"merge_sequence".to_owned()),
@@ -1401,7 +1415,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 10);
+        assert_eq!(user_version(&db), 11);
         db.with_conn(|conn| {
             let husk = |id: &str| -> (String, Option<String>, String) {
                 conn.query_row(
@@ -1554,7 +1568,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 10);
+        assert_eq!(user_version(&db), 11);
         db.with_conn(|conn| {
             let names = column_names(conn, "tasks");
             for column in V10_COLUMNS {
@@ -1589,6 +1603,52 @@ mod tests {
                 "merged",
                 "merged work of a releasing product waits for a release to be issued"
             );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Version 11 adds `depends_on` and nothing else: every row comes across
+    /// with the column empty, because nothing that already existed waits.
+    #[test]
+    fn a_version_ten_database_gains_an_empty_depends_on_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sqlite.db");
+
+        let legacy = Connection::open(&path).unwrap();
+        for batch in [SCHEMA_V1, SCHEMA_V2] {
+            legacy.execute_batch(batch).unwrap();
+        }
+        super::rebuild_tasks_without_the_product_key(&legacy).unwrap();
+        for batch in [
+            SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10,
+        ] {
+            legacy.execute_batch(batch).unwrap();
+        }
+        legacy
+            .execute_batch(
+                "INSERT INTO tasks (id, title, status, kind, product_id, created_at, updated_at)
+                 VALUES ('t-1', 'first', 'draft', 'normal', 'a/b', 'early', 'early');",
+            )
+            .unwrap();
+        let before: i64 = legacy
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, 10, "the fixture must start at version 10");
+        let row_before = task_row(&legacy, "t-1");
+        drop(legacy);
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(user_version(&db), 11);
+        db.with_conn(|conn| {
+            assert!(column_names(conn, "tasks").contains(&"depends_on".to_owned()));
+            let depends_on: Option<String> = conn
+                .query_row("SELECT depends_on FROM tasks WHERE id = 't-1'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert!(depends_on.is_none(), "an existing row waits for nothing");
+            assert_eq!(task_row(conn, "t-1"), row_before, "no other column moved");
             Ok(())
         })
         .unwrap();

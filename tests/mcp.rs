@@ -802,6 +802,80 @@ async fn task_create_files_the_release_level_and_defaults_it_to_patch() {
     );
 }
 
+/// `depends_on` is filed and cleared over MCP the same way HTTP does it, and
+/// `task_get` says what the dependency is doing.
+#[tokio::test]
+async fn task_create_and_update_carry_depends_on_and_task_get_reports_its_status() {
+    let (_dir, state) = file_backed_state();
+    let router = task_server::app(state);
+    catalogue(&router, "sunny-side/task-server").await;
+
+    let mut admin = McpClient::new(&router, "/mcp", STALE_MCP_CAPABILITY);
+    admin.initialize().await;
+    admin
+        .call(
+            "task_create",
+            json!({ "id": "t-first", "title": "first", "product_id": "sunny-side/task-server" }),
+        )
+        .await;
+    let second = admin
+        .call(
+            "task_create",
+            json!({
+                "id": "t-second",
+                "title": "second",
+                "product_id": "sunny-side/task-server",
+                "depends_on": "t-first",
+            }),
+        )
+        .await;
+    assert_eq!(second["isError"], json!(false), "{second}");
+    assert_eq!(second["structuredContent"]["task"]["depends_on"], "t-first");
+    assert_eq!(second["structuredContent"]["dependency_status"], "draft");
+
+    let refused = admin
+        .call(
+            "task_set_status",
+            json!({ "id": "t-second", "status": "ready" }),
+        )
+        .await;
+    assert_eq!(refused["isError"], json!(true), "{refused}");
+    assert_eq!(refused["structuredContent"]["code"], "dependency_pending");
+
+    let cycle = admin
+        .call(
+            "task_update",
+            json!({ "id": "t-first", "depends_on": "t-second" }),
+        )
+        .await;
+    assert_eq!(cycle["isError"], json!(true), "{cycle}");
+    assert_eq!(cycle["structuredContent"]["code"], "invalid");
+
+    let cleared = admin
+        .call(
+            "task_update",
+            json!({ "id": "t-second", "depends_on": null }),
+        )
+        .await;
+    assert_eq!(cleared["isError"], json!(false), "{cleared}");
+    assert_eq!(
+        cleared["structuredContent"]["task"]["depends_on"],
+        Value::Null
+    );
+    let seen = admin.call("task_get", json!({ "id": "t-second" })).await;
+    assert_eq!(seen["structuredContent"]["dependency_status"], Value::Null);
+    let ready = admin
+        .call(
+            "task_set_status",
+            json!({ "id": "t-second", "status": "ready" }),
+        )
+        .await;
+    assert_eq!(
+        ready["structuredContent"]["task"]["status"], "ready",
+        "{ready}"
+    );
+}
+
 /// The refusal of `approved`, `merged`, and `released` is one domain rule, so
 /// pressing it over MCP answers exactly what pressing it over HTTP answers, and
 /// moves nothing. `approved` matters most here: a model that could press it

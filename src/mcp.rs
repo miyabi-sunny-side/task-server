@@ -60,6 +60,11 @@ pub struct TaskCreateArgs {
     /// it forces existing users or their data through a migration.
     #[serde(default)]
     pub release_level: Option<String>,
+    /// The task this one waits for. It stays `draft` until that task is
+    /// merged, and the landing promotes it to `ready`. One id; chain tasks
+    /// (A → B → C) to wait for several.
+    #[serde(default)]
+    pub depends_on: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -97,6 +102,11 @@ pub struct TaskUpdateArgs {
     /// it forces existing users or their data through a migration.
     #[serde(default)]
     pub release_level: Option<String>,
+    /// The task this one waits for. Pass `null` to clear it — that is how a
+    /// person skips the order on purpose.
+    #[serde(default, deserialize_with = "task::double_option")]
+    #[schemars(with = "Option<String>")]
+    pub depends_on: Option<Option<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -193,10 +203,12 @@ fn card(db: &crate::db::Db, task: &Task) -> Result<Value, Error> {
     } else {
         None
     };
+    let dependency_status = task::dependency_status(db, task)?;
     Ok(json!({
         "task": task,
         "available_transitions": available_transitions,
         "latest_review": latest_review,
+        "dependency_status": dependency_status,
     }))
 }
 
@@ -259,6 +271,7 @@ impl Admin {
                             kind: TaskKind::Normal,
                             priority: args.priority.unwrap_or(0),
                             release_level,
+                            depends_on: args.depends_on,
                         },
                         now,
                     )
@@ -309,6 +322,7 @@ impl Admin {
             priority: args.priority,
             branch: args.branch,
             release_level,
+            depends_on: args.depends_on,
         };
         answer(
             task::update(&self.state.db, &args.id, &patch, self.state.clock.now())
@@ -317,7 +331,10 @@ impl Admin {
     }
 
     #[tool(
-        description = "Move a task to another status. A task cannot be promoted to `ready` while \
+        description = "Move a task to another status. A task that depends on another one \
+                       (`depends_on`) cannot be promoted to `ready` by hand while that task has \
+                       not landed (code `dependency_pending`): the landing promotes it, or clear \
+                       depends_on to skip the order. A task cannot be promoted to `ready` while \
                        its product is not in the product catalogue: that refusal comes back with \
                        code `product_not_catalogued` (or `product_required` when the task names \
                        no product at all). Correct the id or register the product through the \

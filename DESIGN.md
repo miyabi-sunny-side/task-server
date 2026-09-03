@@ -683,6 +683,20 @@ counterpart to carry, so it earns no token pair.
   also a status this screen never *produces*: a review report alone
   enters it, so no control anywhere in this UI is labelled `approved`.
 
+  **Dependency.** A task that waits for another (`depends_on`) carries
+  one more muted caption in the caption row, labelled `depends_on`, whose
+  value is a link to that task; while the dependency has not landed the
+  caption adds the dependency's status as an outline badge, and once it
+  has landed (or when there is no dependency) the badge — and, with no
+  dependency, the whole caption — is absent. That is the whole reason a
+  draft is still a draft, so it is said where the other facts about the
+  task are said, in the same voice: no color, no icon, no instruction.
+  On the top page a status-group card of a waiting task shows the
+  dependency's id as a second muted caption beside the product id,
+  marked `←`; nothing else on the list changes, and no control is added
+  anywhere for it — the landing promotes the task, and a person who
+  wants to skip the order clears the dependency.
+
   **Review block.** A task the card payload carries a review outcome
   for (`review_verdict` and `review_findings`, however the server
   sources them) renders one block **between the caption row and the
@@ -934,6 +948,15 @@ counterpart to carry, so it earns no token pair.
       (surface-raised background, 1px border, 8px radius) and appear in
       no status group. Cancelling a `blocked` merge and reloading leaves
       that merge out of every train and its target inside this block.
+  29. A Task Card whose task carries `depends_on` renders a caption
+      labelled `depends_on` whose link resolves to that task's card, and
+      while the card payload carries `dependency_status` the caption holds
+      an outline badge with that status; without `dependency_status` no
+      badge exists, and without `depends_on` no such caption exists. On
+      the top page a waiting task's status-group card carries the
+      dependency id as a muted caption beside the product id, and a task
+      without a dependency carries none. No button anywhere is added for
+      dependencies.
 
 ## Do's and Don'ts
 

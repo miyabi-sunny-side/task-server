@@ -153,4 +153,33 @@ describe("TaskCard", () => {
       expect((button as HTMLButtonElement).disabled).toBe(true);
     }
   });
+
+  it("names the dependency it waits for, with its status until it lands", () => {
+    render(TaskCard, {
+      props: {
+        task: { ...FIXTURE, depends_on: "beta", dependency_status: "wip" },
+      },
+    });
+
+    const field = document.querySelector<HTMLElement>(
+      '[data-field="depends_on"]',
+    )!;
+    expect(field.textContent).toContain("beta");
+    expect(field.querySelector("a")?.getAttribute("href")).toBe("/tasks/beta");
+    expect(
+      field.querySelector("[data-dependency-status]")?.textContent?.trim(),
+    ).toBe("wip");
+
+    cleanup();
+    render(TaskCard, { props: { task: { ...FIXTURE, depends_on: "beta" } } });
+    expect(
+      document.querySelector(
+        '[data-field="depends_on"] [data-dependency-status]',
+      ),
+    ).toBeNull();
+
+    cleanup();
+    render(TaskCard, { props: { task: FIXTURE } });
+    expect(document.querySelector('[data-field="depends_on"]')).toBeNull();
+  });
 });

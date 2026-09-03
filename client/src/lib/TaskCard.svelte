@@ -40,6 +40,20 @@
   <span class="caption-label">verification</span>
   {task.verification ?? ""}
 </p>
+<!-- A task that waits for another says so beside the other captions, and
+     while the dependency has not landed, what it is doing — that is the
+     whole reason a draft is still a draft (DESIGN.md, Dependency). -->
+{#if task.depends_on}
+  <p class="caption" data-field="depends_on">
+    <span class="caption-label">depends_on</span>
+    <a class="dependency" href={`/tasks/${task.depends_on}`}
+      >{task.depends_on}</a
+    >
+    {#if task.dependency_status}
+      <span class="badge" data-dependency-status>{task.dependency_status}</span>
+    {/if}
+  </p>
+{/if}
 <!-- Above the body: a worker who was sent back to `ready` has to read the
      correction before the instruction it corrects (DESIGN.md, Review block).
      Neutral throughout — `request_changes` is a finished review, not a
@@ -88,6 +102,10 @@
 
   .caption-label
     margin-right: var(--sp-2)
+
+  .dependency
+    margin-right: var(--sp-2)
+    color: var(--c-link)
 
   // The card recipe, borrowed for a block inside the card.
   .review

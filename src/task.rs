@@ -10,7 +10,8 @@ use crate::product::{self, check_product_id};
 const COLUMNS: &str = "id, title, body, status, kind, product_id, priority, branch, claimed_by, \
                        claim_id, claimed_at, claim_expires_at, commit_sha, verification, \
                        release_tag, created_at, updated_at, merge_target_task_id, checks_json, \
-                       review_target_task_id, review_verdict, release_level, release_task_id";
+                       review_target_task_id, review_verdict, release_level, release_task_id, \
+                       depends_on";
 
 /// Every status, in vocabulary order. Used to enumerate legal transitions.
 pub(crate) const ALL_STATUSES: [TaskStatus; 10] = [
@@ -323,6 +324,11 @@ pub struct Task {
     /// Set on a `normal` task once a release task was issued to ship it.
     #[serde(default)]
     pub release_task_id: Option<String>,
+    /// The task this one waits for. While it is set and that task has not
+    /// landed (`merged` or `released`), this one is not promoted to `ready`;
+    /// the landing promotes it. One id, not a list: a chain expresses more.
+    #[serde(default)]
+    pub depends_on: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -335,6 +341,8 @@ pub struct NewTask {
     pub priority: i64,
     #[serde(default)]
     pub release_level: ReleaseLevel,
+    #[serde(default)]
+    pub depends_on: Option<String>,
 }
 
 /// The attributes a PATCH may change. A `None` field is left as it is.
@@ -347,6 +355,20 @@ pub struct TaskPatch {
     pub priority: Option<i64>,
     pub branch: Option<String>,
     pub release_level: Option<ReleaseLevel>,
+    /// Absent leaves the dependency alone; an explicit `null` clears it; an
+    /// id sets it. The two nulls have to stay apart, because clearing a
+    /// dependency is how a person skips the order on purpose.
+    #[serde(deserialize_with = "double_option")]
+    pub depends_on: Option<Option<String>>,
+}
+
+/// `null` and "not sent" are different answers for an optional field that can
+/// be cleared: the outer `Option` is presence, the inner one is the value.
+pub fn double_option<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 /// Create a task in `draft`.
@@ -374,11 +396,12 @@ pub fn create(db: &Db, new: &NewTask, now: OffsetDateTime) -> Result<Task, Error
         check_product_id("product_id", product_id)?;
     }
     let stamp = format_z(now);
-    db.with_conn(|conn| {
-        conn.execute(
+    db.with_tx(|tx| {
+        check_dependency(tx, &new.id, new.depends_on.as_deref())?;
+        tx.execute(
             "INSERT INTO tasks (id, title, body, status, kind, product_id, priority, release_level,
-                                created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+                                depends_on, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
             rusqlite::params![
                 new.id,
                 new.title,
@@ -388,11 +411,155 @@ pub fn create(db: &Db, new: &NewTask, now: OffsetDateTime) -> Result<Task, Error
                 new.product_id,
                 new.priority,
                 new.release_level.as_str(),
+                new.depends_on,
                 stamp,
             ],
         )?;
-        read(conn, &new.id)
+        read(tx, &new.id)
     })
+}
+
+/// Whether `depends_on` may be the dependency of `id`.
+///
+/// A dependency that could never land is refused at the door rather than
+/// left to strand the task: itself, a task that does not exist, one that was
+/// called off, or one whose own chain leads back here (`A → B → A` would wait
+/// for ever, and one step at a time is enough to find it).
+fn check_dependency(conn: &Connection, id: &str, depends_on: Option<&str>) -> Result<(), Error> {
+    let Some(dependency) = depends_on else {
+        return Ok(());
+    };
+    if dependency == id {
+        return Err(Error::Invalid(format!("task {id} cannot depend on itself")));
+    }
+    let target = match read(conn, dependency) {
+        Ok(target) => target,
+        Err(Error::NotFound) => {
+            return Err(Error::Invalid(format!(
+                "task {id} cannot depend on {dependency}: no such task"
+            )));
+        }
+        Err(other) => return Err(other),
+    };
+    if matches!(target.status, TaskStatus::Cancelled | TaskStatus::Dropped) {
+        return Err(Error::Invalid(format!(
+            "task {id} cannot depend on {dependency}: it is {} and will never land",
+            target.status.as_str()
+        )));
+    }
+    // Walk the chain from the dependency. Reaching `id` again is a cycle;
+    // a chain longer than the table is one too, however it got there.
+    let mut seen = std::collections::HashSet::new();
+    let mut next = target.depends_on;
+    while let Some(link) = next {
+        if link == id {
+            return Err(Error::Invalid(format!(
+                "task {id} cannot depend on {dependency}: that chain leads back to {id}"
+            )));
+        }
+        if !seen.insert(link.clone()) {
+            return Err(Error::Invalid(format!(
+                "task {id} cannot depend on {dependency}: its chain loops at {link}"
+            )));
+        }
+        next = match read(conn, &link) {
+            Ok(task) => task.depends_on,
+            Err(Error::NotFound) => None,
+            Err(other) => return Err(other),
+        };
+    }
+    Ok(())
+}
+
+/// Whether a dependency has landed: `merged` or `released`, and nothing else.
+#[must_use]
+pub fn has_landed(status: TaskStatus) -> bool {
+    matches!(status, TaskStatus::Merged | TaskStatus::Released)
+}
+
+/// The dependency `task` is still waiting for, with its status; `None` when it
+/// has none or it has landed.
+fn pending_dependency(
+    conn: &Connection,
+    task: &Task,
+) -> Result<Option<(String, TaskStatus)>, Error> {
+    let Some(dependency) = task.depends_on.as_deref() else {
+        return Ok(None);
+    };
+    let target = read(conn, dependency)?;
+    if has_landed(target.status) {
+        return Ok(None);
+    }
+    Ok(Some((target.id, target.status)))
+}
+
+/// The status of the dependency `task` is still waiting for, read for the
+/// card. `None` when it has none or it has landed.
+pub fn dependency_status(db: &Db, task: &Task) -> Result<Option<TaskStatus>, Error> {
+    db.with_conn(|conn| Ok(pending_dependency(conn, task)?.map(|(_, status)| status)))
+}
+
+/// `landed_id` just landed: promote every `draft` task that waited for it.
+///
+/// The promotion goes through the same gate a pressed `ready` does, so a task
+/// whose product left the catalogue stays `draft` — and says why on its
+/// `verification`, because a task that silently stays `draft` is exactly what
+/// this column exists to end. `blocked` tasks are a person's decision and are
+/// left alone.
+fn promote_dependants(tx: &Connection, landed_id: &str, stamp: &str) -> Result<(), Error> {
+    let waiting = query_all(
+        tx,
+        &format!(
+            "SELECT {COLUMNS} FROM tasks WHERE depends_on = ?1 AND status = 'draft'
+             ORDER BY created_at ASC, id ASC"
+        ),
+        &[&landed_id],
+    )?;
+    for task in waiting {
+        match check_catalogued(tx, &task) {
+            Ok(()) => {
+                tx.execute(
+                    "UPDATE tasks SET status = 'ready', updated_at = ?2 WHERE id = ?1",
+                    rusqlite::params![task.id, stamp],
+                )?;
+            }
+            Err(refusal) => {
+                tx.execute(
+                    "UPDATE tasks SET verification = ?2, updated_at = ?3 WHERE id = ?1",
+                    rusqlite::params![
+                        task.id,
+                        format!("not promoted when {landed_id} landed: {refusal}"),
+                        stamp
+                    ],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `called_off_id` was cancelled or dropped: the tasks waiting for it will
+/// never be promoted, so they are blocked with the reason on the row rather
+/// than left `draft` for ever. Work already under way is not touched.
+fn block_dependants(
+    tx: &Connection,
+    called_off_id: &str,
+    status: TaskStatus,
+    stamp: &str,
+) -> Result<(), Error> {
+    tx.execute(
+        "UPDATE tasks SET status = 'blocked', verification = ?2, updated_at = ?3
+         WHERE depends_on = ?1 AND status IN ('draft', 'ready')",
+        rusqlite::params![
+            called_off_id,
+            format!(
+                "blocked: depends on {called_off_id}, which was {} and will never land",
+                status.as_str()
+            ),
+            stamp
+        ],
+    )?;
+    Ok(())
 }
 
 pub fn get(db: &Db, id: &str) -> Result<Task, Error> {
@@ -449,9 +616,16 @@ pub fn update(db: &Db, id: &str, patch: &TaskPatch, now: OffsetDateTime) -> Resu
     let stamp = format_z(now);
     db.with_tx(|tx| {
         let task = read(tx, id)?;
+        let depends_on = match &patch.depends_on {
+            Some(next) => next.as_deref(),
+            None => task.depends_on.as_deref(),
+        };
+        if patch.depends_on.is_some() {
+            check_dependency(tx, id, depends_on)?;
+        }
         tx.execute(
             "UPDATE tasks SET title = ?2, body = ?3, product_id = ?4, priority = ?5, branch = ?6,
-                    release_level = ?7, updated_at = ?8
+                    release_level = ?7, depends_on = ?8, updated_at = ?9
              WHERE id = ?1",
             rusqlite::params![
                 id,
@@ -461,6 +635,7 @@ pub fn update(db: &Db, id: &str, patch: &TaskPatch, now: OffsetDateTime) -> Resu
                 patch.priority.unwrap_or(task.priority),
                 patch.branch.as_deref().or(task.branch.as_deref()),
                 patch.release_level.unwrap_or(task.release_level).as_str(),
+                depends_on,
                 stamp,
             ],
         )?;
@@ -773,6 +948,19 @@ fn set_status_pressed_by(
         }
         if to == TaskStatus::Ready {
             check_catalogued(tx, &task)?;
+            // The order is the dependency's to keep, not a person's to skip:
+            // clearing `depends_on` is the way past it, and that is deliberate.
+            if let Some((dependency, status)) = pending_dependency(tx, &task)? {
+                return Err(Error::Precondition {
+                    code: "dependency_pending",
+                    message: format!(
+                        "task {id} depends on {dependency}, which is {} and has not landed; \
+                         it becomes ready when that task is merged, or clear depends_on to \
+                         skip the order",
+                        status.as_str()
+                    ),
+                });
+            }
         }
         if to == TaskStatus::Released && !product_releases(tx, task.product_id.as_deref())? {
             let product_id = task.product_id.as_deref().unwrap_or("<none>");
@@ -784,6 +972,15 @@ fn set_status_pressed_by(
             "UPDATE tasks SET status = ?2, updated_at = ?3 WHERE id = ?1",
             rusqlite::params![id, to.as_str(), stamp],
         )?;
+        // The landing promotes what waited for it; a task called off blocks
+        // what waited for it. Both here, so a status the control plane grants
+        // directly behaves the same as one a report grants.
+        if has_landed(to) {
+            promote_dependants(tx, id, &stamp)?;
+        }
+        if matches!(to, TaskStatus::Cancelled | TaskStatus::Dropped) {
+            block_dependants(tx, id, to, &stamp)?;
+        }
         read(tx, id)
     })
 }
@@ -1358,6 +1555,7 @@ fn land_merge_target(tx: &Connection, merge: &Task, stamp: &str) -> Result<(), E
         "UPDATE tasks SET status = 'merged', updated_at = ?2 WHERE id = ?1",
         rusqlite::params![target_id, stamp],
     )?;
+    promote_dependants(tx, target_id, stamp)?;
     // Landing is where the release is decided. A product that ships has its
     // release issued here, in the same transaction, the way a report issues
     // its review; one that does not ship is done the moment it lands.
@@ -2196,6 +2394,7 @@ fn from_row(row: &Row<'_>) -> Result<Task, Error> {
         review_verdict: decode_verdict(row.get::<_, Option<String>>(20)?.as_deref())?,
         release_level: ReleaseLevel::parse(&row.get::<_, String>(21)?)?,
         release_task_id: row.get(22)?,
+        depends_on: row.get(23)?,
     })
 }
 
@@ -2216,11 +2415,11 @@ mod tests {
 
     use super::{
         ALL_STATUSES, Check, NewTask, Releasable, ReleaseLevel, ReportOutcome, ReviewVerdict, Task,
-        TaskKind, TaskPatch, TaskStatus, available_transitions, can_transition, claim, create, get,
-        issue_merge, issue_release, issue_review, latest_review, list, list_active, list_by_status,
-        merge_task_id, mergeable, pending_merges, pending_releases, pending_reviews, releasable,
-        release_task_id, report, review_report, review_task_id, set_status, set_status_by_operator,
-        unreviewed, update,
+        TaskKind, TaskPatch, TaskStatus, available_transitions, can_transition, claim, create,
+        dependency_status, get, issue_merge, issue_release, issue_review, latest_review, list,
+        list_active, list_by_status, merge_task_id, mergeable, pending_merges, pending_releases,
+        pending_reviews, releasable, release_task_id, report, review_report, review_task_id,
+        set_status, set_status_by_operator, unreviewed, update,
     };
     use crate::clock::format_z;
     use crate::db::Db;
@@ -2261,6 +2460,7 @@ mod tests {
             kind,
             priority,
             release_level: ReleaseLevel::Patch,
+            depends_on: None,
         }
     }
 
@@ -5848,5 +6048,276 @@ mod tests {
         assert_eq!(outcome.findings.as_deref(), Some("the guard is there now"));
         assert_eq!(outcome.subject_commit_sha.as_deref(), Some("def5678"));
         assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Approved);
+    }
+
+    // --- depends_on ---
+
+    fn dependent(db: &Db, id: &str, depends_on: &str) -> Task {
+        create(
+            db,
+            &NewTask {
+                depends_on: Some(depends_on.into()),
+                ..new_task(id, TaskKind::Normal, 0)
+            },
+            now(),
+        )
+        .unwrap()
+    }
+
+    /// A → B → C: the landing of A promotes B and nothing else; C waits for
+    /// B's landing. A dependency is one link, and a chain is how several are
+    /// expressed.
+    #[test]
+    fn a_landing_promotes_the_draft_that_waited_for_it_and_only_that_one() {
+        let db = db_with_product();
+        create(&db, &new_task("t-a", TaskKind::Normal, 0), now()).unwrap();
+        let b = dependent(&db, "t-b", "t-a");
+        assert_eq!(b.depends_on.as_deref(), Some("t-a"));
+        dependent(&db, "t-c", "t-b");
+        assert_eq!(
+            dependency_status(&db, &b).unwrap(),
+            Some(TaskStatus::Draft),
+            "the card says what the dependency is doing"
+        );
+
+        work_to_approved(&db, "t-a");
+        merge_into(&db, &issued_merge(&db, "t-a").id, TaskStatus::Done);
+        assert_eq!(get(&db, "t-a").unwrap().status, TaskStatus::Merged);
+
+        assert_eq!(
+            get(&db, "t-b").unwrap().status,
+            TaskStatus::Ready,
+            "the landing promoted the task that waited for it"
+        );
+        assert_eq!(
+            get(&db, "t-c").unwrap().status,
+            TaskStatus::Draft,
+            "the chain waits one link at a time"
+        );
+        assert_eq!(
+            dependency_status(&db, &get(&db, "t-b").unwrap()).unwrap(),
+            None
+        );
+
+        // t-b is already `ready` (the landing put it there), so it is driven
+        // from the claim on.
+        let leased = claim(&db, "worker", &[TaskKind::Normal], later(), 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(leased.id, "t-b");
+        report(
+            &db,
+            &leased.claim_id.unwrap(),
+            "abc1234",
+            "cargo test",
+            &[],
+            ReportOutcome::Done,
+            None,
+            later(),
+        )
+        .unwrap();
+        let (_, claim_id) = claim_review(&db, "t-b");
+        review_report(
+            &db,
+            &claim_id,
+            "abc1234",
+            ReviewVerdict::Approve,
+            "read it",
+            later(),
+        )
+        .unwrap();
+        merge_into(&db, &issued_merge(&db, "t-b").id, TaskStatus::Done);
+        assert_eq!(get(&db, "t-c").unwrap().status, TaskStatus::Ready);
+    }
+
+    /// `released` is a landing too: a product that does not release ends at
+    /// the merge, and its dependants are promoted from there.
+    #[test]
+    fn a_release_promotes_the_draft_that_waited_for_it() {
+        let db = db_with_product();
+        product::upsert(
+            &db,
+            &Product {
+                id: "c/d".into(),
+                repository: "https://example.test/c/d.git".into(),
+                description: String::new(),
+                releases: false,
+                archived: false,
+            },
+            now(),
+        )
+        .unwrap();
+        create(
+            &db,
+            &NewTask {
+                product_id: Some("c/d".into()),
+                ..new_task("t-a", TaskKind::Normal, 0)
+            },
+            now(),
+        )
+        .unwrap();
+        dependent(&db, "t-b", "t-a");
+
+        work_to_approved(&db, "t-a");
+        let merge = issued_merge(&db, "t-a");
+        assert_eq!(
+            claim_merge(&db, "luna", later()).as_deref(),
+            Some(merge.id.as_str())
+        );
+        land_merge(&db, &merge.id, "abc1234");
+        assert_eq!(get(&db, "t-a").unwrap().status, TaskStatus::Released);
+        assert_eq!(get(&db, "t-b").unwrap().status, TaskStatus::Ready);
+
+        // The control plane granting `released` directly promotes the same way.
+        create(&db, &new_task("t-x", TaskKind::Normal, 0), now()).unwrap();
+        dependent(&db, "t-y", "t-x");
+        for to in [
+            TaskStatus::Ready,
+            TaskStatus::Wip,
+            TaskStatus::Done,
+            TaskStatus::Approved,
+            TaskStatus::Merged,
+        ] {
+            set_status(&db, "t-x", to, now()).unwrap();
+        }
+        assert_eq!(get(&db, "t-y").unwrap().status, TaskStatus::Ready);
+    }
+
+    /// The order belongs to the dependency, not to a hand: `ready` is refused
+    /// while the dependency has not landed, and the refusal names it.
+    #[test]
+    fn a_pressed_ready_is_refused_while_the_dependency_has_not_landed() {
+        let db = db_with_product();
+        create(&db, &new_task("t-a", TaskKind::Normal, 0), now()).unwrap();
+        dependent(&db, "t-b", "t-a");
+        set_status(&db, "t-a", TaskStatus::Ready, now()).unwrap();
+
+        let refused = set_status_by_operator(&db, "t-b", TaskStatus::Ready, now()).unwrap_err();
+        match refused {
+            Error::Precondition { code, message } => {
+                assert_eq!(code, "dependency_pending");
+                assert!(
+                    message.contains("t-a") && message.contains("ready"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected a precondition, got {other:?}"),
+        }
+        assert_eq!(get(&db, "t-b").unwrap().status, TaskStatus::Draft);
+
+        // Clearing the dependency is the way past the order.
+        update(
+            &db,
+            "t-b",
+            &TaskPatch {
+                depends_on: Some(None),
+                ..TaskPatch::default()
+            },
+            later(),
+        )
+        .unwrap();
+        assert!(get(&db, "t-b").unwrap().depends_on.is_none());
+        set_status_by_operator(&db, "t-b", TaskStatus::Ready, later()).unwrap();
+    }
+
+    #[test]
+    fn a_dependency_on_itself_an_unknown_task_or_a_cycle_is_refused() {
+        let db = db_with_product();
+        create(&db, &new_task("t-a", TaskKind::Normal, 0), now()).unwrap();
+        for (id, dependency) in [("t-self", "t-self"), ("t-ghost", "no-such-task")] {
+            let refused = create(
+                &db,
+                &NewTask {
+                    depends_on: Some(dependency.into()),
+                    ..new_task(id, TaskKind::Normal, 0)
+                },
+                now(),
+            )
+            .unwrap_err();
+            assert!(matches!(refused, Error::Invalid(_)), "{id}: {refused:?}");
+            assert!(
+                matches!(get(&db, id), Err(Error::NotFound)),
+                "nothing was written"
+            );
+        }
+
+        dependent(&db, "t-b", "t-a");
+        let cycle = update(
+            &db,
+            "t-a",
+            &TaskPatch {
+                depends_on: Some(Some("t-b".into())),
+                ..TaskPatch::default()
+            },
+            now(),
+        )
+        .unwrap_err();
+        assert!(matches!(cycle, Error::Invalid(_)), "{cycle:?}");
+        assert!(get(&db, "t-a").unwrap().depends_on.is_none());
+
+        set_status_by_operator(&db, "t-a", TaskStatus::Cancelled, now()).unwrap();
+        let called_off = create(
+            &db,
+            &NewTask {
+                depends_on: Some("t-a".into()),
+                ..new_task("t-late", TaskKind::Normal, 0)
+            },
+            now(),
+        )
+        .unwrap_err();
+        assert!(matches!(called_off, Error::Invalid(_)), "{called_off:?}");
+    }
+
+    /// A dependency called off after the fact blocks what waited for it,
+    /// with the reason on the row, rather than leaving it `draft` for ever.
+    #[test]
+    fn a_dependency_that_is_cancelled_blocks_its_dependants_with_the_reason() {
+        let db = db_with_product();
+        create(&db, &new_task("t-a", TaskKind::Normal, 0), now()).unwrap();
+        dependent(&db, "t-b", "t-a");
+
+        set_status_by_operator(&db, "t-a", TaskStatus::Cancelled, later()).unwrap();
+
+        let blocked = get(&db, "t-b").unwrap();
+        assert_eq!(blocked.status, TaskStatus::Blocked);
+        assert!(
+            blocked
+                .verification
+                .as_deref()
+                .unwrap_or("")
+                .contains("t-a"),
+            "{blocked:?}"
+        );
+    }
+
+    /// The promotion goes through the catalogue gate like a pressed `ready`,
+    /// and a task it cannot promote says why instead of staying quietly draft.
+    #[test]
+    fn a_dependant_whose_product_is_not_catalogued_stays_draft_and_says_why() {
+        let db = db_with_product();
+        create(&db, &new_task("t-a", TaskKind::Normal, 0), now()).unwrap();
+        create(
+            &db,
+            &NewTask {
+                product_id: Some("x/y".into()),
+                depends_on: Some("t-a".into()),
+                ..new_task("t-b", TaskKind::Normal, 0)
+            },
+            now(),
+        )
+        .unwrap();
+
+        work_to_approved(&db, "t-a");
+        merge_into(&db, &issued_merge(&db, "t-a").id, TaskStatus::Done);
+
+        let left = get(&db, "t-b").unwrap();
+        assert_eq!(left.status, TaskStatus::Draft);
+        assert!(
+            left.verification
+                .as_deref()
+                .unwrap_or("")
+                .contains("not in the product catalogue"),
+            "{left:?}"
+        );
     }
 }

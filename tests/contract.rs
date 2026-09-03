@@ -3120,3 +3120,93 @@ async fn a_claim_takes_only_the_kinds_the_worker_asks_for() {
     assert_eq!(status, StatusCode::OK, "{anything}");
     assert_eq!(anything["id"], "t-any");
 }
+
+/// A task that waits for another is promoted by that task's landing, never by a
+/// hand: `ready` is refused with `dependency_pending` while the dependency is
+/// open, and the card says what the dependency is doing.
+#[tokio::test]
+async fn a_dependant_is_promoted_by_the_landing_and_refuses_a_pressed_ready() {
+    let (_dir, state) = file_backed_state();
+    put_product(&state, PRODUCT, true).await;
+    create_task(
+        &state,
+        &json!({"id": "t-first", "title": "goes first", "product_id": PRODUCT}),
+    )
+    .await;
+    let second = create_task(
+        &state,
+        &json!({
+            "id": "t-second",
+            "title": "waits for the first",
+            "product_id": PRODUCT,
+            "depends_on": "t-first",
+        }),
+    )
+    .await;
+    assert_eq!(second["depends_on"], "t-first", "{second}");
+    assert_eq!(second["dependency_status"], "draft", "{second}");
+
+    let (status, refused) = post_status(&state, "t-second", "ready").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["code"], "dependency_pending");
+    assert!(
+        refused["error"].as_str().unwrap().contains("t-first")
+            && refused["error"].as_str().unwrap().contains("draft"),
+        "the refusal names the dependency and its status: {refused}"
+    );
+
+    for (id, depends_on) in [("t-self", "t-self"), ("t-ghost", "nope")] {
+        let (status, refused) = send(
+            &state,
+            human(
+                "POST",
+                "/api/tasks",
+                &json!({"id": id, "title": "x", "product_id": PRODUCT, "depends_on": depends_on}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{id}: {refused}");
+    }
+
+    // t-first already exists, so it is driven by hand rather than through
+    // drive_to_merged, which would file it again.
+    set_status(&state, "t-first", "ready").await;
+    work_to_done(&state, "t-first", "aaa1111").await;
+    approve_task(&state, "t-first", "aaa1111").await;
+    let merge = issued_merge(&state, "t-first").await;
+    land_merge(&state, merge["id"].as_str().unwrap(), "aaa1111").await;
+    let (_, promoted) = get_task(&state, "t-second").await;
+    assert_eq!(
+        promoted["status"], "ready",
+        "the landing promoted it: {promoted}"
+    );
+    assert!(promoted.get("dependency_status").is_none(), "{promoted}");
+
+    let (status, listing) = send(&state, read("/api/tasks")).await;
+    assert_eq!(status, StatusCode::OK);
+    let row = listing
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "t-second")
+        .expect("summary");
+    assert_eq!(
+        row["depends_on"], "t-first",
+        "the list carries the dependency: {row}"
+    );
+
+    // A cleared dependency is a PATCH with an explicit null.
+    create_task(
+        &state,
+        &json!({"id": "t-third", "title": "x", "product_id": PRODUCT, "depends_on": "t-second"}),
+    )
+    .await;
+    let (status, cleared) = send(
+        &state,
+        human("PATCH", "/api/tasks/t-third", &json!({"depends_on": null})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{cleared}");
+    assert_eq!(cleared["depends_on"], Value::Null);
+    set_status(&state, "t-third", "ready").await;
+}

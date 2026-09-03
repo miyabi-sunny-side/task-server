@@ -26,6 +26,7 @@ fn new_task(id: &str, product_id: &str, kind: TaskKind, priority: i64) -> NewTas
         kind,
         priority,
         release_level: task_server::task::ReleaseLevel::Patch,
+        depends_on: None,
     }
 }
 

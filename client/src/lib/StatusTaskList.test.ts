@@ -193,4 +193,29 @@ describe("StatusTaskList", () => {
     }
     expect(focusableIn(ready)).toHaveLength(cardsOf(ready).length);
   });
+
+  it("says on a card which task it waits for", () => {
+    render(StatusTaskList, {
+      props: {
+        fetchState: "ready",
+        items: [
+          { ...summary("t-wait", "draft"), depends_on: "t-first" },
+          summary("t-first", "ready"),
+        ],
+      },
+    });
+
+    const waiting = document.querySelector<HTMLElement>(
+      'a[href="/tasks/t-wait"]',
+    )!;
+    expect(
+      waiting.querySelector<HTMLElement>("[data-depends-on]")?.dataset
+        .dependsOn,
+    ).toBe("t-first");
+    expect(waiting.textContent).toContain("t-first");
+    const first = document.querySelector<HTMLElement>(
+      'a[href="/tasks/t-first"]',
+    )!;
+    expect(first.querySelector("[data-depends-on]")).toBeNull();
+  });
 });

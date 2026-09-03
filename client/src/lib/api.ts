@@ -19,6 +19,8 @@ export interface TaskSummary {
   product_id: string;
   priority: number;
   updated_at: string;
+  // The task this one waits for, so a list can say why a draft is waiting.
+  depends_on?: string | null;
 }
 
 // What the latest *finished* review of a task said, read from that review's
@@ -57,6 +59,11 @@ export interface TaskCard {
   // field existed still type-check; the server always sends it.
   release_level?: "patch" | "minor" | "major";
   release_task_id?: string | null;
+  // The task this one waits for; the landing of that task promotes this one.
+  depends_on?: string | null;
+  // What that task is doing while it has not landed. Absent once it has, or
+  // when there is no dependency at all.
+  dependency_status?: string;
 }
 
 // A refusal the server explained. The message is the human wording the
