@@ -322,14 +322,23 @@ would give an id nobody can check out.
 
 Every field comes from repository data already on disk, and no `git` binary is
 ever run. Normal clones use their working tree, including uncommitted changes.
-Bare repositories use the clean tree at `HEAD`, from loose or packed objects.
+Bare repositories describe themselves from their committed tree, read from loose
+or packed objects, and `releases` is read from the committed tree for every
+repository: the tree at the tip of the **default branch**, which is what
+`refs/remotes/origin/HEAD` names, or `HEAD` when there is no remote-tracking
+default. A bare clone that only ever fetches keeps its local `main` at the commit
+it was cloned from while `origin/main` follows, so asking `HEAD` there would
+describe a commit nobody ships; a normal clone's working tree can be stale or
+partial for the same reason. A tree the walk cannot read (no commit yet, a ref
+that is missing, an object that will not open) does not turn `releases` off: the
+value already in the catalogue is kept and a warning names the product.
 
 | Field | Derived from |
 | --- | --- |
 | `id` | Where it sits locally, `<org>/<repo>`. Never the remote's owner: `sunny-side/5ch-viewer` keeps that id even though it pushes to `miyabisun`. |
 | `repository` | The `origin` URL in `.git/config`, normalised to its browsable `https://` form. |
 | `description` | The first non-empty line of working-tree `README.md`, or its blob at bare `HEAD`, without its leading `#`. Absent is empty. |
-| `releases` | For a normal clone, whether working-tree `.github/workflows` is a directory; an empty one counts. For a bare repository, whether `.github/workflows` is a tree at `HEAD`; Git cannot store an empty directory, so at least one tracked path must be below it. Nothing in the directory is interpreted. A tag is not evidence because a version can be cut by hand. |
+| `releases` | Whether `.github/workflows` is a tree at the tip of the default branch (`origin/HEAD`, else `HEAD`) — the same test for a normal clone, a worktree and a bare repository, never the working tree. Git cannot store an empty directory, so at least one tracked path must be below it. Nothing in the directory is interpreted. A tag is not evidence because a version can be cut by hand. Unreadable: the previous value is kept. Note that a repository derived from rust-svelte-template ships its release workflow on `workflow_dispatch` only, so its first release is dispatched by hand even though the flag is on. |
 
 A worktree and a submodule keep `.git` as a file naming the real git directory,
 and that pointer is followed — including a worktree's `commondir` — because git
