@@ -3756,7 +3756,9 @@ async fn a_rescan_walks_the_tree_now_and_names_what_changed() {
     let (status, second) = send(&state, human("POST", "/api/products/rescan", &json!({}))).await;
     assert_eq!(status, StatusCode::OK, "{second}");
     assert_eq!(second["inserted"], json!(["sunny-side/two"]));
+    assert_eq!(second["updated"], json!([]));
     assert_eq!(second["archived"], json!(["sunny-side/one"]));
+
     let (_, products) = send(&state, read("/api/products")).await;
     let archived: Vec<(&str, bool)> = products
         .as_array()
@@ -3769,6 +3771,33 @@ async fn a_rescan_walks_the_tree_now_and_names_what_changed() {
             && archived.contains(&("sunny-side/two", false)),
         "{products}"
     );
+
+    // A changed README is an update; a clone that comes back with a changed
+    // README is unarchived, and not listed as updated as well.
+    std::fs::write(root.join("sunny-side/two/README.md"), "# two, renamed\n").expect("README");
+    clone_fixture(&root, "sunny-side/one");
+    std::fs::write(root.join("sunny-side/one/README.md"), "# one, back\n").expect("README");
+    let (status, third) = send(&state, human("POST", "/api/products/rescan", &json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{third}");
+    assert_eq!(third["inserted"], json!([]));
+    assert_eq!(third["updated"], json!(["sunny-side/two"]));
+    assert_eq!(third["unarchived"], json!(["sunny-side/one"]));
+    assert_eq!(third["archived"], json!([]));
+    let (_, one) = send(&state, read("/api/products/sunny-side/one")).await;
+    assert_eq!(one["description"], "one, back");
+    assert_eq!(one["archived"], false);
+}
+
+/// Rescans need identity and CSRF, are serialised so two overlapping requests
+/// walk the tree once, and are refused with `catalogue_not_derived` when no
+/// tree is configured.
+#[tokio::test]
+async fn rescans_are_serialised_and_refused_without_a_tree() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = Arc::new(Db::open(dir.path().join("task-server.db")).expect("open"));
+    let root = dir.path().join("projects");
+    clone_fixture(&root, "sunny-side/one");
+    let state = state_for(&db).with_projects_dir(&root);
 
     // Auth: identity + CSRF like every other human mutation.
     let (status, _) = send(
