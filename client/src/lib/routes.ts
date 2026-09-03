@@ -11,6 +11,7 @@ interface RouteDef {
 export const routes: RouteDef[] = [
   { pattern: /^\/$/, params: [] },
   { pattern: /^\/tasks\/([^/]+)$/, params: ["id"] },
+  { pattern: /^\/done$/, params: [] },
 ];
 
 export function matchRoute(pathname: string): RouteMatch {

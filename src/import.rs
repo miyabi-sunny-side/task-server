@@ -509,10 +509,22 @@ fn write_all(
 }
 
 fn insert(tx: &Connection, task: &Parsed, stamp: &str) -> Result<(), Error> {
+    // A row imported already past `done` earned that status before this
+    // database existed, so `stamp` — the import's own timestamp — is the same
+    // best-effort estimate [`SCHEMA_V9`] backfills for a pre-existing row. A
+    // row imported short of `done` gets no `done_at`, for the same reason the
+    // migration gives none: guessing one would assert a completion that never
+    // happened.
+    let done_at = matches!(
+        task.status,
+        TaskStatus::Done | TaskStatus::Approved | TaskStatus::Merged | TaskStatus::Released
+    )
+    .then_some(stamp);
     tx.execute(
         "INSERT INTO tasks (id, title, body, status, kind, product_id, priority,
-                            commit_sha, verification, release_tag, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10, ?10)",
+                            commit_sha, verification, release_tag, created_at, updated_at,
+                            done_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10, ?10, ?11)",
         rusqlite::params![
             task.id,
             task.title,
@@ -524,6 +536,7 @@ fn insert(tx: &Connection, task: &Parsed, stamp: &str) -> Result<(), Error> {
             task.verification,
             task.release_tag,
             stamp,
+            done_at,
         ],
     )?;
     Ok(())

@@ -1294,6 +1294,83 @@ async fn release_level_is_filed_with_the_task_and_defaults_to_patch() {
 }
 
 #[tokio::test]
+async fn done_endpoint_lists_completed_normal_work_newest_first_and_hides_subtasks() {
+    let (_dir, state, clock) = clocked_state(60);
+    put_product(&state, PRODUCT, true).await;
+    put_product(&state, KEEPER, false).await;
+
+    // t-oldest finishes first and ships under a release tag.
+    drive_to_merged(&state, "t-oldest", PRODUCT, "aaa1111").await;
+    ship_release(&state, PRODUCT, "v1.0.0").await;
+
+    clock.advance_secs(60);
+
+    // t-middle finishes next, on a product that never releases, so landing
+    // is where its work ends.
+    drive_to_merged_or_released(&state, "t-middle", KEEPER, "bbb2222").await;
+
+    clock.advance_secs(60);
+
+    // t-newest finishes last and is left at plain `done`.
+    ready_task(&state, "t-newest", 0).await;
+    work_to_done(&state, "t-newest", "ccc3333").await;
+
+    // Open work never appears here.
+    ready_task(&state, "t-open", 0).await;
+
+    let (status, rows) = send(&state, read("/api/done")).await;
+    assert_eq!(status, StatusCode::OK, "done: {rows}");
+    assert_eq!(
+        ids_of(&rows),
+        ["t-newest", "t-middle", "t-oldest"],
+        "most recently completed first: {rows}"
+    );
+
+    let array = rows.as_array().expect("json array");
+    let newest = &array[0];
+    for field in [
+        "id",
+        "title",
+        "status",
+        "product_id",
+        "release_tag",
+        "verification",
+        "done_at",
+    ] {
+        assert!(
+            newest.get(field).is_some(),
+            "a done row must carry {field}: {newest}"
+        );
+    }
+    assert_eq!(newest["status"], "done");
+    assert_eq!(newest["release_tag"], Value::Null);
+    assert_eq!(newest["verification"], "cargo test");
+
+    let oldest = &array[2];
+    assert_eq!(oldest["status"], "released");
+    assert_eq!(oldest["release_tag"], "v1.0.0");
+
+    // Neither the review nor the merge subtask of any driven task leaks in,
+    // even though both reached `done`/`merged` themselves.
+    for subtask_id in [
+        "review:t-oldest",
+        "merge:t-oldest",
+        "review:t-middle",
+        "merge:t-middle",
+    ] {
+        assert!(
+            !ids_of(&rows).contains(&subtask_id),
+            "{subtask_id} must not appear on the done screen: {rows}"
+        );
+    }
+
+    // The existing summary endpoint stays exactly as it was.
+    let (status, summaries) = send(&state, read("/api/tasks?status=done")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_summary_shape(&summaries.as_array().expect("json array")[0]);
+}
+
+#[tokio::test]
 async fn claim_prefers_instant_merge_and_listing_hides_released() {
     let (_dir, state) = file_backed_state();
     put_product(&state, PRODUCT, true).await;

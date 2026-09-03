@@ -125,6 +125,23 @@ export function fetchTasks(
   return requestJson(url, { signal });
 }
 
+// A row of the done screen: what a `normal` task finished, and when.
+// `done_at` is the moment this task first reached `done` — not `updated_at`,
+// which keeps moving through approval, landing, and release.
+export interface DoneTask {
+  id: string;
+  title: string;
+  status: string;
+  product_id: string | null;
+  release_tag: string | null;
+  verification: string | null;
+  done_at: string | null;
+}
+
+export function fetchDone(signal?: AbortSignal): Promise<DoneTask[]> {
+  return requestJson("/api/done", { signal });
+}
+
 export function fetchTask(id: string, signal?: AbortSignal): Promise<TaskCard> {
   return requestJson(`/api/tasks/${encodeURIComponent(id)}`, { signal });
 }

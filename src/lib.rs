@@ -25,7 +25,7 @@ pub use clock::{Clock, SharedClock, SystemClock, format_z};
 pub use db::Db;
 pub use error::Error;
 pub use frontmatter::{Document, join_document, split_document};
-pub use http::{ControlPlane, PendingMerge, PendingRelease, TaskCard, TaskSummary};
+pub use http::{ControlPlane, DoneSummary, PendingMerge, PendingRelease, TaskCard, TaskSummary};
 pub use import::{ImportError, ImportSources, ImportSummary, import_markdown};
 pub use product::Product;
 pub use state::AppState;
@@ -40,6 +40,7 @@ pub fn app(state: AppState) -> Router {
         .route("/health", get(http::api_health))
         .route("/session", get(http::api_session))
         .route("/tasks", get(http::api_tasks).post(http::api_create_task))
+        .route("/done", get(http::api_done))
         .route(
             "/tasks/{id}",
             get(http::api_task).patch(http::api_patch_task),

@@ -311,6 +311,26 @@ PRAGMA user_version = 12;
 COMMIT;
 ";
 
+/// Version 13 remembers when a `normal` task first reached `done`.
+///
+/// `updated_at` cannot stand in for this: it moves again on every later
+/// transition (approval, landing, release), so it answers "when did this row
+/// last change" rather than "when did the work finish". A row already sitting
+/// at `done` or past it earned that status through `done` at some point, so
+/// its `updated_at` at migration time is the closest recoverable estimate —
+/// history that predates this column was never asked to keep a better one. A
+/// row that never reached `done` gets no estimate at all: guessing one for
+/// `draft`, `ready`, `wip`, or a sidetracked row that was never `done` would
+/// assert a completion that did not happen.
+const SCHEMA_V13: &str = "\
+BEGIN;
+ALTER TABLE tasks ADD COLUMN done_at TEXT;
+UPDATE tasks SET done_at = updated_at
+  WHERE kind = 'normal' AND status IN ('done', 'approved', 'merged', 'released');
+PRAGMA user_version = 13;
+COMMIT;
+";
+
 /// How long a writer waits for a lock before giving up, in milliseconds.
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -496,6 +516,9 @@ fn migrate(conn: &Connection) -> Result<(), Error> {
     if version < 12 {
         conn.execute_batch(SCHEMA_V12)?;
     }
+    if version < 13 {
+        conn.execute_batch(SCHEMA_V13)?;
+    }
     Ok(())
 }
 
@@ -641,11 +664,11 @@ mod tests {
         let named = Db::open(":memory:").unwrap();
         assert_eq!(pragma_string(&named, "journal_mode"), "memory");
         assert_eq!(pragma_int(&named, "busy_timeout"), 5000);
-        assert_eq!(user_version(&named), 12);
+        assert_eq!(user_version(&named), 13);
 
         let private = Db::open_in_memory().unwrap();
         assert_eq!(pragma_int(&private, "busy_timeout"), 5000);
-        assert_eq!(user_version(&private), 12);
+        assert_eq!(user_version(&private), 13);
 
         // A URI spelling is not one of them. Only the exact `:memory:` is
         // exempt, so a URI is an ordinary filename: it lands on disk in WAL,
@@ -666,10 +689,10 @@ mod tests {
 
     /// Every column of one task row, in schema order, as `(name, value)`. A
     /// rebuild that dropped, reordered, or blanked a column shows up here.
-    /// The columns versions 10 and 11 added. Every migration test below asks
-    /// about an earlier step, and a column that arrived after it would
+    /// The columns versions 10, 11 and 13 added. Every migration test below
+    /// asks about an earlier step, and a column that arrived after it would
     /// otherwise show up as a difference in every row comparison.
-    const V10_COLUMNS: [&str; 3] = ["release_level", "release_task_id", "depends_on"];
+    const LATER_COLUMNS: [&str; 4] = ["release_level", "release_task_id", "depends_on", "done_at"];
 
     fn task_row(conn: &Connection, id: &str) -> Vec<(String, String)> {
         let mut statement = conn.prepare("SELECT * FROM tasks WHERE id = ?1").unwrap();
@@ -687,7 +710,7 @@ mod tests {
                 let value: rusqlite::types::Value = row.get(index).unwrap();
                 (name.clone(), format!("{value:?}"))
             })
-            .filter(|(name, _)| !V10_COLUMNS.contains(&name.as_str()))
+            .filter(|(name, _)| !LATER_COLUMNS.contains(&name.as_str()))
             .collect()
     }
 
@@ -734,7 +757,7 @@ mod tests {
     #[test]
     fn migration_creates_the_current_schema() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(user_version(&db), 12);
+        assert_eq!(user_version(&db), 13);
         let tables: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row(
@@ -766,7 +789,7 @@ mod tests {
         drop(db);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 12);
+        assert_eq!(user_version(&db), 13);
         let products: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row("SELECT count(*) FROM products", [], |row| row.get(0))?)
@@ -801,7 +824,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 12);
+        assert_eq!(user_version(&db), 13);
 
         let (title, status, priority, merge_target, checks): (
             String,
@@ -897,7 +920,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 12);
+        assert_eq!(user_version(&db), 13);
 
         db.with_conn(|conn| {
             let rows_after = rebuilt_rows(conn, ["t-target", "merge:t-target", "t-plain"]);
@@ -1001,7 +1024,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 12);
+        assert_eq!(user_version(&db), 13);
         let archived = |db: &Db| -> (usize, Option<String>) {
             db.with_conn(|conn| {
                 let columns = column_names(conn, "products");
@@ -1026,7 +1049,7 @@ mod tests {
         // column is not added twice and the row is not re-marked.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 12);
+        assert_eq!(user_version(&db), 13);
         assert_eq!(archived(&db), (1, None), "a second open changes nothing");
         let tasks: i64 = db
             .with_conn(|conn| {
@@ -1229,7 +1252,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 12);
+        assert_eq!(user_version(&db), 13);
         db.with_conn(|conn| {
             let columns = column_names(conn, "tasks");
             for added in ["review_target_task_id", "review_verdict"] {
@@ -1257,7 +1280,7 @@ mod tests {
         // Reopening runs the step again and must change nothing.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 12);
+        assert_eq!(user_version(&db), 13);
         let tasks: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?)
@@ -1315,7 +1338,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 12);
+        assert_eq!(user_version(&db), 13);
 
         let upgraded = Connection::open(&path).unwrap();
         assert!(
@@ -1346,7 +1369,7 @@ mod tests {
         // Reopening runs nothing again.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 12);
+        assert_eq!(user_version(&db), 13);
     }
 
     /// The step on its own: a database that already reached version 6 loses the
@@ -1393,7 +1416,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 12);
+        assert_eq!(user_version(&db), 13);
         let upgraded = Connection::open(&path).unwrap();
         assert!(
             !column_names(&upgraded, "tasks").contains(&"merge_sequence".to_owned()),
@@ -1456,7 +1479,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 12);
+        assert_eq!(user_version(&db), 13);
         db.with_conn(|conn| {
             let husk = |id: &str| -> (String, Option<String>, String) {
                 conn.query_row(
@@ -1485,6 +1508,88 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// A row already sitting at `done` or past it earned that status through
+    /// `done` at some point, so its `updated_at` is the closest recoverable
+    /// estimate of when. A row that never reached `done` — whatever kind it
+    /// is, and even one merely sidetracked to `blocked` — gets no estimate:
+    /// guessing one would assert a completion that never happened.
+    #[test]
+    fn a_version_eight_database_backfills_done_at_for_completed_normal_work_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sqlite.db");
+
+        let legacy = Connection::open(&path).unwrap();
+        legacy.execute_batch(SCHEMA_V1).unwrap();
+        legacy.execute_batch(SCHEMA_V2).unwrap();
+        super::rebuild_tasks_without_the_product_key(&legacy).unwrap();
+        legacy.execute_batch(SCHEMA_V4).unwrap();
+        legacy.execute_batch(SCHEMA_V5).unwrap();
+        legacy.execute_batch(SCHEMA_V6).unwrap();
+        legacy.execute_batch(SCHEMA_V7).unwrap();
+        legacy.execute_batch(SCHEMA_V8).unwrap();
+        legacy
+            .execute_batch(
+                "INSERT INTO tasks (id, title, status, kind, created_at, updated_at)
+                 VALUES ('t-draft', 'not started', 'draft', 'normal', 'then', 'then');
+                 INSERT INTO tasks (id, title, status, kind, created_at, updated_at)
+                 VALUES ('t-wip', 'in progress', 'wip', 'normal', 'then', 'then');
+                 INSERT INTO tasks (id, title, status, kind, created_at, updated_at)
+                 VALUES ('t-blocked', 'stuck, never finished', 'blocked', 'normal', 'then', 'later');
+                 INSERT INTO tasks (id, title, status, kind, created_at, updated_at)
+                 VALUES ('t-done', 'finished', 'done', 'normal', 'then', 'later');
+                 INSERT INTO tasks (id, title, status, kind, created_at, updated_at)
+                 VALUES ('t-approved', 'reviewed', 'approved', 'normal', 'then', 'later');
+                 INSERT INTO tasks (id, title, status, kind, created_at, updated_at)
+                 VALUES ('t-merged', 'landed', 'merged', 'normal', 'then', 'later');
+                 INSERT INTO tasks (id, title, status, kind, created_at, updated_at)
+                 VALUES ('t-released', 'shipped', 'released', 'normal', 'then', 'later');
+                 INSERT INTO tasks (id, title, status, kind, created_at, updated_at)
+                 VALUES ('review:t-done', 'a finished review of other work', 'done', 'review',
+                         'then', 'later');",
+            )
+            .unwrap();
+        let before: i64 = legacy
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, 8, "the fixture must start at version 8");
+        drop(legacy);
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(user_version(&db), 13);
+
+        let done_at = |db: &Db, id: &str| -> Option<String> {
+            db.with_conn(|conn| {
+                Ok(
+                    conn.query_row("SELECT done_at FROM tasks WHERE id = ?1", [id], |row| {
+                        row.get(0)
+                    })?,
+                )
+            })
+            .unwrap()
+        };
+
+        for id in ["t-done", "t-approved", "t-merged", "t-released"] {
+            assert_eq!(
+                done_at(&db, id),
+                Some("later".to_owned()),
+                "{id} already reached done, so it is backfilled from updated_at"
+            );
+        }
+        for id in ["t-draft", "t-wip", "t-blocked", "review:t-done"] {
+            assert_eq!(
+                done_at(&db, id),
+                None,
+                "{id} never reached done as a normal task, so no value is invented for it"
+            );
+        }
+
+        // Reopening runs the step again and must change nothing.
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(user_version(&db), 13);
+        assert_eq!(done_at(&db, "t-done"), Some("later".to_owned()));
     }
 
     /// A review that finished — approved, or sent back for changes — is over,
@@ -1609,10 +1714,10 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 12);
+        assert_eq!(user_version(&db), 13);
         db.with_conn(|conn| {
             let names = column_names(conn, "tasks");
-            for column in V10_COLUMNS {
+            for column in LATER_COLUMNS {
                 assert!(names.contains(&column.to_owned()), "{column} arrived");
             }
             let row = |id: &str| -> (String, Option<String>, String, Option<String>) {
@@ -1705,7 +1810,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 12);
+        assert_eq!(user_version(&db), 13);
         db.with_conn(|conn| {
             conn.execute(
                 "UPDATE tasks SET status = 'released', release_tag = 'v1.0.0'
@@ -1789,7 +1894,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).expect("the upgrade must not collide on the review index");
-        assert_eq!(user_version(&db), 12);
+        assert_eq!(user_version(&db), 13);
         db.with_conn(|conn| {
             let released: i64 = conn
                 .query_row(
@@ -1842,7 +1947,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 12);
+        assert_eq!(user_version(&db), 13);
         db.with_conn(|conn| {
             assert!(column_names(conn, "tasks").contains(&"depends_on".to_owned()));
             let depends_on: Option<String> = conn

@@ -1,10 +1,13 @@
 <script lang="ts">
   import Icon from "./Icon.svelte";
   import ThemeModal from "./ThemeModal.svelte";
+  import { router } from "./router.svelte";
 
   let menuOpen = $state(false);
   let themeOpen = $state(false);
   let menuButton = $state<HTMLButtonElement | undefined>();
+
+  let onDone = $derived(router.index === 2);
 
   function closeMenu() {
     menuOpen = false;
@@ -32,7 +35,17 @@
 <svelte:window {onkeydown} />
 
 <header>
-  <a class="title" href="/">Task Server</a>
+  <div class="nav">
+    <a class="title" href="/">Task Server</a>
+    <a
+      class="done-link"
+      class:selected={onDone}
+      href="/done"
+      aria-current={onDone ? "page" : undefined}
+    >
+      done
+    </a>
+  </div>
   <div class="menu-wrapper">
     <button
       class="icon-btn"
@@ -78,11 +91,34 @@
     background: var(--c-wash-base)
     border-bottom: 1px solid var(--c-border)
 
+  .nav
+    display: flex
+    align-items: center
+    gap: var(--sp-2)
+
   .title
     font-size: var(--fs-md)
     font-weight: 500
     color: var(--c-on-surface)
     text-decoration: none
+
+  .done-link
+    display: inline-flex
+    align-items: center
+    min-height: 36px
+    padding: var(--sp-1) var(--sp-2)
+    border-radius: var(--radius-sm)
+    font-size: var(--fs-md)
+    font-weight: 500
+    color: var(--c-on-surface)
+    text-decoration: none
+
+  .done-link:hover
+    background: var(--c-hover-1)
+
+  .done-link.selected
+    background: var(--c-accent-subtle)
+    color: var(--c-accent)
 
   .menu-wrapper
     position: relative

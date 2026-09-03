@@ -409,6 +409,7 @@ and `dropped`.
 | GET | `/healthz`, `/api/health` | none |
 | GET | `/api/session` | read |
 | GET | `/api/tasks`, `/api/tasks/{id}` | read |
+| GET | `/api/done` | read |
 | POST | `/api/tasks` | human mutation |
 | PATCH | `/api/tasks/{id}` | human mutation |
 | POST | `/api/tasks/{id}/status` | human mutation |
@@ -423,6 +424,21 @@ and `dropped`.
 for a status explicitly; an unknown status is a 400. Single-task responses are
 the full task plus `available_transitions`, and `latest_review` when a review
 has answered for it.
+
+`GET /api/done` answers the done screen directly rather than composing several
+`?status=` calls: every `normal` task whose status is `done`, `approved`,
+`merged`, or `released`, newest-completed first (`done_at DESC, id DESC`).
+`done_at` is a `tasks` column of its own — the moment a task first reached
+`done` — because `updated_at` keeps moving through approval, landing, and
+release and cannot answer "when did this finish". It is written once, on the
+transition into `done` (by a worker report or an operator press), guarded by
+`kind = 'normal'` so a `review` or `instant:merge` row never carries one, and
+left alone by every later transition; a task sent back for rework and finished
+again keeps its first `done_at`. A database that predates the column backfills
+it from `updated_at` for every row already at `done` or past it — the best
+recoverable estimate for history the column was not there to keep — and
+leaves every other row `NULL` rather than inventing a completion that never
+happened.
 
 `GET /api/control` answers
 `{ mergeable, pending_merges, pending_releases, pending_reviews, unreviewed,

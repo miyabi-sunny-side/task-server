@@ -274,10 +274,17 @@ The shell stacks three rows:
 
 1. **App header — invariant on every page.** Sticky, 48px, full width,
    `--c-wash-base` background, 1px bottom hairline. Contents are exactly
-   two: the app title as a home link (`<a href="/">`, label type,
-   on-surface ink, no underline — left) and the hamburger icon-button
-   (right). **The title is the header's only navigation link**; all
-   other navigation lives inside the menu, so phone widths never crowd.
+   three, left to right: the app title as a home link (`<a href="/">`,
+   label type, on-surface ink, no underline), the done link
+   (`<a href="/done">`, label type, same ink, grouped beside the title
+   with `--sp-2` gap), and the hamburger icon-button (right, unchanged).
+   **The title and the done link are the header's only navigation
+   links**; every other destination lives inside the menu, so phone
+   widths never crowd. The done link is a plain page-navigation link,
+   not a primary action — it never takes the accent-filled button
+   treatment, so it never competes with a page's one accent-filled
+   control (see Colors, Buttons). Its only states are default and
+   selected (Components); it never disables.
 2. **Sub-header — detail screens only.** 40px, `--c-wash-raised`, 1px
    bottom hairline, holding only the current item's title (label,
    single line, ellipsized). No back button — going back is the header
@@ -460,8 +467,19 @@ counterpart to carry, so it earns no token pair.
 
 - **App header:** per Layout. The title link keeps on-surface ink with
   no underline (chrome, not content — the `link` token is for body
-  links). The hamburger is a 36px quiet icon-button with `aria-label`
-  and `aria-expanded`.
+  links). Beside it, the **done link** is the header's one
+  page-navigation link: label type, `var(--sp-1) var(--sp-2)` padding,
+  `--radius-sm`, inline-flex, 36px min height (the same hit target as
+  the hamburger). Default state matches the title — on-surface ink,
+  transparent background, hover fills `--c-hover-1`. On `/done` it
+  carries `aria-current="page"` plus the **selected-radio treatment
+  already used in the release modal** (`--c-accent-subtle` background,
+  `--radius-sm`) and switches its text to `--c-accent` ink — the tint
+  this document already names "the selected-state tint" in Colors,
+  never a solid accent fill, because the header is chrome present on
+  every page and a nav link is not the primary action a page's one
+  accent fill marks. The hamburger stays a 36px quiet icon-button with
+  `aria-label` and `aria-expanded`, unchanged.
 - **Menu (from the hamburger):** a dropdown panel spatially anchored to
   the hamburger, not a modal — absolutely positioned at `top: 100%` /
   `right: 0` within the header's positioned right slot, `min-width`
@@ -723,6 +741,43 @@ counterpart to carry, so it earns no token pair.
   A `review` task's own card adds its subject commit as a muted caption
   in the caption row, so the operator can see which commit the verdict
   was passed on.
+- **Done page — completed task list.** Reached from the header's done
+  link (`/done`); no sub-header, per Layout item 2 — like the top page,
+  the content column opens directly on the list and current location is
+  carried by the header's selected state alone, with no page heading of
+  its own. It lists every `kind: normal` task whose status is `done`,
+  `approved`, `merged`, or `released` — non-`normal` tasks (`review`,
+  `instant:merge`) never appear, matching the top page's own status
+  groups. `released` is shown here on purpose: the top page drops a task
+  the moment it ships, and this list is where shipped work keeps being
+  readable. Rows sort by completion time, most recent first.
+
+  Each row reuses the **card recipe** (`.cards` / `.card`:
+  surface-raised, 1px hairline, `--radius-md`, 10px padding, 8px gaps
+  between rows), stacked exactly like a blocked merge-train card — a
+  `.name`/`.tail` header line, then one optional line under it — so the
+  whole row is **one link to the Task Card and never a second focus
+  stop**. The header line holds the title (`.name`) on the left; the
+  tail (right, baseline-aligned) holds, in order, the **status badge**
+  (outline badge recipe — neutral, never tinted, per Status is worn,
+  never tinted), the **release tag** when present (the same outline
+  badge recipe, a second chip), the `.product` id, then the completion
+  timestamp as a muted caption. Under the header line, when
+  `verification` is non-empty, an excerpt line renders its **first one
+  or two source lines** (split on `\n`, not CSS-clamped) as muted
+  body-sm text with `white-space: pre-line` and `overflow-wrap: anywhere`
+  — a task with empty or absent verification renders no excerpt line,
+  never an empty one, the same rule the review block already keeps.
+
+  The list container carries `data-state="loading|empty|error|success"`
+  on the task list's own discipline: _loading_ is the centered accent
+  spinner line; _empty_ is one centered muted `.state` line reading
+  "完了したタスクがありません" and nothing else — no heading, no zero
+  pill; _error_ is the `.state.error` line plus a default "再試行"
+  button; _success_ is the rows. There is no group heading and no status
+  grouping here — unlike the top page's task list, the done page is
+  already filtered to one purpose and reads faster as one flat,
+  time-ordered list than as separate single-status groups.
 - **Buttons:** default = surface-raised bg, 1px hairline, label type,
   sm radius, 8×14px padding, hover fills `--c-hover-1`. Primary =
   accent bg, `surface-raised`-token text — **at most one per primary
@@ -780,10 +835,11 @@ counterpart to carry, so it earns no token pair.
   2. Choosing ライト in the theme modal sets `data-theme="light"`,
      turns the body `rgb(250, 246, 239)`, writes the storage key, and
      leaves the modal open.
-  3. At 375px the header contains exactly two interactive elements —
-     the title `<a href="/">` and the hamburger `<button>` — and
+  3. At 375px the header contains exactly three interactive elements —
+     the title `<a href="/">`, the done link `<a href="/done">`, and
+     the hamburger `<button>` — and
      `document.documentElement.scrollWidth` never exceeds the
-     viewport, with the menu closed or open.
+     viewport, with the menu closed or open, on both `/` and `/done`.
   4. Cards compute to 1px border / 8px radius / 10px padding / 8px gap;
      the list's `data-state` reflects loading, empty, error, success.
   5. Chrome icons are all inline SVG on the 24×24 viewBox grid, stroked
@@ -974,6 +1030,47 @@ counterpart to carry, so it earns no token pair.
       dependency id as a muted caption beside the product id, and a task
       without a dependency carries none. No button anywhere is added for
       dependencies.
+  30. Header done link states, computed. Off `/done`, the done link's
+      computed `background-color` is transparent and it carries no
+      `aria-current` attribute. On `/done`, it carries
+      `aria-current="page"`, its computed `background-color` equals
+      `--c-accent-subtle` (`rgba(94, 184, 199, 0.15)` in Sumi,
+      `rgba(47, 111, 126, 0.1)` in Kinari), its computed `color` equals
+      `--c-accent`, and its computed `border-radius` equals 6px. On no
+      page does the header itself contain a solid-accent-background
+      element — the done link never computes a solid `--c-accent`
+      background in either state, so it never becomes a second
+      accent-filled control alongside a page's own primary button.
+      `:focus-visible` on the done link shows the same 2px accent
+      outline as every other control, and clicking it or activating it
+      with Enter navigates to `/done` without a full page reload.
+  31. The done page shows only completed work, correctly typed. Every
+      row links to a task whose `kind` is `normal`; no `review` or
+      `instant:merge` task ever appears. Every row's status is one of
+      `done`, `approved`, `merged`, `released`; no other status appears.
+      Loading the page twice against unchanged server state yields rows
+      in the same order, and that order is non-increasing by completion
+      time (each row's timestamp is at or after the next row's).
+  32. Done row composition and single focus stop. Each row computes the
+      card recipe (1px border, 8px radius, 10px padding) and contains
+      exactly one focusable element — the row's own link — regardless
+      of whether a release-tag chip or a verification excerpt is
+      present. The status badge and any release-tag chip both compute
+      `border-radius` 9999px and sit in the row's tail alongside the
+      product id and the completion timestamp. A row whose task has
+      empty or absent `verification` renders no excerpt element at all
+      — not an empty one — and a row whose `verification` holds more
+      than two lines shows only its first two, joined by a single
+      `\n`, in the rendered `textContent`.
+  33. Done page states. With no completed tasks the list renders
+      exactly one `.state` element reading "完了したタスクがありません"
+      and no row, no heading, and no pill. While loading it renders the
+      centered accent spinner and no rows. On a failed fetch it renders
+      the `.state.error` line plus a default-styled "再試行" button
+      that re-fires the request on click. At 375px, a row whose
+      verification excerpt holds a 40-character unbroken token still
+      leaves `document.documentElement.scrollWidth` within the
+      viewport.
 
 ## Do's and Don'ts
 
@@ -1022,6 +1119,15 @@ counterpart to carry, so it earns no token pair.
   learn why.
 - Do present the menu as a hamburger-anchored dropdown; centered
   modals are for dialogs (theme settings), never for navigation.
+- Do give the done link the selected-radio tint (`--c-accent-subtle`
+  background, `--c-accent` text) and `aria-current="page"` when active;
+  don't give a page-navigation link a solid accent-filled background —
+  that treatment stays reserved for a region's one primary action.
+- Do keep a done row a single link with one focus stop, its status and
+  release tag riding the existing outline badge recipe; don't add a
+  second link or button inside a row for the tag or the status.
+- Do drop a done row's verification excerpt entirely when there is
+  nothing to show; don't render an empty excerpt line.
 - Don't use emoji or text glyphs as icons; every UI icon is an
   `Icon.svelte` dictionary entry.
 - Do render every app-icon raster from `client/public/icon.svg` and track

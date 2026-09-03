@@ -11,7 +11,7 @@ const COLUMNS: &str = "id, title, body, status, kind, product_id, priority, bran
                        claim_id, claimed_at, claim_expires_at, commit_sha, verification, \
                        release_tag, created_at, updated_at, merge_target_task_id, checks_json, \
                        review_target_task_id, review_verdict, release_level, release_task_id, \
-                       depends_on";
+                       depends_on, done_at";
 
 /// Every status, in vocabulary order. Used to enumerate legal transitions.
 pub(crate) const ALL_STATUSES: [TaskStatus; 10] = [
@@ -329,6 +329,14 @@ pub struct Task {
     /// the landing promotes it. One id, not a list: a chain expresses more.
     #[serde(default)]
     pub depends_on: Option<String>,
+    /// The moment a `normal` task first reached `done`, written once and never
+    /// overwritten by a later transition (approval, landing, release, or a
+    /// second pass through `done` after `request_changes`). `None` on a task
+    /// that has never been `done`, and always `None` on a `review` or
+    /// `instant:merge` task — the done screen this exists for reads `normal`
+    /// work only.
+    #[serde(default)]
+    pub done_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -598,6 +606,26 @@ pub fn list_by_status(db: &Db, status: TaskStatus) -> Result<Vec<Task>, Error> {
                 "SELECT {COLUMNS} FROM tasks WHERE status = ?1 ORDER BY created_at ASC, id ASC"
             ),
             &[&status.as_str()],
+        )
+    })
+}
+
+/// Completed `normal` work, most recently finished first: everything that has
+/// passed `done` and not fallen back out of it (`done`, `approved`, `merged`,
+/// `released`). `review` and `instant:merge` tasks never carry a `done_at` for
+/// their own kind, so restricting to `normal` and ordering by `done_at` are
+/// the same filter stated twice; both are named because the id tiebreak needs
+/// a `normal`-only ordering to be meaningful at all.
+pub fn list_done(db: &Db) -> Result<Vec<Task>, Error> {
+    db.with_conn(|conn| {
+        query_all(
+            conn,
+            &format!(
+                "SELECT {COLUMNS} FROM tasks
+                 WHERE kind = 'normal' AND status IN ('done', 'approved', 'merged', 'released')
+                 ORDER BY done_at DESC, id DESC"
+            ),
+            &[],
         )
     })
 }
@@ -969,7 +997,10 @@ fn set_status_pressed_by(
             )));
         }
         tx.execute(
-            "UPDATE tasks SET status = ?2, updated_at = ?3 WHERE id = ?1",
+            "UPDATE tasks SET status = ?2, updated_at = ?3,
+                    done_at = CASE WHEN ?2 = 'done' AND kind = 'normal'
+                              THEN COALESCE(done_at, ?3) ELSE done_at END
+             WHERE id = ?1",
             rusqlite::params![id, to.as_str(), stamp],
         )?;
         // The landing promotes what waited for it; a task called off blocks
@@ -1404,7 +1435,9 @@ pub fn report(
             TaskStatus::Wip => {
                 tx.execute(
                     "UPDATE tasks SET status = 'done', commit_sha = ?2, verification = ?3,
-                            checks_json = ?4, updated_at = ?5
+                            checks_json = ?4, updated_at = ?5,
+                            done_at = CASE WHEN kind = 'normal'
+                                      THEN COALESCE(done_at, ?5) ELSE done_at END
                      WHERE id = ?1",
                     rusqlite::params![task.id, commit_sha, verification, checks_json, stamp],
                 )?;
@@ -2476,6 +2509,7 @@ fn from_row(row: &Row<'_>) -> Result<Task, Error> {
         release_level: ReleaseLevel::parse(&row.get::<_, String>(21)?)?,
         release_task_id: row.get(22)?,
         depends_on: row.get(23)?,
+        done_at: row.get(24)?,
     })
 }
 
@@ -2498,9 +2532,9 @@ mod tests {
         ALL_STATUSES, Check, NewTask, Releasable, ReleaseLevel, ReportOutcome, ReviewVerdict, Task,
         TaskKind, TaskPatch, TaskStatus, available_transitions, can_transition, claim, create,
         dependency_status, get, issue_merge, issue_release, issue_review, latest_review, list,
-        list_active, list_by_status, merge_task_id, mergeable, pending_merges, pending_releases,
-        pending_reviews, releasable, release_claim, release_task_id, report, review_report,
-        review_task_id, set_status, set_status_by_operator, unreviewed, update,
+        list_active, list_by_status, list_done, merge_task_id, mergeable, pending_merges,
+        pending_releases, pending_reviews, releasable, release_claim, release_task_id, report,
+        review_report, review_task_id, set_status, set_status_by_operator, unreviewed, update,
     };
     use crate::clock::format_z;
     use crate::db::Db;
@@ -2513,6 +2547,10 @@ mod tests {
 
     fn later() -> time::OffsetDateTime {
         datetime!(2026-03-04 05:06:08 UTC)
+    }
+
+    fn even_later() -> time::OffsetDateTime {
+        datetime!(2026-03-04 05:06:09 UTC)
     }
 
     fn db_with_product() -> Db {
@@ -5884,6 +5922,215 @@ mod tests {
         set_status_by_operator(&db, "t-hand", TaskStatus::Wip, later()).unwrap();
         let finished = set_status_by_operator(&db, "t-hand", TaskStatus::Done, later()).unwrap();
         assert_eq!(finished.status, TaskStatus::Done);
+    }
+
+    /// `done_at` is the first time a task reached `done`, not the latest
+    /// status change: it is written once, on the transition into `done`, and
+    /// every later transition — approval, landing, release — leaves it alone.
+    #[test]
+    fn done_at_is_recorded_once_and_unmoved_by_approval_merge_or_release() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        set_status(&db, "t-1", TaskStatus::Ready, now()).unwrap();
+
+        // The worker-report path writes `done_at`, not a pressed status.
+        let leased = claim(&db, "worker", &[TaskKind::Normal], now(), 60)
+            .unwrap()
+            .unwrap();
+        report(
+            &db,
+            &leased.claim_id.clone().unwrap(),
+            "abc1234",
+            "cargo test",
+            &[],
+            ReportOutcome::Done,
+            None,
+            now(),
+        )
+        .unwrap();
+        let finished = get(&db, "t-1").unwrap();
+        assert_eq!(finished.done_at.as_deref(), Some(format_z(now()).as_str()));
+
+        // The review's own approve write moves the target `done -> approved`
+        // through a dedicated UPDATE, not the one `done_at` is guarded on.
+        let (_, review_claim) = claim_review(&db, "t-1");
+        let approved = review_report(
+            &db,
+            &review_claim,
+            "abc1234",
+            ReviewVerdict::Approve,
+            "looks good",
+            later(),
+        )
+        .unwrap();
+        assert_eq!(approved.status, TaskStatus::Done, "the review, not t-1");
+        let approved = get(&db, "t-1").unwrap();
+        assert_eq!(
+            approved.status,
+            TaskStatus::Approved,
+            "the approval promoted t-1"
+        );
+        assert_eq!(
+            approved.done_at, finished.done_at,
+            "approval does not move the completion time"
+        );
+
+        // Landing goes through `land_merge_target`'s own UPDATE.
+        let merge_leased = claim(&db, "builder", &[TaskKind::InstantMerge], even_later(), 60)
+            .unwrap()
+            .unwrap();
+        report(
+            &db,
+            &merge_leased.claim_id.clone().unwrap(),
+            "abc1234",
+            "landed",
+            &[Check {
+                name: "cargo test".into(),
+                exit_code: 0,
+            }],
+            ReportOutcome::Done,
+            None,
+            even_later(),
+        )
+        .unwrap();
+        let merged = get(&db, "t-1").unwrap();
+        assert_eq!(merged.status, TaskStatus::Merged);
+        assert_eq!(
+            merged.done_at, finished.done_at,
+            "landing does not move it either"
+        );
+
+        // Release goes through the release task's own report UPDATE.
+        let release = claim_release(&db);
+        ship(&db, &release, Some("v1.0.0")).unwrap();
+        let released = get(&db, "t-1").unwrap();
+        assert_eq!(released.status, TaskStatus::Released);
+        assert_eq!(released.done_at, finished.done_at, "nor does release");
+    }
+
+    /// The worker-report path writes `done_at` the same way the operator press
+    /// does, and a task sent back and finished a second time keeps the first
+    /// timestamp — "first" is the whole point of the column.
+    #[test]
+    fn done_at_survives_a_second_pass_through_done() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        work_to_done(&db, "t-1");
+        let first = get(&db, "t-1").unwrap();
+        assert_eq!(first.done_at.as_deref(), Some(format_z(now()).as_str()));
+
+        set_status_by_operator(&db, "t-1", TaskStatus::Blocked, later()).unwrap();
+        set_status_by_operator(&db, "t-1", TaskStatus::Ready, later()).unwrap();
+        set_status_by_operator(&db, "t-1", TaskStatus::Wip, later()).unwrap();
+        let second = set_status_by_operator(&db, "t-1", TaskStatus::Done, even_later()).unwrap();
+        assert_eq!(
+            second.done_at, first.done_at,
+            "done_at is the first time this task reached done, not the latest"
+        );
+    }
+
+    /// The done screen reads completed `normal` work only, newest first, and
+    /// never a review or merge subtask — even once that subtask is itself
+    /// `done` or `merged`.
+    #[test]
+    fn list_done_orders_completed_normal_work_by_completion_time_and_excludes_subtasks() {
+        let db = db_with_product();
+
+        create(&db, &new_task("t-early", TaskKind::Normal, 0), now()).unwrap();
+        set_status(&db, "t-early", TaskStatus::Ready, now()).unwrap();
+        set_status(&db, "t-early", TaskStatus::Wip, now()).unwrap();
+        set_status(&db, "t-early", TaskStatus::Done, now()).unwrap();
+
+        // t-mid finishes later, through the real worker-report -> review ->
+        // approve -> merge pipeline, so its review and merge subtasks exist
+        // and have to stay out of the done list even though both are
+        // themselves `done` or `merged`.
+        create(&db, &new_task("t-mid", TaskKind::Normal, 0), now()).unwrap();
+        set_status(&db, "t-mid", TaskStatus::Ready, now()).unwrap();
+        let leased = claim(&db, "worker", &[TaskKind::Normal], later(), 60)
+            .unwrap()
+            .unwrap();
+        report(
+            &db,
+            &leased.claim_id.clone().unwrap(),
+            "abc1234",
+            "cargo test",
+            &[],
+            ReportOutcome::Done,
+            None,
+            later(),
+        )
+        .unwrap();
+        let (_, review_claim) = claim_review(&db, "t-mid");
+        review_report(
+            &db,
+            &review_claim,
+            "abc1234",
+            ReviewVerdict::Approve,
+            "looks good",
+            later(),
+        )
+        .unwrap();
+        let merge_leased = claim(&db, "builder", &[TaskKind::InstantMerge], later(), 60)
+            .unwrap()
+            .unwrap();
+        report(
+            &db,
+            &merge_leased.claim_id.clone().unwrap(),
+            "abc1234",
+            "landed",
+            &[Check {
+                name: "cargo test".into(),
+                exit_code: 0,
+            }],
+            ReportOutcome::Done,
+            None,
+            even_later(),
+        )
+        .unwrap();
+
+        // t-approved finishes last and stops at `approved`: reviewed but not
+        // yet landed, still one of the statuses the done screen shows.
+        create(&db, &new_task("t-approved", TaskKind::Normal, 0), now()).unwrap();
+        set_status(&db, "t-approved", TaskStatus::Ready, now()).unwrap();
+        let leased = claim(&db, "worker", &[TaskKind::Normal], even_later(), 60)
+            .unwrap()
+            .unwrap();
+        report(
+            &db,
+            &leased.claim_id.clone().unwrap(),
+            "ccc3333",
+            "cargo test",
+            &[],
+            ReportOutcome::Done,
+            None,
+            even_later(),
+        )
+        .unwrap();
+        let (_, review_claim) = claim_review(&db, "t-approved");
+        review_report(
+            &db,
+            &review_claim,
+            "ccc3333",
+            ReviewVerdict::Approve,
+            "looks good",
+            even_later(),
+        )
+        .unwrap();
+
+        create(&db, &new_task("t-open", TaskKind::Normal, 0), now()).unwrap();
+        set_status(&db, "t-open", TaskStatus::Ready, now()).unwrap();
+
+        let rows = list_done(&db).unwrap();
+        let ids: Vec<String> = rows.iter().map(|task| task.id.clone()).collect();
+        assert_eq!(
+            ids,
+            ["t-approved", "t-mid", "t-early"],
+            "most recently completed first; open work, reviews, and merges are absent"
+        );
+        assert_eq!(rows[0].status, TaskStatus::Approved);
+        assert_eq!(rows[1].status, TaskStatus::Merged);
+        assert_eq!(rows[2].status, TaskStatus::Done);
     }
 
     /// A train is one product's. Another product's merges are rebasing onto

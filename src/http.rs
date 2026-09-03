@@ -93,6 +93,39 @@ impl From<Task> for PendingRelease {
     }
 }
 
+/// A row of the done screen: what a `normal` task finished, and when.
+///
+/// Not [`TaskSummary`] plus fields, because a summary is what every list of
+/// live work carries and this list is read after the pipeline stopped
+/// tracking the task — `updated_at` keeps moving through merge and release,
+/// so it is `done_at` this row sorts and shows, not `updated_at`.
+#[derive(Debug, Serialize)]
+pub struct DoneSummary {
+    pub id: String,
+    pub title: String,
+    pub status: TaskStatus,
+    pub product_id: Option<String>,
+    pub release_tag: Option<String>,
+    pub verification: Option<String>,
+    /// When this task first reached `done`. Present on every row this
+    /// endpoint returns — [`task::list_done`] selects only rows that did.
+    pub done_at: Option<String>,
+}
+
+impl From<Task> for DoneSummary {
+    fn from(task: Task) -> Self {
+        Self {
+            id: task.id,
+            title: task.title,
+            status: task.status,
+            product_id: task.product_id,
+            release_tag: task.release_tag,
+            verification: task.verification,
+            done_at: task.done_at,
+        }
+    }
+}
+
 /// The full task plus the transitions a human may actually press and, for work
 /// a review has answered, what that review said.
 #[derive(Debug, Serialize)]
@@ -320,6 +353,16 @@ pub async fn api_tasks(
         None => task::list_active(&state.db)?,
     };
     Ok(Json(summaries(tasks)))
+}
+
+/// Completed `normal` work, most recently finished first (`GET /api/done`).
+pub async fn api_done(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<DoneSummary>>, Error> {
+    require_identity(&headers, &state)?;
+    let tasks = task::list_done(&state.db)?;
+    Ok(Json(tasks.into_iter().map(DoneSummary::from).collect()))
 }
 
 /// Register a task.

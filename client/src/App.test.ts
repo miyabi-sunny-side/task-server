@@ -54,8 +54,9 @@ describe("App", () => {
     const header = screen.getByRole("banner");
     const title = header.querySelector('a[href="/"]');
     expect(title?.textContent).toContain("Task Server");
+    expect(header.querySelector('a[href="/done"]')).toBeTruthy();
     expect(screen.getByRole("button", { name: "メニュー" })).toBeTruthy();
-    expect(header.querySelectorAll("a, button")).toHaveLength(2);
+    expect(header.querySelectorAll("a, button")).toHaveLength(3);
 
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: TASK.title })).toBeTruthy(),
@@ -65,5 +66,45 @@ describe("App", () => {
 
     await fireEvent.click(title as HTMLElement);
     expect(window.location.pathname).toBe("/");
+  });
+
+  it("navigates to /done from the header and marks it current", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>().mockImplementation((input) => {
+        const url = String(input);
+        const payload =
+          url === "/api/tasks" || url === "/api/done"
+            ? []
+            : url === "/api/control"
+              ? {
+                  mergeable: [],
+                  pending_merges: [],
+                  pending_reviews: [],
+                  unreviewed: [],
+                  releasable: [],
+                }
+              : url === "/api/session"
+                ? { user: "test", csrf_token: "test-csrf" }
+                : TASK;
+        return Promise.resolve(
+          new Response(JSON.stringify(payload), { status: 200 }),
+        );
+      }),
+    );
+
+    render(App);
+
+    const header = screen.getByRole("banner");
+    const doneLink = header.querySelector('a[href="/done"]') as HTMLElement;
+    expect(doneLink.getAttribute("aria-current")).toBeNull();
+
+    await fireEvent.click(doneLink);
+
+    expect(window.location.pathname).toBe("/done");
+    expect(doneLink.getAttribute("aria-current")).toBe("page");
+    await waitFor(() =>
+      expect(screen.getByText("完了したタスクがありません")).toBeTruthy(),
+    );
   });
 });
