@@ -3210,3 +3210,63 @@ async fn a_dependant_is_promoted_by_the_landing_and_refuses_a_pressed_ready() {
     assert_eq!(cleared["depends_on"], Value::Null);
     set_status(&state, "t-third", "ready").await;
 }
+
+/// A worker that is about to go hands its claim back, and the task is taken
+/// again by the next claim instead of waiting out the lease.
+#[tokio::test]
+async fn a_worker_hands_a_live_claim_back_and_the_next_claim_takes_the_task() {
+    let (_dir, state, clock) = clocked_state(60);
+    put_product(&state, PRODUCT, true).await;
+    ready_task(&state, "t-1", 0).await;
+
+    let (status, lease) = send(&state, worker("/worker/claim", &json!({"worker": "grok"}))).await;
+    assert_eq!(status, StatusCode::OK, "{lease}");
+    let claim_id = claim_id_of(&lease);
+
+    let (status, back) = send(
+        &state,
+        worker(
+            "/worker/claim/release",
+            &json!({"claim_id": claim_id, "reason": "self-update"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{back}");
+    assert_eq!(back["status"], "ready");
+    assert_eq!(back["claim_id"], Value::Null);
+    assert_eq!(back["claimed_by"], Value::Null);
+    assert_eq!(back["verification"], "claim released by grok: self-update");
+
+    let (status, again) = send(
+        &state,
+        worker(
+            "/worker/claim/release",
+            &json!({"claim_id": claim_id, "reason": "shutdown"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{again}");
+    assert_eq!(again["code"], "claim_not_live");
+
+    let (status, retaken) = send(&state, worker("/worker/claim", &json!({"worker": "sol"}))).await;
+    assert_eq!(status, StatusCode::OK, "{retaken}");
+    assert_eq!(retaken["id"], "t-1");
+    assert_eq!(retaken["claimed_by"], "sol");
+    let retaken_claim = claim_id_of(&retaken);
+    assert_ne!(retaken_claim, claim_id);
+
+    // Past the lease the claim is no longer live, and the row is not touched.
+    clock.advance_secs(120);
+    let (status, late) = send(
+        &state,
+        worker(
+            "/worker/claim/release",
+            &json!({"claim_id": retaken_claim, "reason": "shutdown"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{late}");
+    assert_eq!(late["code"], "claim_not_live");
+    let (_, card) = get_task(&state, "t-1").await;
+    assert_eq!(card["status"], "wip");
+}

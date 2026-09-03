@@ -326,8 +326,15 @@ JSON API, the MCP endpoints, and the compiled client.
   rejected with 409. Reporting the same `commit_sha` twice is idempotent.
 - Clock is injectable. Default claim TTL is 3600 seconds (`CLAIM_TTL_SECS`).
   There is no renew or heartbeat route, so the TTL must exceed the longest task.
-  Renew is the next protocol priority; nack/release follows because it helps a
-  graceful worker but cannot recover a disposable machine that already vanished.
+  Renew is the next protocol priority.
+- A worker hands a live claim back with `POST /worker/claim/release`
+  (`{claim_id, reason}`): the task returns to `ready`, the four lease columns
+  are cleared, and `claim released by <worker>: <reason>` is appended to
+  `verification`. Any kind; a review's `review_attempt` is not counted, because
+  the attempt is over only when a verdict is written. A claim that is not live
+  — expired, already reported, unknown — is 409 with code `claim_not_live` and
+  writes nothing. It helps a graceful worker; it cannot recover a machine that
+  already vanished, which is what the lease is still for.
 - Listen on `127.0.0.1` by default (`APP_BIND_ADDR` may override). Binding a LAN
   interface adds reachability, not TLS. The container image binds
   `0.0.0.0:3000`; runtime port publishing and ingress remain the boundary.
@@ -406,7 +413,7 @@ and `dropped`.
 | POST | `/api/reviews`, `/api/merges`, `/api/releases` | human mutation (reconciliation handles) |
 | GET | `/api/products`, `/api/products/{id}` | read |
 | PUT | `/api/products/{id}` | human mutation |
-| POST | `/worker/claim`, `/worker/report`, `/worker/review-report` | trusted network; no application auth |
+| POST | `/worker/claim`, `/worker/claim/release`, `/worker/report`, `/worker/review-report` | trusted network; no application auth |
 | POST | `/mcp`, `/worker/mcp` | trusted network; no application auth |
 
 `GET /api/tasks` returns summaries and hides `released` unless `?status=` asks

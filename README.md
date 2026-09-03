@@ -48,6 +48,7 @@ creates the database (and its parent directory) on first start.
 | GET | `/api/products/{id}` | one product |
 | PUT | `/api/products/{id}` | create or replace a product |
 | POST | `/worker/claim` | lease the next ready task; optional `kinds` routes by role and optional `idempotency_key` makes an uncertain response retryable |
+| POST | `/worker/claim/release` | `{"claim_id": "...", "reason": "..."}` hands a live claim back: the task returns to `ready` with the reason on `verification`; a claim that is not live is 409 `claim_not_live` |
 | POST | `/worker/report` | report a commit, and `checks`, against a lease; `"outcome": "blocked"` records why the work could not be finished |
 | POST | `/worker/review-report` | answer a claimed review with a verdict and findings |
 | POST | `/mcp` | MCP over Streamable HTTP: the catalogue and the task lifecycle |

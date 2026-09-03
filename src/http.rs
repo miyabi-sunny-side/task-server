@@ -143,6 +143,15 @@ pub struct ReportBody {
     pub release_tag: Option<String>,
 }
 
+/// A worker handing a live claim back before its lease runs out.
+#[derive(Debug, Deserialize)]
+pub struct ClaimReleaseBody {
+    pub claim_id: String,
+    /// Why, in a short fixed word (`shutdown`, `self-update`, `gave-up`). Kept
+    /// on the task's `verification`.
+    pub reason: String,
+}
+
 /// A review's completion. Deliberately not [`ReportBody`]: a verdict is not a
 /// commit, and `request_changes` is a finished review rather than a failed one.
 #[derive(Debug, Deserialize)]
@@ -525,6 +534,17 @@ pub async fn worker_report(
         state.clock.now(),
     )?;
     Ok(Json(card(&state.db, reported)?))
+}
+
+/// Hand a live claim back. The task returns to `ready` with the lease columns
+/// cleared and the reason on `verification`; a claim that is not live answers
+/// 409 with code `claim_not_live` and changes nothing.
+pub async fn worker_claim_release(
+    State(state): State<AppState>,
+    Json(body): Json<ClaimReleaseBody>,
+) -> Result<Json<TaskCard>, Error> {
+    let released = task::release_claim(&state.db, &body.claim_id, &body.reason, state.clock.now())?;
+    Ok(Json(card(&state.db, released)?))
 }
 
 /// The review's own completion route.

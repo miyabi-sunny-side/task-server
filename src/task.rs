@@ -1238,6 +1238,84 @@ fn kind_filter(kinds: &[TaskKind]) -> String {
     format!(" AND kind IN ('{}')", list.join("', '"))
 }
 
+/// Hand a live claim back before its lease runs out.
+///
+/// A worker that is about to go — shutdown, self-update, giving up — would
+/// otherwise leave the task `wip` until the lease expires, with nobody able to
+/// take it. Handing it back puts the task where the claim found it: `ready`,
+/// with the lease columns cleared, so the next claim takes it again. The reason
+/// is kept on `verification`, appended to whatever was already there, because a
+/// task that came back is a fact the next worker and the operator both read.
+///
+/// The kind does not matter: a review's `review_attempt` stays as it is (the
+/// attempt is over only when a verdict is written), and a merge lets its
+/// product's train move on, which is what leaving `wip` does.
+///
+/// Only a live lease can be handed back. An expired one, one the task already
+/// reported on, or an unknown `claim_id` answers with `claim_not_live` — a
+/// conflict, because the request is well formed and the world has moved — and
+/// writes nothing.
+pub fn release_claim(
+    db: &Db,
+    claim_id: &str,
+    reason: &str,
+    now: OffsetDateTime,
+) -> Result<Task, Error> {
+    if claim_id.trim().is_empty() || reason.trim().is_empty() {
+        return Err(Error::Invalid("claim_id and reason are required".into()));
+    }
+    let stamp = format_z(now);
+    db.with_tx(|tx| {
+        let sql = format!("SELECT {COLUMNS} FROM tasks WHERE claim_id = ?1");
+        let Some(task) = query_all(tx, &sql, &[&claim_id])?.pop() else {
+            return Err(claim_not_live(
+                "no task holds this claim_id; it was already handed back, reported, or retaken",
+            ));
+        };
+        let live = task.status == TaskStatus::Wip
+            && task
+                .claim_expires_at
+                .as_deref()
+                .is_some_and(|expires| expires > stamp.as_str());
+        if !live {
+            return Err(claim_not_live(&format!(
+                "task {} is {} and its lease {}; only a live claim can be handed back",
+                task.id,
+                task.status.as_str(),
+                if task.status == TaskStatus::Wip {
+                    "has expired"
+                } else {
+                    "is over"
+                }
+            )));
+        }
+        let note = format!(
+            "claim released by {}: {}",
+            task.claimed_by.as_deref().unwrap_or("<unknown worker>"),
+            reason.trim()
+        );
+        let verification = match task.verification.as_deref() {
+            Some(existing) if !existing.trim().is_empty() => format!("{existing}\n{note}"),
+            _ => note,
+        };
+        tx.execute(
+            "UPDATE tasks SET status = 'ready', claim_id = NULL, claimed_by = NULL,
+                    claimed_at = NULL, claim_expires_at = NULL, verification = ?2,
+                    updated_at = ?3
+             WHERE id = ?1",
+            rusqlite::params![task.id, verification, stamp],
+        )?;
+        read(tx, &task.id)
+    })
+}
+
+fn claim_not_live(message: &str) -> Error {
+    Error::Precondition {
+        code: "claim_not_live",
+        message: message.to_owned(),
+    }
+}
+
 /// Accept a worker's result for the lease `claim_id`.
 ///
 /// For an `instant:merge` task this is the gate onto the main line: the report
@@ -2418,8 +2496,8 @@ mod tests {
         TaskKind, TaskPatch, TaskStatus, available_transitions, can_transition, claim, create,
         dependency_status, get, issue_merge, issue_release, issue_review, latest_review, list,
         list_active, list_by_status, merge_task_id, mergeable, pending_merges, pending_releases,
-        pending_reviews, releasable, release_task_id, report, review_report, review_task_id,
-        set_status, set_status_by_operator, unreviewed, update,
+        pending_reviews, releasable, release_claim, release_task_id, report, review_report,
+        review_task_id, set_status, set_status_by_operator, unreviewed, update,
     };
     use crate::clock::format_z;
     use crate::db::Db;
@@ -6319,5 +6397,155 @@ mod tests {
                 .contains("not in the product catalogue"),
             "{left:?}"
         );
+    }
+    // --- handing a claim back ---
+
+    /// A live claim handed back puts the task where the claim found it, with
+    /// the reason on the row, and the next claim takes it again.
+    #[test]
+    fn a_live_claim_handed_back_returns_the_task_to_ready_with_the_reason() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        set_status(&db, "t-1", TaskStatus::Ready, now()).unwrap();
+        let leased = claim(&db, "worker-a", &[TaskKind::Normal], now(), 60)
+            .unwrap()
+            .unwrap();
+        let claim_id = leased.claim_id.clone().unwrap();
+
+        let back = release_claim(&db, &claim_id, "self-update", later()).unwrap();
+        assert_eq!(back.status, TaskStatus::Ready);
+        assert!(back.claim_id.is_none() && back.claimed_by.is_none());
+        assert!(back.claimed_at.is_none() && back.claim_expires_at.is_none());
+        assert_eq!(
+            back.verification.as_deref(),
+            Some("claim released by worker-a: self-update")
+        );
+        assert_eq!(back.branch.as_deref(), Some("task/t-1"), "the branch stays");
+
+        // Handing it back twice is a conflict, and the task is not touched.
+        assert!(matches!(
+            release_claim(&db, &claim_id, "shutdown", later()),
+            Err(Error::Precondition {
+                code: "claim_not_live",
+                ..
+            })
+        ));
+        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Ready);
+
+        // The next claim takes it, under a fresh claim_id, and a second
+        // hand-back appends to what is already on the row.
+        let again = claim(&db, "worker-b", &[TaskKind::Normal], later(), 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.id, "t-1");
+        assert_ne!(again.claim_id, Some(claim_id));
+        let back =
+            release_claim(&db, again.claim_id.as_deref().unwrap(), "gave-up", later()).unwrap();
+        assert_eq!(
+            back.verification.as_deref(),
+            Some("claim released by worker-a: self-update\nclaim released by worker-b: gave-up")
+        );
+    }
+
+    /// Only a live lease can be handed back: an expired one, a reported one,
+    /// and an unknown id are all refused with `claim_not_live`.
+    #[test]
+    fn an_expired_reported_or_unknown_claim_cannot_be_handed_back() {
+        let db = db_with_product();
+        for id in ["t-expired", "t-reported"] {
+            create(&db, &new_task(id, TaskKind::Normal, 0), now()).unwrap();
+            set_status(&db, id, TaskStatus::Ready, now()).unwrap();
+        }
+        let expired = claim(&db, "worker", &[TaskKind::Normal], now(), 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.id, "t-expired");
+        let past = now() + time::Duration::seconds(5);
+        assert!(matches!(
+            release_claim(&db, expired.claim_id.as_deref().unwrap(), "shutdown", past),
+            Err(Error::Precondition {
+                code: "claim_not_live",
+                ..
+            })
+        ));
+        assert_eq!(get(&db, "t-expired").unwrap().status, TaskStatus::Wip);
+
+        let reported = claim(&db, "worker", &[TaskKind::Normal], now(), 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reported.id, "t-reported");
+        let claim_id = reported.claim_id.clone().unwrap();
+        report(
+            &db,
+            &claim_id,
+            "abc1234",
+            "cargo test",
+            &[],
+            ReportOutcome::Done,
+            None,
+            now(),
+        )
+        .unwrap();
+        assert!(matches!(
+            release_claim(&db, &claim_id, "shutdown", later()),
+            Err(Error::Precondition {
+                code: "claim_not_live",
+                ..
+            })
+        ));
+        assert_eq!(get(&db, "t-reported").unwrap().status, TaskStatus::Done);
+
+        assert!(matches!(
+            release_claim(&db, "no-such-claim", "shutdown", later()),
+            Err(Error::Precondition {
+                code: "claim_not_live",
+                ..
+            })
+        ));
+        assert!(matches!(
+            release_claim(&db, &claim_id, "  ", later()),
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    /// A review's claim can be handed back too, and the attempt is not
+    /// counted: the attempt is over only when a verdict is written.
+    #[test]
+    fn a_review_claim_handed_back_keeps_its_attempt_number() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        work_to_done(&db, "t-1");
+        let (review_id, claim_id) = claim_review(&db, "t-1");
+        let attempt_of = |id: &str| -> i64 {
+            db.with_conn(|conn| {
+                Ok(conn.query_row(
+                    "SELECT review_attempt FROM tasks WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap()
+        };
+        let attempt_before = attempt_of(&review_id);
+
+        let back = release_claim(&db, &claim_id, "shutdown", later()).unwrap();
+        assert_eq!(back.id, review_id);
+        assert_eq!(back.status, TaskStatus::Ready);
+        assert!(back.review_verdict.is_none());
+        assert_eq!(attempt_of(&review_id), attempt_before);
+
+        // The same review is claimed again and answered as usual.
+        let (again, claim_id) = claim_review(&db, "t-1");
+        assert_eq!(again, review_id);
+        review_report(
+            &db,
+            &claim_id,
+            "abc1234",
+            ReviewVerdict::Approve,
+            "read it",
+            later(),
+        )
+        .unwrap();
+        assert_eq!(get(&db, "t-1").unwrap().status, TaskStatus::Approved);
     }
 }

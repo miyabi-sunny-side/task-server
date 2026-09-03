@@ -60,6 +60,7 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(http::healthz))
         .route("/worker/claim", post(http::worker_claim))
+        .route("/worker/claim/release", post(http::worker_claim_release))
         .route("/worker/report", post(http::worker_report))
         .route("/worker/review-report", post(http::worker_review_report))
         // Same domain layer, second transport. Both MCP faces share the worker
