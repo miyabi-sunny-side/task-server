@@ -533,6 +533,7 @@ pub fn create(db: &Db, new: &NewTask, now: OffsetDateTime) -> Result<Task, Error
                 stamp,
             ],
         )?;
+        promote_if_dependency_landed(tx, &new.id, &stamp)?;
         read(tx, &new.id)
     })
 }
@@ -634,24 +635,60 @@ fn promote_dependants(tx: &Connection, landed_id: &str, stamp: &str) -> Result<(
         &[&landed_id],
     )?;
     for task in waiting {
-        match check_catalogued(tx, &task) {
-            Ok(()) => {
-                tx.execute(
-                    "UPDATE tasks SET status = 'ready', updated_at = ?2 WHERE id = ?1",
-                    rusqlite::params![task.id, stamp],
-                )?;
-            }
-            Err(refusal) => {
-                tx.execute(
-                    "UPDATE tasks SET verification = ?2, updated_at = ?3 WHERE id = ?1",
-                    rusqlite::params![
-                        task.id,
-                        format!("not promoted when {landed_id} landed: {refusal}"),
-                        stamp
-                    ],
-                )?;
-            }
+        promote_draft(tx, &task, &format!("when {landed_id} landed"), stamp)?;
+    }
+    Ok(())
+}
+
+/// Promote one `draft` whose dependency has landed, through the same gate a
+/// pressed `ready` goes through. A refusal leaves it `draft` and writes the
+/// reason on `verification`, prefixed with `occasion` (why promotion was tried).
+fn promote_draft(tx: &Connection, task: &Task, occasion: &str, stamp: &str) -> Result<(), Error> {
+    match check_catalogued(tx, task) {
+        Ok(()) => {
+            tx.execute(
+                "UPDATE tasks SET status = 'ready', updated_at = ?2 WHERE id = ?1",
+                rusqlite::params![task.id, stamp],
+            )?;
         }
+        Err(refusal) => {
+            tx.execute(
+                "UPDATE tasks SET verification = ?2, updated_at = ?3 WHERE id = ?1",
+                rusqlite::params![
+                    task.id,
+                    format!("not promoted {occasion}: {refusal}"),
+                    stamp
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// A `draft` that was just pointed at a dependency which has already landed is
+/// promoted now: the landing that would have promoted it is in the past, so
+/// waiting for it would wait for ever. Anything else — no dependency, a
+/// dependency still open, a task that is not `draft` — is left alone.
+fn promote_if_dependency_landed(tx: &Connection, id: &str, stamp: &str) -> Result<(), Error> {
+    let task = read(tx, id)?;
+    if task.status != TaskStatus::Draft {
+        return Ok(());
+    }
+    let Some(dependency) = task.depends_on.as_deref() else {
+        return Ok(());
+    };
+    let landed = match read(tx, dependency) {
+        Ok(target) => has_landed(target.status),
+        Err(Error::NotFound) => false,
+        Err(other) => return Err(other),
+    };
+    if landed {
+        promote_draft(
+            tx,
+            &task,
+            &format!("when depends_on was set to {dependency}, which had already landed"),
+            stamp,
+        )?;
     }
     Ok(())
 }
@@ -930,6 +967,9 @@ pub fn update(db: &Db, id: &str, patch: &TaskPatch, now: OffsetDateTime) -> Resu
                 stamp,
             ],
         )?;
+        if patch.depends_on.is_some() {
+            promote_if_dependency_landed(tx, id, &stamp)?;
+        }
         read(tx, id)
     })
 }
@@ -3219,11 +3259,12 @@ mod tests {
         ALL_STATUSES, Check, NewTask, Releasable, ReleaseLevel, ReportOutcome, ReviewVerdict,
         ReworkReason, StuckReason, StuckThresholds, Task, TaskKind, TaskPatch, TaskStatus,
         available_transitions, can_transition, claim, closed_moment, create, delete,
-        dependency_status, get, issue_merge, issue_release, issue_review, latest_review, list,
-        list_active, list_by_status, list_closed, list_done, merge_task_id, mergeable,
-        offered_transitions, pending_merges, pending_releases, pending_reviews, releasable,
-        release_claim, release_task_id, report, review_report, review_task_id, rework_task_id,
-        set_status, set_status_by_operator, stuck, sweep_called_off, unreviewed, update,
+        dependency_status, get, has_landed, issue_merge, issue_release, issue_review,
+        latest_review, list, list_active, list_by_status, list_closed, list_done, merge_task_id,
+        mergeable, offered_transitions, pending_merges, pending_releases, pending_reviews,
+        releasable, release_claim, release_task_id, report, review_report, review_task_id,
+        rework_task_id, set_status, set_status_by_operator, stuck, sweep_called_off, unreviewed,
+        update,
     };
     use crate::clock::format_z;
     use crate::db::Db;
@@ -8249,5 +8290,79 @@ mod tests {
             "released work is never swept"
         );
         assert!(sweep_called_off(&db, at, 30).unwrap().is_empty());
+    }
+
+    /// A draft pointed at work that already landed is promoted on the spot; the
+    /// landing that would have promoted it is in the past. An open dependency
+    /// leaves it draft; an uncatalogued product leaves it draft with the reason.
+    #[test]
+    fn a_dependency_that_already_landed_promotes_the_draft_at_once() {
+        let db = db_with_product();
+        let landed = merge_waiting_for(&db, "t-landed", "a/b");
+        merge_into(&db, &landed.id, TaskStatus::Done);
+        assert!(has_landed(get(&db, "t-landed").unwrap().status));
+
+        // At creation.
+        let created = dependent(&db, "t-new", "t-landed");
+        assert_eq!(
+            created.status,
+            TaskStatus::Ready,
+            "created against landed work"
+        );
+
+        // By PATCH on an existing draft.
+        create(&db, &new_task("t-later", TaskKind::Normal, 0), now()).unwrap();
+        let patched = update(
+            &db,
+            "t-later",
+            &TaskPatch {
+                depends_on: Some(Some("t-landed".into())),
+                ..TaskPatch::default()
+            },
+            later(),
+        )
+        .unwrap();
+        assert_eq!(patched.status, TaskStatus::Ready);
+
+        // An open dependency still waits.
+        create(&db, &new_task("t-open", TaskKind::Normal, 0), now()).unwrap();
+        let waiting = dependent(&db, "t-waits", "t-open");
+        assert_eq!(waiting.status, TaskStatus::Draft);
+        assert!(waiting.verification.is_none());
+
+        // The catalogue gate still applies: draft, with the reason written down.
+        let refused = create(
+            &db,
+            &NewTask {
+                product_id: Some("nobody/knows".into()),
+                depends_on: Some("t-landed".into()),
+                ..new_task("t-unknown", TaskKind::Normal, 0)
+            },
+            now(),
+        )
+        .unwrap();
+        assert_eq!(refused.status, TaskStatus::Draft);
+        let reason = refused.verification.expect("the reason is written");
+        assert!(
+            reason.contains("not promoted when depends_on was set to t-landed")
+                && reason.contains("nobody/knows"),
+            "{reason}"
+        );
+
+        // A task that is not draft is left where it is.
+        create(&db, &new_task("t-going", TaskKind::Normal, 0), now()).unwrap();
+        set_status(&db, "t-going", TaskStatus::Ready, now()).unwrap();
+        set_status(&db, "t-going", TaskStatus::Blocked, now()).unwrap();
+        let blocked = update(
+            &db,
+            "t-going",
+            &TaskPatch {
+                depends_on: Some(Some("t-landed".into())),
+                ..TaskPatch::default()
+            },
+            later(),
+        )
+        .unwrap();
+        assert_eq!(blocked.status, TaskStatus::Blocked);
     }
 }

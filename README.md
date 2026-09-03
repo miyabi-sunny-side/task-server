@@ -265,6 +265,30 @@ deployment's catalogue authority.
   reason. Returning a server path would not help: the clone is missing from the
   worker's machine either way.
 
+## Dependencies (`depends_on`)
+
+A task may name one other task it waits for: `depends_on` on `POST /api/tasks`,
+`PATCH /api/tasks/{id}` and the MCP `task_create` / `task_update`. While the
+dependency has not landed (`merged` or `released`), the dependant cannot be
+pressed to `ready` — the status route and `task_set_status` answer 409
+`dependency_pending` — and its card carries the dependency's status as
+`dependency_status`. The landing promotes every `draft` that waited for it,
+through the same gate a pressed `ready` goes through; a draft the gate refuses
+(product not catalogued, no product) stays `draft` with the reason on
+`verification`.
+
+**A draft pointed at work that has already landed is promoted at once.** Filing
+a task after its dependency shipped, or re-linking a chain onto a landed task,
+is ordinary; the landing that would have promoted it is in the past, so the
+server promotes on the spot — at `POST /api/tasks` or when `PATCH` sets
+`depends_on` — under the same gate and with the same `verification` note when
+refused. A task that is not `draft` is left where it is.
+
+A dependency that could never land is refused when set: the task itself, an
+unknown task, a `cancelled` or `dropped` task, or a chain that leads back. When
+a dependency is later called off, its dependants are moved to `blocked` with the
+reason. Clearing `depends_on` (`null`) is the way to skip the order.
+
 ## The product catalogue
 
 The `products` table is the register of product identity. Anything that names a
