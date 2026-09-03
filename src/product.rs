@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use rusqlite::{Connection, Row};
 use serde::{Deserialize, Serialize};
@@ -53,6 +54,11 @@ pub struct Archived {
 pub struct ReconcileReport {
     pub inserted: usize,
     pub updated: usize,
+    /// The ids behind the two counts, in the order the walk listed them. Taken
+    /// inside the same transaction as the writes, so they name exactly what was
+    /// written — a `PUT` racing the walk cannot make them drift.
+    pub inserted_ids: Vec<String>,
+    pub updated_ids: Vec<String>,
     /// Rows that matched in every field, and so were not written at all.
     pub unchanged: usize,
     /// Products that left the tree. The rows stay; the mark goes on.
@@ -125,11 +131,13 @@ pub fn reconcile(
                         report.unarchived.push(product.id.clone());
                     } else {
                         report.updated += 1;
+                        report.updated_ids.push(product.id.clone());
                     }
                 }
                 None => {
                     write(tx, product, &stamp)?;
                     report.inserted += 1;
+                    report.inserted_ids.push(product.id.clone());
                 }
             }
         }
@@ -645,4 +653,53 @@ mod tests {
         empty.repository = "  ".into();
         assert!(matches!(upsert(&db, &empty, now), Err(Error::Invalid(_))));
     }
+}
+
+/// What one walk of the project tree changed, by id, plus what it skipped.
+///
+/// The same walk the startup runs, callable while the server is up
+/// (`POST /api/products/rescan`, MCP `product_rescan`), so a new clone joins the
+/// catalogue without a restart.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct Derived {
+    pub inserted: Vec<String>,
+    pub updated: Vec<String>,
+    pub unchanged: usize,
+    pub archived: Vec<String>,
+    pub unarchived: Vec<String>,
+    /// The walk found no products, so nothing was archived (see [`reconcile`]).
+    pub skipped_archive_all: bool,
+    /// Entries of the tree that are not products, by reason.
+    pub skipped: BTreeMap<String, usize>,
+    /// Products whose `releases` could not be read and kept their previous value.
+    pub releases_unknown: Vec<String>,
+}
+
+/// Walk `root` and make the catalogue equal it. A `releases` flag the walk could
+/// not read keeps the value the catalogue already holds.
+///
+/// # Errors
+/// The walk failing (an unreadable root stops here; nothing is written), or a
+/// database error.
+pub fn derive_from_tree(db: &Db, root: &Path, now: OffsetDateTime) -> Result<Derived, Error> {
+    let scanned = crate::scan::scan(root)?;
+    let skipped = scanned
+        .skipped_by_reason()
+        .into_iter()
+        .map(|(reason, count)| (reason.to_owned(), count))
+        .collect();
+    let releases_unknown = scanned.releases_unknown.clone();
+    let scanned =
+        scanned.with_previous_releases(|id| get(db, id).ok().map(|stored| stored.releases));
+    let report = reconcile(db, &scanned.products, now)?;
+    Ok(Derived {
+        inserted: report.inserted_ids,
+        updated: report.updated_ids,
+        unchanged: report.unchanged,
+        archived: report.archived.into_iter().map(|a| a.id).collect(),
+        unarchived: report.unarchived,
+        skipped_archive_all: report.skipped_archive_all,
+        skipped,
+        releases_unknown,
+    })
 }

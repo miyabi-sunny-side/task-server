@@ -341,8 +341,10 @@ async fn catalogue(router: &Router, id: &str) {
     assert_eq!(status, StatusCode::OK, "cataloguing {id}");
 }
 
-const ADMIN_TOOLS: [&str; 7] = [
+const ADMIN_TOOLS: [&str; 9] = [
     "product_list",
+    "product_register",
+    "product_rescan",
     "task_create",
     "task_delete",
     "task_get",
@@ -1601,4 +1603,65 @@ async fn task_delete_removes_only_work_that_is_over() {
     let gone = admin.call("task_get", json!({ "id": "t-1" })).await;
     assert_eq!(gone["isError"], json!(true));
     assert_eq!(gone["structuredContent"]["code"], "not_found");
+}
+
+/// `product_register` writes a curated row; `product_rescan` without a tree is
+/// refused with the code the route uses, and with a tree it walks and answers ids.
+#[tokio::test]
+async fn products_are_registered_and_rescanned_over_mcp() {
+    let (_dir, state) = file_backed_state();
+    let router = task_server::app(state);
+    let mut admin = McpClient::new(&router, "/mcp", STALE_MCP_CAPABILITY);
+    admin.initialize().await;
+
+    let registered = admin
+        .call(
+            "product_register",
+            json!({"id": "sunny-side/hand", "repository": "git@github.com:x/hand.git", "releases": false}),
+        )
+        .await;
+    assert_eq!(registered["isError"], json!(false), "{registered}");
+    assert_eq!(
+        registered["structuredContent"]["product"]["id"],
+        "sunny-side/hand"
+    );
+    assert_eq!(
+        registered["structuredContent"]["product"]["releases"],
+        false
+    );
+    let listed = admin.call("product_list", json!({})).await;
+    assert!(
+        listed["structuredContent"]["products"]
+            .to_string()
+            .contains("sunny-side/hand")
+    );
+
+    let refused = admin.call("product_rescan", json!({})).await;
+    assert_eq!(refused["isError"], json!(true), "{refused}");
+    assert_eq!(
+        refused["structuredContent"]["code"],
+        "catalogue_not_derived"
+    );
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("projects");
+    let clone = root.join("sunny-side/scanned");
+    std::fs::create_dir_all(clone.join(".git/objects")).expect("objects");
+    std::fs::create_dir_all(clone.join(".git/refs")).expect("refs");
+    std::fs::write(clone.join(".git/HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+    std::fs::write(
+        clone.join(".git/config"),
+        "[remote \"origin\"]\n\turl = git@github.com:x/scanned.git\n",
+    )
+    .expect("config");
+    let derived = task_server::app(AppState::for_test().with_projects_dir(&root));
+    let mut admin = McpClient::new(&derived, "/mcp", STALE_MCP_CAPABILITY);
+    admin.initialize().await;
+    let rescanned = admin.call("product_rescan", json!({})).await;
+    assert_eq!(rescanned["isError"], json!(false), "{rescanned}");
+    assert_eq!(rescanned["structuredContent"]["walked"], true);
+    assert_eq!(
+        rescanned["structuredContent"]["inserted"],
+        json!(["sunny-side/scanned"])
+    );
 }

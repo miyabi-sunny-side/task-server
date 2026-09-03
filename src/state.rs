@@ -1,6 +1,6 @@
 use std::env;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::clock::{Clock, SystemClock};
 use crate::db::Db;
@@ -8,6 +8,13 @@ use crate::error::Error;
 use crate::task::StuckThresholds;
 
 pub const DEFAULT_CLAIM_TTL_SECS: u64 = 3600;
+
+/// The last rescan and when it finished. Held under one mutex so two rescans
+/// never walk at once, and a caller that queued behind a walk gets its result.
+#[derive(Debug, Default)]
+pub struct RescanGate {
+    pub finished: Option<(std::time::Instant, crate::product::Derived)>,
+}
 /// How many days a run keeps its stdout / stderr tails before the startup sweep
 /// blanks them. Every other field of a run is kept for good.
 pub const DEFAULT_RUNS_RETENTION_DAYS: u64 = 90;
@@ -31,6 +38,13 @@ pub struct AppState {
     /// Days a called-off task stays before it is deleted
     /// (`CALLED_OFF_RETENTION_DAYS`).
     pub called_off_retention_days: u64,
+    /// The project tree the catalogue is derived from (`APP_PROJECTS_DIR`), when
+    /// one is configured. `None` means the catalogue is curated over the API.
+    pub projects_dir: Option<PathBuf>,
+    /// Serialises rescans and remembers when the last one finished, so a
+    /// request that arrived while one was running takes that result instead of
+    /// walking again.
+    pub rescan: Arc<Mutex<RescanGate>>,
     pub clock: Arc<dyn Clock>,
 }
 
@@ -46,6 +60,8 @@ impl AppState {
             stuck: StuckThresholds::default(),
             runs_retention_days: DEFAULT_RUNS_RETENTION_DAYS,
             called_off_retention_days: DEFAULT_CALLED_OFF_RETENTION_DAYS,
+            projects_dir: None,
+            rescan: Arc::new(Mutex::new(RescanGate::default())),
             clock: Arc::new(SystemClock),
         }
     }
@@ -101,6 +117,9 @@ impl AppState {
             release_secs: secs("APP_STUCK_RELEASE_SECS", defaults.release_secs)?,
         };
         let runs_retention_days = secs("RUNS_RETENTION_DAYS", DEFAULT_RUNS_RETENTION_DAYS)?;
+        let projects_dir = get("APP_PROJECTS_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
         let called_off_retention_days = secs(
             "CALLED_OFF_RETENTION_DAYS",
             DEFAULT_CALLED_OFF_RETENTION_DAYS,
@@ -117,8 +136,16 @@ impl AppState {
             stuck,
             runs_retention_days,
             called_off_retention_days,
+            projects_dir,
+            rescan: Arc::new(Mutex::new(RescanGate::default())),
             clock: Arc::new(SystemClock),
         })
+    }
+
+    #[must_use]
+    pub fn with_projects_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.projects_dir = Some(dir.into());
+        self
     }
 
     #[must_use]

@@ -3728,3 +3728,160 @@ async fn closed_work_is_listed_together_and_deleted_only_once_over() {
     let (status, _) = send(&state, human("DELETE", "/api/tasks/t-fin", &json!({}))).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "deleting twice is not found");
 }
+
+// --- product rescan ---
+
+/// A clone put in the tree while the server runs joins the catalogue on rescan;
+/// one that left is archived; the answer names them. Without a tree the route
+/// answers 409 `catalogue_not_derived`. Two rescans at once walk once.
+#[tokio::test]
+async fn a_rescan_walks_the_tree_now_and_names_what_changed() {
+    let (dir, db) = {
+        let dir = TempDir::new().expect("tempdir");
+        let db = Arc::new(Db::open(dir.path().join("task-server.db")).expect("open"));
+        (dir, db)
+    };
+    let root = dir.path().join("projects");
+    clone_fixture(&root, "sunny-side/one");
+    let state = state_for(&db).with_projects_dir(&root);
+
+    let (status, first) = send(&state, human("POST", "/api/products/rescan", &json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["walked"], true);
+    assert_eq!(first["inserted"], json!(["sunny-side/one"]));
+    assert_eq!(first["archived"], json!([]));
+
+    clone_fixture(&root, "sunny-side/two");
+    std::fs::remove_dir_all(root.join("sunny-side/one")).expect("remove clone");
+    let (status, second) = send(&state, human("POST", "/api/products/rescan", &json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["inserted"], json!(["sunny-side/two"]));
+    assert_eq!(second["updated"], json!([]));
+    assert_eq!(second["archived"], json!(["sunny-side/one"]));
+
+    let (_, products) = send(&state, read("/api/products")).await;
+    let archived: Vec<(&str, bool)> = products
+        .as_array()
+        .expect("products")
+        .iter()
+        .map(|p| (p["id"].as_str().unwrap(), p["archived"].as_bool().unwrap()))
+        .collect();
+    assert!(
+        archived.contains(&("sunny-side/one", true))
+            && archived.contains(&("sunny-side/two", false)),
+        "{products}"
+    );
+
+    // A changed README is an update; a clone that comes back with a changed
+    // README is unarchived, and not listed as updated as well.
+    std::fs::write(root.join("sunny-side/two/README.md"), "# two, renamed\n").expect("README");
+    clone_fixture(&root, "sunny-side/one");
+    std::fs::write(root.join("sunny-side/one/README.md"), "# one, back\n").expect("README");
+    let (status, third) = send(&state, human("POST", "/api/products/rescan", &json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{third}");
+    assert_eq!(third["inserted"], json!([]));
+    assert_eq!(third["updated"], json!(["sunny-side/two"]));
+    assert_eq!(third["unarchived"], json!(["sunny-side/one"]));
+    assert_eq!(third["archived"], json!([]));
+    let (_, one) = send(&state, read("/api/products/sunny-side/one")).await;
+    assert_eq!(one["description"], "one, back");
+    assert_eq!(one["archived"], false);
+}
+
+/// Rescans need identity and CSRF, are serialised so two overlapping requests
+/// walk the tree once, and are refused with `catalogue_not_derived` when no
+/// tree is configured.
+#[tokio::test]
+async fn rescans_are_serialised_and_refused_without_a_tree() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = Arc::new(Db::open(dir.path().join("task-server.db")).expect("open"));
+    let root = dir.path().join("projects");
+    clone_fixture(&root, "sunny-side/one");
+    let state = state_for(&db).with_projects_dir(&root);
+
+    // Auth: identity + CSRF like every other human mutation.
+    let (status, _) = send(
+        &state,
+        request("POST", "/api/products/rescan")
+            .header("x-auth-user", USER)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Two at once: the second arrives while the first walks and takes its
+    // result, so the tree is walked once. The walk is injected and made slow so
+    // the overlap is certain rather than a matter of scheduling.
+    let slow = Arc::new(state.clone());
+    let walks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let first = {
+        let (state, walks) = (Arc::clone(&slow), Arc::clone(&walks));
+        std::thread::spawn(move || {
+            task_server::http::rescan_with(&state, || {
+                walks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                Ok(task_server::product::Derived::default())
+            })
+            .expect("first rescan")
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let second = {
+        let (state, walks) = (Arc::clone(&slow), Arc::clone(&walks));
+        std::thread::spawn(move || {
+            task_server::http::rescan_with(&state, || {
+                walks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(task_server::product::Derived::default())
+            })
+            .expect("second rescan")
+        })
+    };
+    let (first, second) = (
+        first.join().expect("thread"),
+        second.join().expect("thread"),
+    );
+    assert!(first.walked, "the first request walks");
+    assert!(
+        !second.walked,
+        "the second arrived during the walk and took its result"
+    );
+    assert_eq!(
+        walks.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one walk for two requests"
+    );
+    // A request that arrives after the walk finished walks again.
+    let third = task_server::http::rescan_with(&state, || {
+        walks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(task_server::product::Derived::default())
+    })
+    .expect("third rescan");
+    assert!(third.walked);
+    assert_eq!(walks.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    // No tree: nothing to rescan.
+    let curated = AppState::for_test();
+    let (status, refused) = send(&curated, human("POST", "/api/products/rescan", &json!({}))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["code"], "catalogue_not_derived");
+}
+
+/// A minimal clone the walk accepts: `.git` with objects, refs, HEAD and an
+/// `origin` remote, plus a README heading for the description.
+fn clone_fixture(root: &std::path::Path, id: &str) {
+    let dir = root.join(id);
+    let git = dir.join(".git");
+    std::fs::create_dir_all(git.join("objects")).expect("objects");
+    std::fs::create_dir_all(git.join("refs")).expect("refs");
+    std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+    std::fs::write(
+        git.join("config"),
+        format!(
+            "[remote \"origin\"]\n\turl = git@github.com:example/{}.git\n",
+            id.replace('/', "-")
+        ),
+    )
+    .expect("config");
+    std::fs::write(dir.join("README.md"), format!("# {id}\n")).expect("README");
+}

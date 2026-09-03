@@ -588,6 +588,79 @@ pub async fn api_put_product(
     Ok(Json(stored))
 }
 
+/// The result of a rescan, with whether this request walked or took the result
+/// of a walk that finished after it arrived.
+#[derive(Debug, Serialize)]
+pub struct RescanAnswer {
+    pub walked: bool,
+    #[serde(flatten)]
+    pub derived: product::Derived,
+}
+
+/// Walk the project tree now and make the catalogue equal it. Only with a
+/// derived catalogue; a curated one answers 409 `catalogue_not_derived`.
+/// Rescans are serialised, and a request that arrived while another was walking
+/// is answered with that walk's result rather than walking again.
+pub async fn api_rescan_products(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<RescanAnswer>, Error> {
+    require_human_mutation(&headers, &state)?;
+    Ok(Json(rescan(&state)?))
+}
+
+/// The rescan itself, shared by the route and the MCP tool.
+///
+/// # Errors
+/// `Error::Precondition` (`catalogue_not_derived`) without a tree; the walk's
+/// or the database's error otherwise.
+pub fn rescan(state: &AppState) -> Result<RescanAnswer, Error> {
+    let Some(root) = state.projects_dir.clone() else {
+        return Err(Error::Precondition {
+            code: "catalogue_not_derived",
+            message: "APP_PROJECTS_DIR is not set, so the catalogue is curated over the API and \
+                      there is no project tree to rescan"
+                .into(),
+        });
+    };
+    rescan_with(state, || {
+        product::derive_from_tree(&state.db, &root, state.clock.now())
+    })
+}
+
+/// The serialisation around a walk, with the walk injected so it can be measured.
+///
+/// Requests queue on the gate. One that arrived while another was walking takes
+/// that walk's result (`walked: false`): the tree it would have read is the tree
+/// that walk read, at or after the moment it asked.
+///
+/// # Errors
+/// Whatever `walk` returns.
+pub fn rescan_with(
+    state: &AppState,
+    walk: impl FnOnce() -> Result<product::Derived, Error>,
+) -> Result<RescanAnswer, Error> {
+    let arrived = std::time::Instant::now();
+    let mut gate = state
+        .rescan
+        .lock()
+        .map_err(|_| Error::Io("rescan lock poisoned".into()))?;
+    if let Some((finished, derived)) = &gate.finished
+        && *finished >= arrived
+    {
+        return Ok(RescanAnswer {
+            walked: false,
+            derived: derived.clone(),
+        });
+    }
+    let derived = walk()?;
+    gate.finished = Some((std::time::Instant::now(), derived.clone()));
+    Ok(RescanAnswer {
+        walked: true,
+        derived,
+    })
+}
+
 pub async fn worker_claim(
     State(state): State<AppState>,
     Json(body): Json<ClaimBody>,
