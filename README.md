@@ -37,9 +37,11 @@ creates the database (and its parent directory) on first start.
 | GET | `/api/session` | the caller's identity and CSRF token |
 | GET | `/api/tasks` | task summaries; `released` is hidden unless `?status=` asks for it |
 | POST | `/api/tasks` | create a task in `draft` (optional `release_level`: `patch` by default, `minor`, `major`), returns 201 |
-| GET | `/api/tasks/{id}` | Task Card: the task plus `available_transitions` and `latest_review` |
+| GET | `/api/tasks/{id}` | Task Card: the task plus `available_transitions`, `latest_review` and `runs_count` |
 | PATCH | `/api/tasks/{id}` | edit `title`, `body`, `product_id`, `priority`, `branch`, `release_level` |
 | POST | `/api/tasks/{id}/status` | move the task to `{"status": "..."}`; `approved`, `merged`, and `released` are refused |
+| POST | `/api/runs` | the rescue leaves a note on a task: `{task_id, note}`; the source is `rescue` whatever the body says. 201 with the row |
+| GET | `/api/runs?since=<id>&limit=<n>&task_id=<id>` | the haystack from `id > since` upward, at most `limit` (default 100, max 500); `next` is the `since` of the following page while one exists |
 | GET | `/api/control` | `{ mergeable, pending_merges, pending_releases, pending_reviews, unreviewed, releasable, stuck }`; each `pending_merges` and `pending_releases` row adds `verification`, the reason a blocked one stopped, and a release row its `release_level`; `stuck` rows are `{task_id, kind, status, since, reason}` with `reason` one of `unclaimed`, `lease-expired`, `no-subtask`, `subtask-unclaimed`, `blocked`, `release-stalled` (thresholds: `APP_STUCK_*_SECS`), oldest first within each reason |
 | POST | `/api/reviews` | reconciliation: `{"task_id": "..."}` issues a review task by hand, returns 201 |
 | POST | `/api/merges` | reconciliation: `{"task_id": "..."}` issues a merge task by hand, returns 201 |
@@ -49,6 +51,7 @@ creates the database (and its parent directory) on first start.
 | PUT | `/api/products/{id}` | create or replace a product |
 | POST | `/worker/claim` | lease the next ready task; optional `kinds` routes by role and optional `idempotency_key` makes an uncertain response retryable |
 | POST | `/worker/claim/release` | `{"claim_id": "...", "reason": "..."}` hands a live claim back: the task returns to `ready` with the reason on `verification`; a claim that is not live is 409 `claim_not_live` |
+| POST | `/worker/runs` | append one run to the haystack; idempotent on `(claim_id, attempt, source)` — 201 with the row when written, 200 with the row already there on a resend |
 | POST | `/worker/report` | report a commit, and `checks`, against a lease; `"outcome": "blocked"` records why the work could not be finished |
 | POST | `/worker/review-report` | answer a claimed review with a verdict and findings |
 | POST | `/mcp` | MCP over Streamable HTTP: the catalogue and the task lifecycle |
@@ -962,6 +965,7 @@ corrections instead of moving an existing release tag.
 | `APP_DB_PATH` | `data/task-server.db` | SQLite database, for the server and for `import-markdown` alike. Created with its parent directory on first use. |
 | `APP_BIND_ADDR` | `127.0.0.1:3000` | HTTP listener. Keep loopback unless you are sure you want otherwise. |
 | `CLAIM_TTL_SECS` | `3600` | Lease lifetime for a claim. |
+| `RUNS_RETENTION_DAYS` | `90` | Days a run keeps its `stdout_tail` / `stderr_tail` before the startup sweep blanks them. Every other field of a run is kept for good. |
 | `APP_STUCK_UNCLAIMED_SECS` | `900` | How long a `ready` task (or an issued review / merge / release / rework) may wait unclaimed before `GET /api/control` lists it in `stuck`. |
 | `APP_STUCK_SUBTASK_SECS` | `300` | How long `done` may go without a review, `approved` without a merge, or `merged` without a release before it is `stuck` (`no-subtask`). |
 | `APP_STUCK_RELEASE_SECS` | `1800` | How long an `instant:release` may stay `wip` before it is `stuck` (`release-stalled`). |
@@ -1012,3 +1016,21 @@ back to `client/dist/index.html` so the client router can restore a deep link.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## The haystack (`runs`)
+
+Every run of an agent, every rescue note and every librarian watermark is one
+row in `runs`, appended and never edited. A row is
+`{id, at, source, worker, task_id, kind, claim_id, attempt, profile, model, skill_sha,
+outcome, checks, commit_sha, diff_stat, agent_exit, agent_secs, stdout_tail, stderr_tail,
+note, truncated}`; `source` is `worker`, `rescue` or `librarian`, and each source has its
+own required fields (`worker`: `task_id`, `claim_id`, `outcome`; `rescue`: `task_id`,
+`note`; `librarian`: `note`). The two tails and the note are cut at 8 KB and the row
+says so with `truncated: true`.
+
+Workers append over `POST /worker/runs` (the worker boundary), the rescue over
+`POST /api/runs` (identity and CSRF), and a librarian reads forward from its
+watermark with `GET /api/runs?since=`. Nothing is deleted; once a day's worth of
+starts has passed `RUNS_RETENTION_DAYS`, the startup sweep blanks the two output
+tails and keeps the rest. There is no index to maintain and no review to pass: the
+haystack is the raw material, the summary lives in the knowledge repository.

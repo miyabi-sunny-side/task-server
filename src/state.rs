@@ -8,6 +8,9 @@ use crate::error::Error;
 use crate::task::StuckThresholds;
 
 pub const DEFAULT_CLAIM_TTL_SECS: u64 = 3600;
+/// How many days a run keeps its stdout / stderr tails before the startup sweep
+/// blanks them. Every other field of a run is kept for good.
+pub const DEFAULT_RUNS_RETENTION_DAYS: u64 = 90;
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3000";
 pub const DEFAULT_DB_PATH: &str = "data/task-server.db";
 
@@ -20,6 +23,8 @@ pub struct AppState {
     pub claim_ttl_secs: u64,
     /// How long work may wait before `GET /api/control` lists it as stuck.
     pub stuck: StuckThresholds,
+    /// Days a run keeps its output tails (`RUNS_RETENTION_DAYS`).
+    pub runs_retention_days: u64,
     pub clock: Arc<dyn Clock>,
 }
 
@@ -33,6 +38,7 @@ impl AppState {
             dev_identity: None,
             claim_ttl_secs: DEFAULT_CLAIM_TTL_SECS,
             stuck: StuckThresholds::default(),
+            runs_retention_days: DEFAULT_RUNS_RETENTION_DAYS,
             clock: Arc::new(SystemClock),
         }
     }
@@ -87,6 +93,7 @@ impl AppState {
             subtask_secs: secs("APP_STUCK_SUBTASK_SECS", defaults.subtask_secs)?,
             release_secs: secs("APP_STUCK_RELEASE_SECS", defaults.release_secs)?,
         };
+        let runs_retention_days = secs("RUNS_RETENTION_DAYS", DEFAULT_RUNS_RETENTION_DAYS)?;
         // Opened last, so a fail-closed startup never creates a database file.
         let db_path = get("APP_DB_PATH").unwrap_or_else(|| DEFAULT_DB_PATH.to_owned());
         let db = Arc::new(Db::open(db_path)?);
@@ -97,6 +104,7 @@ impl AppState {
             dev_identity,
             claim_ttl_secs,
             stuck,
+            runs_retention_days,
             clock: Arc::new(SystemClock),
         })
     }
