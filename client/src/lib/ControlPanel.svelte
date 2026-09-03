@@ -26,6 +26,7 @@
   let unreviewed = $derived(plane?.unreviewed ?? []);
   let mergeable = $derived(plane?.mergeable ?? []);
   let releasable = $derived(plane?.releasable ?? []);
+  let stuck = $derived(plane?.stuck ?? []);
 
   let carrying = $derived(
     pendingReviews.length +
@@ -33,7 +34,8 @@
       pendingReleases.length +
       unreviewed.length +
       mergeable.length +
-      releasable.length,
+      releasable.length +
+      stuck.length,
   );
 
   // A readout holding nothing is not drawn, so a quiet pipeline says so in one
@@ -72,7 +74,7 @@
     {/if}
     <MergeTrains pending={pendingMerges} />
     <Releases pending={pendingReleases} />
-    <Reconciliation {unreviewed} {mergeable} {releasable} />
+    <Reconciliation {unreviewed} {mergeable} {releasable} {stuck} />
   {/if}
 </section>
 

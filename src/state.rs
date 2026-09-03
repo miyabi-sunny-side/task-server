@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::clock::{Clock, SystemClock};
 use crate::db::Db;
 use crate::error::Error;
+use crate::task::StuckThresholds;
 
 pub const DEFAULT_CLAIM_TTL_SECS: u64 = 3600;
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3000";
@@ -17,6 +18,8 @@ pub struct AppState {
     pub csrf_token: String,
     pub dev_identity: Option<String>,
     pub claim_ttl_secs: u64,
+    /// How long work may wait before `GET /api/control` lists it as stuck.
+    pub stuck: StuckThresholds,
     pub clock: Arc<dyn Clock>,
 }
 
@@ -29,6 +32,7 @@ impl AppState {
             csrf_token: "test-csrf".into(),
             dev_identity: None,
             claim_ttl_secs: DEFAULT_CLAIM_TTL_SECS,
+            stuck: StuckThresholds::default(),
             clock: Arc::new(SystemClock),
         }
     }
@@ -69,6 +73,20 @@ impl AppState {
                 .map_err(|_| Error::Invalid(format!("invalid CLAIM_TTL_SECS: {raw}")))?,
             None => DEFAULT_CLAIM_TTL_SECS,
         };
+        let secs = |name: &str, default: u64| -> Result<u64, Error> {
+            match get(name) {
+                Some(raw) => raw
+                    .parse()
+                    .map_err(|_| Error::Invalid(format!("invalid {name}: {raw}"))),
+                None => Ok(default),
+            }
+        };
+        let defaults = StuckThresholds::default();
+        let stuck = StuckThresholds {
+            unclaimed_secs: secs("APP_STUCK_UNCLAIMED_SECS", defaults.unclaimed_secs)?,
+            subtask_secs: secs("APP_STUCK_SUBTASK_SECS", defaults.subtask_secs)?,
+            release_secs: secs("APP_STUCK_RELEASE_SECS", defaults.release_secs)?,
+        };
         // Opened last, so a fail-closed startup never creates a database file.
         let db_path = get("APP_DB_PATH").unwrap_or_else(|| DEFAULT_DB_PATH.to_owned());
         let db = Arc::new(Db::open(db_path)?);
@@ -78,6 +96,7 @@ impl AppState {
             csrf_token,
             dev_identity,
             claim_ttl_secs,
+            stuck,
             clock: Arc::new(SystemClock),
         })
     }
@@ -97,6 +116,12 @@ impl AppState {
     #[must_use]
     pub fn with_ttl(mut self, secs: u64) -> Self {
         self.claim_ttl_secs = secs;
+        self
+    }
+
+    #[must_use]
+    pub fn with_stuck(mut self, thresholds: StuckThresholds) -> Self {
+        self.stuck = thresholds;
         self
     }
 

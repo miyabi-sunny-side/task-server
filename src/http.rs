@@ -10,7 +10,7 @@ use crate::product::{self, Product};
 use crate::state::AppState;
 use crate::task::{
     self, Check, NewTask, Releasable, ReleaseLevel, ReportOutcome, ReviewOutcome, ReviewVerdict,
-    Task, TaskKind, TaskPatch, TaskStatus,
+    Stuck, Task, TaskKind, TaskPatch, TaskStatus,
 };
 
 /// A row in the task list: enough to render a card in a list, no body.
@@ -223,6 +223,9 @@ pub struct ControlPlane {
     pub pending_reviews: Vec<TaskSummary>,
     pub unreviewed: Vec<TaskSummary>,
     pub releasable: Vec<Releasable>,
+    /// Work the control plane is holding past its threshold, with a fixed
+    /// reason each. Empty while everything moves.
+    pub stuck: Vec<Stuck>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -451,6 +454,7 @@ pub async fn api_control(
         pending_reviews: summaries(task::pending_reviews(&state.db)?),
         unreviewed: summaries(task::unreviewed(&state.db)?),
         releasable: task::releasable(&state.db)?,
+        stuck: task::stuck(&state.db, state.clock.now(), &state.stuck)?,
     }))
 }
 

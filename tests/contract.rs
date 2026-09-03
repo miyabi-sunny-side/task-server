@@ -3469,3 +3469,42 @@ async fn a_conflicted_merge_is_dropped_and_its_rework_lands_the_rebase() {
         "the finished rework is an ordinary row of the listing: {summaries}"
     );
 }
+
+/// The control plane names what waits too long, with a fixed reason, once the
+/// threshold is over — and nothing before. The rule is the server's clock, so a
+/// rescue reads rows instead of judging a listing.
+#[tokio::test]
+async fn control_lists_stuck_work_once_the_threshold_passes() {
+    let (_dir, state, clock) = clocked_state(60);
+    put_product(&state, "sunny-side/keeper", true).await;
+    create_task(
+        &state,
+        &json!({"id": "t-slow", "title": "slow", "product_id": "sunny-side/keeper"}),
+    )
+    .await;
+    set_status(&state, "t-slow", "ready").await;
+
+    let plane = control(&state).await;
+    assert_eq!(plane["stuck"], json!([]), "{plane}");
+
+    clock.advance_secs(900);
+    let plane = control(&state).await;
+    let stuck = plane["stuck"].as_array().expect("stuck is a list");
+    assert_eq!(stuck.len(), 1, "{plane}");
+    assert_eq!(stuck[0]["task_id"], "t-slow");
+    assert_eq!(stuck[0]["kind"], "normal");
+    assert_eq!(stuck[0]["status"], "ready");
+    assert_eq!(stuck[0]["reason"], "unclaimed");
+    assert_eq!(stuck[0]["since"], "2026-08-15T10:00:00Z");
+    // Existing fields are untouched: additive only.
+    for key in [
+        "mergeable",
+        "pending_merges",
+        "pending_releases",
+        "pending_reviews",
+        "unreviewed",
+        "releasable",
+    ] {
+        assert!(plane.get(key).is_some(), "{key} missing: {plane}");
+    }
+}
