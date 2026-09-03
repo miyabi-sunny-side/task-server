@@ -525,8 +525,9 @@ counterpart to carry, so it earns no token pair.
   quiet pipeline is a state worth naming, not an empty box.
 
   A readout has no status heading over it, so **its cards wear the
-  neutral outline status badge** beside the product id; a status-group
-  card does not, because its heading already says it.
+  neutral outline status badge** beside the product id — the same badge
+  a status-group card wears as its last line, so a card reads the same
+  wherever it sits.
 
   **Review queue.** The pending `review` tasks, under the caption "review
   待ち". This is normal running: in a healthy pipeline the queue is
@@ -651,11 +652,18 @@ counterpart to carry, so it earns no token pair.
   headed by a label-type heading naming the status with its count pill
   beside it; under the heading, cards per the family recipe
   (surface-raised, 1px hairline, 8px radius, 10px padding) in a single
-  column with 8px gaps. A card links to its Task Card and shows the
-  task title (label) with the product id as a muted caption — the group
-  heading already carries the status, so the card does not repeat it.
-  Every card here is a `normal` task, so none carries a kind badge. The
-  list container keeps `data-state="loading|empty|error|success"`:
+  column with 8px gaps. A card links to its Task Card and **reads from
+  the forest to the tree to its state, top to bottom, in three lines**:
+  first the product id in body-sm on-surface text (not the muted
+  caption — it is the first thing read, not an afterthought), then the
+  title (label), wrapping onto further lines rather than being clipped
+  to one, then the neutral outline status badge. The heading groups;
+  the badge lets a single card be read on its own, and it keeps every
+  card on the page — group or readout — in one shape. A card whose
+  kind is not `normal` would add the kind badge after the status
+  badge, but every card here is a `normal` task, so in practice none
+  does. The card is one link and contains no other focusable element.
+  The list container keeps `data-state="loading|empty|error|success"`:
   - _loading:_ centered muted body-sm text with the accent spinner
     (1.5px-stroke circle, 1.1rem);
   - _empty:_ centered muted body-sm message;
@@ -663,13 +671,14 @@ counterpart to carry, so it earns no token pair.
   - _success:_ the groups.
 
 - **Detail page — Task Card:** sub-header (title only) over a content
-  column showing status (an outline badge — caption type, 1px border,
-  muted text; neutral chrome, not a data color), `commit_sha` and
-  `verification` as muted captions when present, body text (body, 1.6,
-  pre-line), and `available_transitions` as a row of default buttons,
-  one per reachable status. A task whose kind is not `normal`
-  (`instant:merge`, `review`) carries a second outline badge naming
-  that kind next to the status. The `ready` transition, when present,
+  column whose head reads in the same order as a list card: **the
+  product id first** (body-sm, on-surface), then a row of outline badges
+  (caption type, 1px border, muted text; neutral chrome, not a data
+  color) — the status, and for a task whose kind is not `normal`
+  (`instant:merge`, `review`) a second badge naming that kind. Below
+  the head, `commit_sha` and `verification` as muted captions when
+  present, body text (body, 1.6, pre-line), and `available_transitions`
+  as a row of default buttons, one per reachable status. The `ready` transition, when present,
   is the single primary (accent-filled) button — it is the human
   decision the screen exists for. After a successful transition the
   card reloads so status and buttons update. There is no
@@ -793,8 +802,11 @@ counterpart to carry, so it earns no token pair.
      buttons or links.
   9. A Task Card shows body, verification, commit_sha, status, and one
      control per available transition, with `ready` as the only primary
-     button when it is offered. After a successful POST the displayed
-     status and buttons match the reloaded card.
+     button when it is offered. Its head opens with the product id: in
+     document order the product precedes the status badge, and the kind
+     badge (when the kind is not `normal`) follows the status badge.
+     After a successful POST the displayed status and buttons match the
+     reloaded card.
   10. On the top page the content column's first element child is the
       control panel and the task list follows it. Each carries its own
       `data-state`; forcing the list request to fail leaves the panel at
@@ -881,12 +893,17 @@ counterpart to carry, so it earns no token pair.
       it exists in the review queue and in no status group; once it is no
       longer pending it leaves the top page entirely — no status group,
       no card, whatever its status. No status group ever contains a card
-      for an `instant:merge` task either, pending or finished. No status
-      group card carries a kind badge, because every card in a status
-      group is a `normal` task. Tabbing through any card — in a status
-      group, the review queue, a merge train, or the reconciliation
-      block — reaches exactly one focusable element, the card link
-      itself.
+      for an `instant:merge` task either, pending or finished. A status
+      group card reads product, then title, then state: in document
+      order its product id precedes its title and its status badge
+      follows the title, and the status badge is the card's only badge,
+      because every card in a status group is a `normal` task. The
+      product id is not clipped, and a title longer than the card wraps
+      (the card's height grows; `document.documentElement.scrollWidth`
+      stays within a 375px viewport). Tabbing through any card — in a
+      status group, the review queue, a merge train, or the
+      reconciliation block — reaches exactly one focusable element, the
+      card link itself.
   23. `approved` is a status the UI reads and never writes: on a `done`
       task's Task Card no transition button's text is `approved`, and
       across the top page and any open modal no control's text is

@@ -26,12 +26,17 @@
   let review = $derived(task.latest_review);
 </script>
 
-<p class="meta">
-  <span class="badge">{task.status}</span>
-  {#if kind}
-    <span class="badge">{kind}</span>
-  {/if}
-</p>
+<!-- The head reads in the same order as a list card (DESIGN.md, Detail
+     page): product first, then the state. The title is the page's h1 above. -->
+<div class="meta">
+  <p class="product">{task.product_id}</p>
+  <p class="badges">
+    <span class="badge">{task.status}</span>
+    {#if kind}
+      <span class="badge">{kind}</span>
+    {/if}
+  </p>
+</div>
 <p class="caption" data-field={commitField}>
   <span class="caption-label">{commitField}</span>
   {task.commit_sha ?? ""}
@@ -90,9 +95,23 @@
 <style lang="sass">
   .meta
     display: flex
+    flex-direction: column
+    gap: var(--sp-1)
+    margin: 0 0 var(--sp-3)
+
+  .product
+    margin: 0
+    font-size: var(--fs-sm)
+    line-height: 1.4
+    color: var(--c-on-surface)
+    overflow-wrap: anywhere
+
+  .badges
+    display: flex
+    flex-wrap: wrap
     align-items: center
     gap: var(--sp-2)
-    margin: 0 0 var(--sp-3)
+    margin: 0
 
   .caption
     margin: 0 0 var(--sp-2)

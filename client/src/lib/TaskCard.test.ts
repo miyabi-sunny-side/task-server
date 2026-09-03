@@ -72,6 +72,23 @@ describe("TaskCard", () => {
     expect(ontransition).toHaveBeenCalledTimes(2);
   });
 
+  it("opens its head with the product, then the status and kind badges", () => {
+    render(TaskCard, { props: { task: { ...FIXTURE, kind: "review" } } });
+
+    const meta = document.querySelector<HTMLElement>(".meta")!;
+    const product = meta.querySelector<HTMLElement>(".product")!;
+    expect(meta.firstElementChild).toBe(product);
+    expect(product.textContent?.trim()).toBe(FIXTURE.product_id);
+    const badges = [...meta.querySelectorAll<HTMLElement>(".badge")].map(
+      (badge) => badge.textContent?.trim(),
+    );
+    expect(badges).toEqual(["wip", "review"]);
+    expect(
+      product.compareDocumentPosition(meta.querySelector(".badge")!) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
   it("names any kind that is not normal in a badge, and leaves a normal task unmarked", () => {
     for (const kind of ["instant:merge", "review"]) {
       render(TaskCard, { props: { task: { ...FIXTURE, kind } } });

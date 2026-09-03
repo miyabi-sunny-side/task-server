@@ -183,6 +183,29 @@ describe("StatusTaskList", () => {
     ).not.toBeNull();
   });
 
+  it("reads a card forest to tree to state: product, then title, then the status badge", () => {
+    render(StatusTaskList, { props: { fetchState: "ready", items: ITEMS } });
+
+    const ready = groups().find((group) => group.dataset.status === "ready")!;
+    const card = ready.querySelector<HTMLElement>('a[href="/tasks/t-ready"]')!;
+    const product = card.querySelector<HTMLElement>(".product")!;
+    const title = card.querySelector<HTMLElement>(".name")!;
+    const status = card.querySelector<HTMLElement>(".badge")!;
+    expect(product.textContent?.trim()).toBe(PRODUCT);
+    expect(title.textContent?.trim()).toBe("task t-ready");
+    expect(status.textContent?.trim()).toBe("ready");
+    // DOM order is reading order: product before title, badge after title.
+    expect(
+      product.compareDocumentPosition(title) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      title.compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    // Every card in a status group is a normal task, so the status badge is
+    // the only badge it wears.
+    expect(card.querySelectorAll(".badge")).toHaveLength(1);
+  });
+
   it("gives a card exactly one focusable element, the link itself", () => {
     render(StatusTaskList, { props: { fetchState: "ready", items: ITEMS } });
 

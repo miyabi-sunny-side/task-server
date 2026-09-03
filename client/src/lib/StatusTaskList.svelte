@@ -85,16 +85,28 @@
         <ul class="cards">
           {#each group.items as item (item.id)}
             <li>
-              <a class="card" href={`/tasks/${item.id}`}>
-                <span class="name">{item.title}</span>
-                <span class="tail">
+              <!-- Forest to tree to state (DESIGN.md, Task list): the product
+                   first, so the reader knows whose task this is before the
+                   title; the title next, wrapping rather than clipping; the
+                   status badge last. Plain spans throughout — the card link is
+                   the only focus stop. -->
+              <a class="card stack" href={`/tasks/${item.id}`}>
+                <span class="head">
+                  <span class="product product-first">{item.product_id}</span>
                   {#if item.depends_on}
-                    <!-- Why a draft is still a draft, read off the list. -->
+                    <!-- Why a draft is still a draft, read off the list
+                         (DESIGN.md, Dependency): beside the product, muted. -->
                     <span class="product" data-depends-on={item.depends_on}
                       >← {item.depends_on}</span
                     >
                   {/if}
-                  <span class="product">{item.product_id}</span>
+                </span>
+                <span class="name">{item.title}</span>
+                <span class="tail">
+                  <span class="badge">{item.status}</span>
+                  {#if item.kind !== "normal"}
+                    <span class="badge">{item.kind}</span>
+                  {/if}
                 </span>
               </a>
             </li>
@@ -122,9 +134,32 @@
     font-weight: 500
     line-height: 1.2
 
+  // The family card recipe lays its children out in a row; this card reads
+  // top to bottom instead, so it stacks and lets the title wrap.
+  .stack
+    flex-direction: column
+    align-items: stretch
+    gap: var(--sp-1)
+
+  .stack .name
+    overflow-wrap: anywhere
+
+  .head
+    display: flex
+    flex-wrap: wrap
+    align-items: baseline
+    gap: var(--sp-2)
+
+  // The product is the first thing read, so it is body-colored and small
+  // rather than the muted caption the row recipe gives it.
+  .product-first
+    font-size: var(--fs-sm)
+    line-height: 1.4
+    color: var(--c-on-surface)
+
   .tail
     display: flex
-    flex-shrink: 0
+    flex-wrap: wrap
     align-items: baseline
     gap: var(--sp-2)
 </style>
