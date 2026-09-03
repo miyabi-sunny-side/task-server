@@ -316,7 +316,7 @@ impl Walk {
         let metadata = match self.bare_metadata(&dirs, &config)? {
             BareMetadata::NotBare => Metadata {
                 readme: self.read_within(&entry.path.join("README.md"))?,
-                releases: self.releases(&dirs)?,
+                releases: self.releases(&dirs),
             },
             BareMetadata::Outside => return Ok(Outcome::Skip(SkipReason::OutsideRoot)),
             BareMetadata::Head(metadata) => metadata,
@@ -690,16 +690,23 @@ impl Walk {
     /// behind origin) has nothing else truthful to say. `None` when the tree
     /// cannot be read at all — no commit, no readable objects, a repository gix
     /// will not open — so the caller keeps the value it already has.
-    fn releases(&self, dirs: &Dirs) -> Result<Option<bool>, Error> {
-        let Some(object_dirs) = self.object_directories(&dirs.common.join("objects"))? else {
+    fn releases(&self, dirs: &Dirs) -> Option<bool> {
+        // Every failure below is this one product's, not the walk's: an object
+        // store that cannot be listed, a repository gix refuses, a corrupt
+        // object anywhere on the path to `.github/workflows`. Each answers
+        // "unknown" so the caller keeps the flag it holds, and the other
+        // products are still catalogued.
+        let Ok(Some(object_dirs)) = self.object_directories(&dirs.common.join("objects")) else {
             return Ok(None);
         };
         let Ok(repo) = Self::open(&dirs.git) else {
             return Ok(None);
         };
         match self.default_tree(&repo, &dirs.git, object_dirs) {
-            Ok(Resolved::Tree(default)) => self.workflows_in(&repo, &dirs.git, &default),
-            Ok(Resolved::Nothing | Resolved::Outside) | Err(_) => Ok(None),
+            Ok(Resolved::Tree(default)) => self
+                .workflows_in(&repo, &dirs.git, &default)
+                .unwrap_or(None),
+            Ok(Resolved::Nothing | Resolved::Outside) | Err(_) => None,
         }
     }
 
@@ -1729,6 +1736,48 @@ mod tests {
         fs::remove_file(repo.git_dir().join("refs/remotes/origin/HEAD")).unwrap();
         let report = scan(root).unwrap();
         assert!(!report.products[0].releases, "HEAD is the bootstrap commit");
+    }
+
+    /// A corrupt object in one normal clone is that clone's problem: its flag is
+    /// unknown and the rest of the tree is still catalogued. The walk must not
+    /// fail — a failed walk is a server that does not start.
+    #[test]
+    fn a_corrupt_tree_in_a_normal_clone_is_unknown_not_a_scan_error() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let (_, broken) = clone(root, "org/broken", "git@github.com:org/broken.git");
+        let commit = commit_files(
+            &broken,
+            &[(".github/workflows/ci.yml", "on: push\n")],
+            "refs/heads/main",
+        );
+        // Corrupt the commit object itself; the tree behind it is unreachable.
+        let object = loose_object_path(&broken, commit);
+        fs::remove_file(&object).unwrap();
+        fs::write(object, "not a git object\n").unwrap();
+        // And a second clone whose object store cannot be listed at all.
+        let (unlisted_dir, unlisted) =
+            clone(root, "org/unlisted", "git@github.com:org/unlisted.git");
+        commit_files(&unlisted, &[("README.md", "# x\n")], "refs/heads/main");
+        write(
+            unlisted_dir.join(".git/objects/info/alternates"),
+            "\0not a path\n",
+        );
+        let (_, fine) = clone(root, "org/fine", "git@github.com:org/fine.git");
+        commit_files(
+            &fine,
+            &[(".github/workflows/ci.yml", "on: push\n")],
+            "refs/heads/main",
+        );
+
+        let report = scan(root).unwrap();
+        assert_eq!(ids(&report), ["org/broken", "org/fine", "org/unlisted"]);
+        assert_eq!(report.releases_unknown, ["org/broken", "org/unlisted"]);
+        assert!(
+            !report.products[0].releases,
+            "placeholder off, not a scan error"
+        );
+        assert!(report.products[1].releases, "the healthy clone is read");
     }
 
     /// A tree the walk cannot read is not a `false`: the id is reported as
