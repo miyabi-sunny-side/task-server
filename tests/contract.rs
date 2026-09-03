@@ -3885,3 +3885,70 @@ fn clone_fixture(root: &std::path::Path, id: &str) {
     .expect("config");
     std::fs::write(dir.join("README.md"), format!("# {id}\n")).expect("README");
 }
+
+/// Over HTTP: a draft created with, or patched to, a dependency that already
+/// landed is `ready` in the answer; an open dependency leaves it `draft`.
+#[tokio::test]
+async fn a_dependency_that_already_landed_promotes_over_http() {
+    let state = AppState::for_test();
+    put_product(&state, "sunny-side/keeper", true).await;
+    drive_to_merged(&state, "t-first", "sunny-side/keeper", "abc1234").await;
+
+    let created = create_task(
+        &state,
+        &json!({"id": "t-after", "title": "after", "product_id": "sunny-side/keeper",
+                "depends_on": "t-first"}),
+    )
+    .await;
+    assert_eq!(created["status"], "ready", "{created}");
+    assert_eq!(created["depends_on"], "t-first");
+
+    create_task(
+        &state,
+        &json!({"id": "t-open", "title": "open", "product_id": "sunny-side/keeper"}),
+    )
+    .await;
+    create_task(
+        &state,
+        &json!({"id": "t-patched", "title": "patched", "product_id": "sunny-side/keeper"}),
+    )
+    .await;
+    let (status, waiting) = send(
+        &state,
+        human(
+            "PATCH",
+            "/api/tasks/t-patched",
+            &json!({"depends_on": "t-open"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{waiting}");
+    assert_eq!(waiting["status"], "draft");
+    let (status, promoted) = send(
+        &state,
+        human(
+            "PATCH",
+            "/api/tasks/t-patched",
+            &json!({"depends_on": "t-first"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{promoted}");
+    assert_eq!(promoted["status"], "ready", "{promoted}");
+
+    // `released` counts as landed too: a non-releasing product ends its work
+    // there straight from the merge. A fresh server, so the release the keeper's
+    // landing issued above is not what the claim hands out.
+    let state = AppState::for_test();
+    put_product(&state, "sunny-side/library", false).await;
+    drive_to_merged_or_released(&state, "t-lib", "sunny-side/library", "def5678").await;
+    let (_, shipped) = get_task(&state, "t-lib").await;
+    assert_eq!(shipped["status"], "released", "{shipped}");
+    let after_release = create_task(
+        &state,
+        &json!({"id": "t-after-release", "title": "after release",
+                "product_id": "sunny-side/library", "depends_on": "t-lib"}),
+    )
+    .await;
+    assert_eq!(after_release["status"], "ready", "{after_release}");
+}
