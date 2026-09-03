@@ -344,30 +344,6 @@ pub enum StuckReason {
     ReleaseStalled,
 }
 
-impl StuckReason {
-    /// The order the readout lists reasons in: the table in the README.
-    const ORDERED: [Self; 6] = [
-        Self::Unclaimed,
-        Self::LeaseExpired,
-        Self::NoSubtask,
-        Self::SubtaskUnclaimed,
-        Self::Blocked,
-        Self::ReleaseStalled,
-    ];
-
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Unclaimed => "unclaimed",
-            Self::LeaseExpired => "lease-expired",
-            Self::NoSubtask => "no-subtask",
-            Self::SubtaskUnclaimed => "subtask-unclaimed",
-            Self::Blocked => "blocked",
-            Self::ReleaseStalled => "release-stalled",
-        }
-    }
-}
-
 /// How long a task may sit in each state before [`stuck`] names it. Seconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StuckThresholds {
@@ -2864,7 +2840,8 @@ pub fn releasable(db: &Db) -> Result<Vec<Releasable>, Error> {
 }
 
 /// The tasks the control plane is holding without moving them, oldest first
-/// within each reason, reasons in the README's order.
+/// within each reason, reasons in the README's order. One row per task: a
+/// release whose lease is over is `lease-expired`, not also `release-stalled`.
 ///
 /// This is the deterministic half of a rescue: the judgment "this has waited
 /// too long" is a clock and a threshold, not a reading of the list, so it lives
@@ -2924,7 +2901,7 @@ pub fn stuck(
         collect(
             StuckReason::LeaseExpired,
             "SELECT id, kind, status, claim_expires_at FROM tasks
-             WHERE status = 'wip' AND claim_expires_at IS NOT NULL AND claim_expires_at < ?1
+             WHERE status = 'wip' AND claim_expires_at IS NOT NULL AND claim_expires_at <= ?1
              ORDER BY claim_expires_at ASC, id ASC",
             &[&now_z],
         )?;
@@ -2970,10 +2947,10 @@ pub fn stuck(
             "SELECT id, kind, status, coalesce(claimed_at, updated_at) FROM tasks
              WHERE kind = 'instant:release' AND status = 'wip'
                AND coalesce(claimed_at, updated_at) <= ?1
+               AND (claim_expires_at IS NULL OR claim_expires_at > ?2)
              ORDER BY coalesce(claimed_at, updated_at) ASC, id ASC",
-            &[&release],
+            &[&release, &now_z],
         )?;
-        debug_assert!(StuckReason::ORDERED.len() == 6);
         Ok(out)
     })
 }
@@ -7854,9 +7831,10 @@ mod tests {
             .unwrap();
         assert_eq!(leased.id, "t-1");
 
-        assert!(stuck_ids(&db, secs_after(now(), 60)).is_empty());
+        assert!(stuck_ids(&db, secs_after(now(), 59)).is_empty());
+        // The lease ends when it becomes claimable again (`claim` uses <=).
         assert_eq!(
-            stuck_ids(&db, secs_after(now(), 61)),
+            stuck_ids(&db, secs_after(now(), 60)),
             [("t-1".to_owned(), StuckReason::LeaseExpired)]
         );
 
@@ -7899,8 +7877,54 @@ mod tests {
         );
     }
 
+    /// `approved` without a live merge and `merged` without a release carrying
+    /// it are `no-subtask` once the threshold passes; while the merge is live
+    /// (even blocked) or a release is open, they are not.
+    #[test]
+    fn approved_and_merged_work_without_their_subtask_are_stuck() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        work_to_approved(&db, "t-1");
+        let merge = issued_merge(&db, "t-1");
+        assert!(
+            !stuck_ids(&db, secs_after(now(), 10_000))
+                .iter()
+                .any(|(id, reason)| id == "t-1" && *reason == StuckReason::NoSubtask),
+            "a live merge means the approval is carried"
+        );
+        set_status(&db, &merge.id, TaskStatus::Cancelled, later()).unwrap();
+        assert!(
+            !stuck_ids(&db, secs_after(later(), 299))
+                .iter()
+                .any(|(id, _)| id == "t-1")
+        );
+        assert!(
+            stuck_ids(&db, secs_after(later(), 300))
+                .contains(&("t-1".to_owned(), StuckReason::NoSubtask)),
+            "an approval whose merge was called off has no subtask"
+        );
+
+        let landed = merge_waiting_for(&db, "t-2", "a/b");
+        merge_into(&db, &landed.id, TaskStatus::Done);
+        assert_eq!(get(&db, "t-2").unwrap().status, TaskStatus::Merged);
+        let release = get(&db, &release_task_id("t-2")).unwrap();
+        assert!(
+            !stuck_ids(&db, secs_after(later(), 10_000))
+                .iter()
+                .any(|(id, reason)| id == "t-2" && *reason == StuckReason::NoSubtask),
+            "landed work with a release carrying it is not stuck"
+        );
+        set_status(&db, &release.id, TaskStatus::Cancelled, even_later()).unwrap();
+        assert!(
+            stuck_ids(&db, secs_after(even_later(), 300))
+                .contains(&("t-2".to_owned(), StuckReason::NoSubtask)),
+            "landed work whose release was called off has no subtask"
+        );
+    }
+
     /// Blocked work is always stuck, whatever the kind. A release that stays
-    /// `wip` past its threshold is `release-stalled`.
+    /// `wip` past its threshold is `release-stalled` — but once its lease is
+    /// over it is `lease-expired` instead, one row per task.
     #[test]
     fn blocked_work_and_a_stalled_release_are_stuck() {
         let db = db_with_product();
@@ -7914,7 +7938,10 @@ mod tests {
 
         let first = merge_waiting_for(&db, "t-2", "a/b");
         merge_into(&db, &first.id, TaskStatus::Done);
-        let release = claim_release(&db);
+        // A long lease, so the stall is measured before the lease is over.
+        let release = claim(&db, "shipper", &[TaskKind::InstantRelease], later(), 10_000)
+            .unwrap()
+            .expect("a release must be waiting to be claimed");
         let at = later();
         assert!(
             !stuck_ids(&db, secs_after(at, 1799))
@@ -7932,5 +7959,15 @@ mod tests {
         // Reasons come in the table's order: blocked before release-stalled.
         assert_eq!(rows.last().unwrap().reason, StuckReason::ReleaseStalled);
         assert!(rows.iter().any(|row| row.reason == StuckReason::Blocked));
+
+        // Once the lease is over the release is `lease-expired` and nothing
+        // else: one row per task.
+        let reasons: Vec<_> = stuck(&db, secs_after(at, 10_000), &thresholds())
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.task_id == release.id)
+            .map(|row| row.reason)
+            .collect();
+        assert_eq!(reasons, [StuckReason::LeaseExpired]);
     }
 }

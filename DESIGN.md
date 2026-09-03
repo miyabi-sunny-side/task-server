@@ -627,7 +627,7 @@ counterpart to carry, so it earns no token pair.
 
   **Stuck, inside reconciliation.** The server also measures waiting:
   `GET /api/control` carries `stuck`, one row per task that has sat past
-  a threshold, each with a fixed `reason` (`unclaimed`, `lease-expired`,
+  a threshold (a task never appears under two reasons), each with a fixed `reason` (`unclaimed`, `lease-expired`,
   `no-subtask`, `subtask-unclaimed`, `blocked`, `release-stalled`). The
   block renders it as its last readout under the caption "動いていない
   task" with the count pill, one ordinary card per row linking to the

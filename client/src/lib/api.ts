@@ -175,11 +175,6 @@ export interface PendingRelease extends TaskSummary {
   verification: string | null;
 }
 
-// What the top page needs to draw the automated stretch of the pipeline. The
-// `pending_*` lists are what the server is carrying; `mergeable`, `unreviewed`
-// and `releasable` are the reconciliation windows, empty whenever the
-// automatic issuing works. Nothing here is a button: the page asks the human
-// for no decision.
 // Why the server counts a task as stuck. A fixed vocabulary, worn as a badge.
 export type StuckReason =
   | "unclaimed"
@@ -199,6 +194,11 @@ export interface Stuck {
   reason: StuckReason;
 }
 
+// What the top page needs to draw the automated stretch of the pipeline. The
+// `pending_*` lists are what the server is carrying; `mergeable`, `unreviewed`
+// `releasable` and `stuck` are the reconciliation windows, empty whenever the
+// automatic issuing works. Nothing here is a button: the page asks the human
+// for no decision.
 export interface ControlPlane {
   mergeable: TaskSummary[];
   pending_merges: PendingMerge[];

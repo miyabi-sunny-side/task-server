@@ -468,10 +468,16 @@ happened.
 
 `GET /api/control` answers
 `{ mergeable, pending_merges, pending_releases, pending_reviews, unreviewed,
-releasable }`: the three `pending_*` lists are what the control plane has in
-flight, and `mergeable`, `unreviewed`, and `releasable` are reconciliation
-windows — all stay empty while the automatic issuing works. Each
+releasable, stuck }`: the three `pending_*` lists are what the control plane has
+in flight, and `mergeable`, `unreviewed`, `releasable`, and `stuck` are
+reconciliation windows — all stay empty while the automatic issuing works. Each
 `pending_releases` row is the summary plus `release_level` and `verification`.
+`stuck` rows are `{task_id, kind, status, since, reason}`, one row per task,
+`reason` one of `unclaimed`, `lease-expired`, `no-subtask`, `subtask-unclaimed`,
+`blocked`, `release-stalled`, grouped in that order and oldest first inside a
+reason. The thresholds are `APP_STUCK_UNCLAIMED_SECS` (900),
+`APP_STUCK_SUBTASK_SECS` (300) and `APP_STUCK_RELEASE_SECS` (1800); the judgment
+is the server's clock against them, never a reading of the list.
 
 `pending_merges` is in a stable reading order — oldest first, ties broken by id
 — and each row is the ordinary summary plus `verification`: the reason that merge stopped, or `null` while it
