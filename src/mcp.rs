@@ -25,8 +25,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::error::Error;
+use crate::http;
 use crate::http::TaskSummary;
-use crate::product;
+use crate::product::{self, Product};
 use crate::state::AppState;
 use crate::task::{
     self, Check, NewTask, ReleaseLevel, ReportOutcome, ReviewVerdict, Task, TaskKind, TaskPatch,
@@ -65,6 +66,20 @@ pub struct TaskCreateArgs {
     /// (A → B → C) to wait for several.
     #[serde(default)]
     pub depends_on: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProductRegisterArgs {
+    /// `org/repo`.
+    pub id: String,
+    /// The clone URL.
+    pub repository: String,
+    /// One line about the product. Optional.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Whether the product cuts releases. Defaults to true.
+    #[serde(default)]
+    pub releases: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -237,10 +252,47 @@ impl Admin {
                        product_id is one of these and that product is not archived, so read this \
                        before filing work. `archived: true` means the working copy left the \
                        project tree: the product still answers for the tasks that named it, but \
-                       new work cannot be promoted against it."
+                       new work cannot be promoted against it. After placing a new clone in the \
+                       project tree, call product_rescan so it joins the catalogue."
     )]
     fn product_list(&self) -> CallToolResult {
         answer(product::list(&self.state.db).map(|products| json!({ "products": products })))
+    }
+
+    #[tool(
+        description = "Walk the project tree (APP_PROJECTS_DIR) now and make the catalogue equal \
+                       it: new clones are registered, clones that left are archived, and a \
+                       revived clone is unarchived. Answers the ids that changed. Refused with \
+                       code `catalogue_not_derived` when no tree is configured — register with \
+                       product_register instead."
+    )]
+    fn product_rescan(&self) -> CallToolResult {
+        answer(http::rescan(&self.state).map(|answer| json!(answer)))
+    }
+
+    #[tool(description = "Register or replace a product by hand (the same as \
+                       PUT /api/products/{id}). With a derived catalogue (APP_PROJECTS_DIR set) \
+                       this is a temporary override: the next walk reads repository, \
+                       description and releases back from the tree and archives a product \
+                       the tree does not have. To change a value for good, change the clone.")]
+    fn product_register(
+        &self,
+        Parameters(args): Parameters<ProductRegisterArgs>,
+    ) -> CallToolResult {
+        answer(
+            product::upsert(
+                &self.state.db,
+                &Product {
+                    id: args.id,
+                    repository: args.repository,
+                    description: args.description.unwrap_or_default(),
+                    releases: args.releases.unwrap_or(true),
+                    archived: false,
+                },
+                self.state.clock.now(),
+            )
+            .map(|product| json!({ "product": product })),
+        )
     }
 
     #[tool(

@@ -56,6 +56,7 @@ pub fn app(state: AppState) -> Router {
         .route("/reviews", post(http::api_issue_review))
         .route("/releases", post(http::api_release))
         .route("/products", get(http::api_products))
+        .route("/products/rescan", post(http::api_rescan_products))
         // Product ids are `org/repo`, so the capture has to span two segments.
         .route(
             "/products/{*id}",

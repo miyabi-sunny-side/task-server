@@ -452,6 +452,7 @@ and `dropped`.
 | POST | `/api/reviews`, `/api/merges`, `/api/releases` | human mutation (reconciliation handles) |
 | GET | `/api/products`, `/api/products/{id}` | read |
 | PUT | `/api/products/{id}` | human mutation |
+| POST | `/api/products/rescan` | human mutation |
 | POST | `/worker/claim`, `/worker/claim/release`, `/worker/report`, `/worker/review-report` | trusted network; no application auth |
 | POST | `/mcp`, `/worker/mcp` | trusted network; no application auth |
 

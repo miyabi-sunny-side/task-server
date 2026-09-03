@@ -111,39 +111,23 @@ fn derive_catalogue(state: &AppState, catalogue: &Catalogue) -> Result<(), Box<d
     let Catalogue::Derived(root) = catalogue else {
         return Ok(());
     };
-    let scanned = scan::scan(root)?;
-    for skipped in &scanned.skipped {
-        info!(
-            entry = %skipped.name,
-            reason = skipped.reason.as_str(),
-            "project skipped"
-        );
-    }
-    // A release flag the walk could not read keeps the value the catalogue
-    // already holds: a bad read must not switch a product's releases off.
-    for id in &scanned.releases_unknown {
+    let derived = task_server::product::derive_from_tree(&state.db, root, state.clock.now())?;
+    for id in &derived.releases_unknown {
         warn!(
             id = %id,
             "the default-branch tree could not be read, so releases keeps its previous value"
         );
     }
-    let scanned = scanned.with_previous_releases(|id| {
-        task_server::product::get(&state.db, id)
-            .ok()
-            .map(|stored| stored.releases)
-    });
-    let report = task_server::product::reconcile(&state.db, &scanned.products, state.clock.now())?;
-    for archived in &report.archived {
+    for id in &derived.archived {
         warn!(
-            id = %archived.id,
-            tasks = archived.tasks,
+            id = %id,
             "product left the project tree and was archived: it answers history but takes no new work"
         );
     }
-    for id in &report.unarchived {
+    for id in &derived.unarchived {
         info!(id = %id, "product came back to the project tree and was unarchived");
     }
-    if report.skipped_archive_all {
+    if derived.skipped_archive_all {
         warn!(
             root = %root.display(),
             "the walk found no products, so none were archived: check that the project tree is there"
@@ -151,12 +135,12 @@ fn derive_catalogue(state: &AppState, catalogue: &Catalogue) -> Result<(), Box<d
     }
     info!(
         root = %root.display(),
-        inserted = report.inserted,
-        updated = report.updated,
-        unchanged = report.unchanged,
-        archived = report.archived.len(),
-        unarchived = report.unarchived.len(),
-        skipped = ?scanned.skipped_by_reason(),
+        inserted = derived.inserted.len(),
+        updated = derived.updated.len(),
+        unchanged = derived.unchanged,
+        archived = derived.archived.len(),
+        unarchived = derived.unarchived.len(),
+        skipped = ?derived.skipped,
         "catalogue derived from the project tree"
     );
     Ok(())

@@ -50,7 +50,8 @@ creates the database (and its parent directory) on first start.
 | POST | `/api/releases` | reconciliation: `{"product_id": "..."}` issues the release task of a product whose landed work has none, returns 201 |
 | GET | `/api/products` | product list |
 | GET | `/api/products/{id}` | one product |
-| PUT | `/api/products/{id}` | create or replace a product |
+| PUT | `/api/products/{id}` | create or replace a product. With a project tree configured this is a temporary override: the next walk reads the values back from the tree |
+| POST | `/api/products/rescan` | walk the project tree now (the same walk the startup runs) and answer `{walked, inserted, updated, unchanged, archived, unarchived, skipped, releases_unknown}`; 409 `catalogue_not_derived` without `APP_PROJECTS_DIR`. Rescans are serialised; a request that arrived during a walk gets that walk's result (`walked: false`) |
 | POST | `/worker/claim` | lease the next ready task; optional `kinds` routes by role and optional `idempotency_key` makes an uncertain response retryable |
 | POST | `/worker/claim/release` | `{"claim_id": "...", "reason": "..."}` hands a live claim back: the task returns to `ready` with the reason on `verification`; a claim that is not live is 409 `claim_not_live` |
 | POST | `/worker/runs` | append one run to the haystack; idempotent on `(claim_id, attempt, source)` — 201 with the row when written, 200 with the row already there on a resend |
@@ -281,14 +282,18 @@ refusals are deliberately different codes:
 
 | Code | What it means | The remedy |
 | --- | --- | --- |
-| `product_not_catalogued` | No product is registered under that id. With a project tree configured, that means no clone sits at `<org>/<repo>`. | Correct the task's `product_id`, or put the clone in the tree and restart. With no tree configured, `PUT /api/products/{id}`. |
+| `product_not_catalogued` | No product is registered under that id. With a project tree configured, that means no clone sits at `<org>/<repo>`. | Correct the task's `product_id`, or put the clone in the tree and `POST /api/products/rescan` (MCP `product_rescan`). With no tree configured, `PUT /api/products/{id}` (MCP `product_register`). |
 | `product_archived` | The product *is* registered, and its working copy left the tree. | Restore that one clone; the next walk clears the mark by itself. |
 | `product_required` | The task names no product at all. | Set a `product_id`. |
 
 With [a project tree configured](#derived-from-the-project-tree) the catalogue is
 a derived value, so `PUT /api/products/{id}` is not the way back from either
 refusal: a row typed in by hand is archived by the next walk unless the tree
-agrees with it.
+agrees with it. **In derived mode a PUT is a temporary override and the tree is
+the truth**: the next walk — at startup or on `POST /api/products/rescan` —
+reads `repository`, `description` and `releases` back from the clone and
+decides `archived` by itself. To change a value for good, change the clone:
+the `origin` URL, the README heading, whether `.github/workflows` exists.
 
 Refusals that come from the server's own domain carry a stable `code` next to
 their human `error` message, so an automated client branches on the reason
@@ -391,7 +396,9 @@ root that cannot be read stops the startup.
 One consequence of a derived catalogue is worth stating plainly: a row created
 with `PUT /api/products/{id}` is archived by the next walk unless the tree agrees
 with it. With a tree configured, the API is no longer where the catalogue is
-decided.
+decided. The walk runs at startup and whenever `POST /api/products/rescan` (or
+the MCP `product_rescan`) asks for it, so a new clone joins the catalogue
+without a restart.
 
 Unset `APP_PROJECTS_DIR` and nothing is walked: the catalogue is whatever the API
 put there. The `APP_PRODUCTS_SEED` roster this replaces is retired, and a start
@@ -672,7 +679,7 @@ boundary and have no application-layer authorization:
 
 | Endpoint | Authorization | Tools |
 | --- | --- | --- |
-| `POST /mcp` | none at the application layer | `product_list`, `task_create`, `task_get`, `task_list`, `task_update`, `task_set_status`, `task_delete` |
+| `POST /mcp` | none at the application layer | `product_list`, `task_create`, `task_get`, `task_list`, `task_update`, `task_set_status`, `task_delete`, `product_rescan`, `product_register` |
 | `POST /worker/mcp` | none at the application layer | `task_claim`, `task_report`, `task_review_report` |
 
 Point clients at `http://127.0.0.1:3000/mcp` or `/worker/mcp`. The `initialize`

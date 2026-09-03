@@ -3728,3 +3728,93 @@ async fn closed_work_is_listed_together_and_deleted_only_once_over() {
     let (status, _) = send(&state, human("DELETE", "/api/tasks/t-fin", &json!({}))).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "deleting twice is not found");
 }
+
+// --- product rescan ---
+
+/// A clone put in the tree while the server runs joins the catalogue on rescan;
+/// one that left is archived; the answer names them. Without a tree the route
+/// answers 409 `catalogue_not_derived`. Two rescans at once walk once.
+#[tokio::test]
+async fn a_rescan_walks_the_tree_now_and_names_what_changed() {
+    let (dir, db) = {
+        let dir = TempDir::new().expect("tempdir");
+        let db = Arc::new(Db::open(dir.path().join("task-server.db")).expect("open"));
+        (dir, db)
+    };
+    let root = dir.path().join("projects");
+    clone_fixture(&root, "sunny-side/one");
+    let state = state_for(&db).with_projects_dir(&root);
+
+    let (status, first) = send(&state, human("POST", "/api/products/rescan", &json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["walked"], true);
+    assert_eq!(first["inserted"], json!(["sunny-side/one"]));
+    assert_eq!(first["archived"], json!([]));
+
+    clone_fixture(&root, "sunny-side/two");
+    std::fs::remove_dir_all(root.join("sunny-side/one")).expect("remove clone");
+    let (status, second) = send(&state, human("POST", "/api/products/rescan", &json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["inserted"], json!(["sunny-side/two"]));
+    assert_eq!(second["archived"], json!(["sunny-side/one"]));
+    let (_, products) = send(&state, read("/api/products")).await;
+    let archived: Vec<(&str, bool)> = products
+        .as_array()
+        .expect("products")
+        .iter()
+        .map(|p| (p["id"].as_str().unwrap(), p["archived"].as_bool().unwrap()))
+        .collect();
+    assert!(
+        archived.contains(&("sunny-side/one", true))
+            && archived.contains(&("sunny-side/two", false)),
+        "{products}"
+    );
+
+    // Auth: identity + CSRF like every other human mutation.
+    let (status, _) = send(
+        &state,
+        request("POST", "/api/products/rescan")
+            .header("x-auth-user", USER)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Two at once: the second arrives while the first walks and takes its result.
+    let a = send(&state, human("POST", "/api/products/rescan", &json!({})));
+    let b = send(&state, human("POST", "/api/products/rescan", &json!({})));
+    let ((status_a, answer_a), (status_b, answer_b)) = tokio::join!(a, b);
+    assert_eq!(status_a, StatusCode::OK);
+    assert_eq!(status_b, StatusCode::OK);
+    let walked = [answer_a["walked"].as_bool(), answer_b["walked"].as_bool()];
+    assert!(
+        walked.contains(&Some(true)),
+        "one of them walked: {answer_a} {answer_b}"
+    );
+
+    // No tree: nothing to rescan.
+    let curated = AppState::for_test();
+    let (status, refused) = send(&curated, human("POST", "/api/products/rescan", &json!({}))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["code"], "catalogue_not_derived");
+}
+
+/// A minimal clone the walk accepts: `.git` with objects, refs, HEAD and an
+/// `origin` remote, plus a README heading for the description.
+fn clone_fixture(root: &std::path::Path, id: &str) {
+    let dir = root.join(id);
+    let git = dir.join(".git");
+    std::fs::create_dir_all(git.join("objects")).expect("objects");
+    std::fs::create_dir_all(git.join("refs")).expect("refs");
+    std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+    std::fs::write(
+        git.join("config"),
+        format!(
+            "[remote \"origin\"]\n\turl = git@github.com:example/{}.git\n",
+            id.replace('/', "-")
+        ),
+    )
+    .expect("config");
+    std::fs::write(dir.join("README.md"), format!("# {id}\n")).expect("README");
+}
