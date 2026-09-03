@@ -443,8 +443,10 @@ and `dropped`.
 | GET | `/api/session` | read |
 | GET | `/api/tasks`, `/api/tasks/{id}` | read |
 | GET | `/api/done` | read |
+| GET | `/api/closed` | read |
 | POST | `/api/tasks` | human mutation |
 | PATCH | `/api/tasks/{id}` | human mutation |
+| DELETE | `/api/tasks/{id}` | human mutation |
 | POST | `/api/tasks/{id}/status` | human mutation |
 | GET | `/api/control` | read |
 | POST | `/api/reviews`, `/api/merges`, `/api/releases` | human mutation (reconciliation handles) |
@@ -458,7 +460,9 @@ for a status explicitly; an unknown status is a 400. Single-task responses are
 the full task plus `available_transitions`, and `latest_review` when a review
 has answered for it.
 
-`GET /api/done` answers the done screen directly rather than composing several
+`GET /api/closed` answers the closed screen directly (finished and cancelled
+`normal` work by the moment it closed); `GET /api/done` stays for readers of the
+older done list and answers it directly rather than composing several
 `?status=` calls: every `normal` task whose status is `done`, `approved`,
 `merged`, or `released`, newest-completed first (`done_at DESC, id DESC`).
 `done_at` is a `tasks` column of its own — the moment a task first reached

@@ -11,6 +11,9 @@ interface RouteDef {
 export const routes: RouteDef[] = [
   { pattern: /^\/$/, params: [] },
   { pattern: /^\/tasks\/([^/]+)$/, params: ["id"] },
+  // Index 2 is the retired /done address. syncRoute rewrites it to /closed
+  // before matching, so it never renders; it stays so the indexes above and
+  // below it keep their meaning.
   { pattern: /^\/done$/, params: [] },
   { pattern: /^\/closed$/, params: [] },
 ];

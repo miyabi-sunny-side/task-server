@@ -65,7 +65,7 @@ function focusableIn(root: HTMLElement): Element[] {
   ];
 }
 
-// Newest-completed first, exactly as /api/done already returns it (the
+// Newest-closed first, exactly as /api/closed already returns it (the
 // server owns the sort; this component renders whatever order it receives).
 const ROWS: ClosedTask[] = [
   task({

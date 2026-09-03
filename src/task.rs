@@ -872,8 +872,10 @@ pub fn sweep_called_off(
         let mut removed = Vec::new();
         for id in stale {
             // A subtask swept together with its target is already gone.
-            if read(tx, &id).is_err() {
-                continue;
+            match read(tx, &id) {
+                Ok(_) => {}
+                Err(Error::NotFound) => continue,
+                Err(error) => return Err(error),
             }
             let mut subtasks = delete_subtasks_of(tx, &id)?;
             delete_row(tx, &id)?;
