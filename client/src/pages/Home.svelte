@@ -23,13 +23,16 @@
 
   // Whatever the panel is already drawing in a readout, the list below leaves
   // out: one object drawn twice on one screen reads as two.
-  let drawnByPanel = $derived(
-    [
+  let drawnByPanel = $derived([
+    ...[
       ...(plane?.pending_reviews ?? []),
       ...(plane?.unreviewed ?? []),
       ...(plane?.mergeable ?? []),
     ].map((item) => item.id),
-  );
+    // Stuck rows name their task by `task_id`; a `normal` one would otherwise
+    // stand in its status group as well.
+    ...(plane?.stuck ?? []).map((item) => item.task_id),
+  ]);
 
   function aborted(error: unknown): boolean {
     return error instanceof DOMException && error.name === "AbortError";

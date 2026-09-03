@@ -364,7 +364,9 @@ impl Default for StuckThresholds {
 
 /// One task the control plane is holding without moving it. `since` is the
 /// stored timestamp the wait is measured from: the last status change for most
-/// reasons, the lease end for `lease-expired`, the claim for `release-stalled`.
+/// reasons, the lease end for `lease-expired`, and for `release-stalled` the
+/// claim — or the last status change when the release reached `wip` without a
+/// claim (an operator moved it).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stuck {
     pub task_id: String,

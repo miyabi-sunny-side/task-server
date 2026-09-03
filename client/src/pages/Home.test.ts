@@ -304,6 +304,42 @@ describe("Home", () => {
     expect(list.querySelector('a[href="/tasks/t-ready-2"]')).not.toBeNull();
   });
 
+  it("leaves a stuck normal task out of the status groups too", async () => {
+    stubFetch({
+      control: () =>
+        jsonResponse(
+          plane({
+            stuck: [
+              {
+                task_id: "t-ready-1",
+                kind: "normal",
+                status: "ready",
+                since: "2026-08-15T10:00:00Z",
+                reason: "unclaimed",
+              },
+            ],
+          }),
+        ),
+    });
+
+    render(Home);
+    await waitFor(() =>
+      expect(region("control").dataset.state).toBe("success"),
+    );
+    await waitFor(() => expect(region("tasks").dataset.state).toBe("success"));
+
+    // One home: the stuck readout on the panel, not the `ready` group.
+    expect(
+      region("tasks").querySelector('a[href="/tasks/t-ready-1"]'),
+    ).toBeNull();
+    expect(
+      region("control").querySelectorAll('a[href="/tasks/t-ready-1"]'),
+    ).toHaveLength(1);
+    expect(
+      region("tasks").querySelector('a[href="/tasks/t-ready-2"]'),
+    ).not.toBeNull();
+  });
+
   it("shows a stopped merge's cause off the control payload, asking nothing else", async () => {
     let jammed = true;
     const fetchMock = stubFetch({
