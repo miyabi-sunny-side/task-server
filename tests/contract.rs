@@ -3722,7 +3722,16 @@ async fn the_haystack_hands_out_the_oldest_unread_run_until_it_is_read() {
     let (status, bad) = send(&state, read("/api/runs/next?source=nobody")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
 
-    // Reading is identity-only: no CSRF token, like the worker's own doors.
+    // Reading is identity-only: no CSRF token, like the worker's own doors —
+    // but identity it does need.
+    let (status, anonymous) = send(
+        &state,
+        request("POST", "/api/runs/1/read")
+            .body(Body::from("{}"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{anonymous}");
     let (status, marked) = send(
         &state,
         request("POST", "/api/runs/1/read")

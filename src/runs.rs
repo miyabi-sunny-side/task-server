@@ -1,10 +1,12 @@
 //! The haystack: one appended row per run.
 //!
-//! A worker's agent run, a rescue's five lines, a librarian's watermark — each
-//! is one row in `runs`, appended and never edited. There is no index to
-//! maintain and no review to pass: a librarian reads forward from a watermark
-//! (`GET /api/runs?since=`) and summarises elsewhere. The only later write is
-//! the retention sweep, which blanks the two output tails of old rows and keeps
+//! A worker's agent run, a rescue's five lines, a librarian's note — each is
+//! one row in `runs`, appended and never edited except for its reading receipt.
+//! There is no index to maintain and no review to pass: a reader takes the
+//! oldest unread row (`GET /api/runs/next`), summarises elsewhere, and says it
+//! is done (`POST /api/runs/{id}/read`), which stamps `read_at`; the cursor is
+//! the server's, so a reader keeps no watermark. The other later write is the
+//! retention sweep, which blanks the two output tails of old rows and keeps
 //! every other field.
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -406,10 +408,19 @@ pub fn mark_read(
         if before.read_at.is_some() {
             return Ok((before, false));
         }
-        let note = note.map(|text| truncate_tail(text).0);
+        // The receipt's note is cut like the row's own note, and the row says
+        // so the same way.
+        let (note, cut) = match note {
+            Some(text) => {
+                let (kept, cut) = truncate_tail(text);
+                (Some(kept), cut)
+            }
+            None => (None, false),
+        };
         tx.execute(
-            "UPDATE runs SET read_at = ?2, read_note = ?3 WHERE id = ?1 AND read_at IS NULL",
-            params![id, format_z(now), note],
+            "UPDATE runs SET read_at = ?2, read_note = ?3, truncated = truncated OR ?4
+             WHERE id = ?1 AND read_at IS NULL",
+            params![id, format_z(now), note, i64::from(cut)],
         )?;
         Ok((read(tx, id)?, true))
     })
@@ -726,6 +737,18 @@ mod tests {
         assert!(next_unread(&db, None).unwrap().is_none());
         assert!(next_unread(&db, Some(Source::Rescue)).unwrap().is_none());
         assert_eq!(count_unread_for_task(&db, "t-1").unwrap(), 0);
+
+        // The receipt's note is cut like the row's own note, and flagged.
+        let long = "x".repeat(TAIL_LIMIT_BYTES + 10);
+        let (extra, _) = append(
+            &db,
+            &worker_run("c-extra", 1),
+            now() + time::Duration::days(1),
+        )
+        .unwrap();
+        let (cut, _) = mark_read(&db, extra.id, Some(&long), now()).unwrap();
+        assert_eq!(cut.read_note.map(|s| s.len()), Some(TAIL_LIMIT_BYTES));
+        assert!(cut.truncated, "a cut receipt note is said like a cut note");
     }
 
     /// The sweep blanks only the tails, only past retention, and keeps the rest.

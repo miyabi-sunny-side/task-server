@@ -454,6 +454,9 @@ and `dropped`.
 | GET | `/api/products`, `/api/products/{id}` | read |
 | PUT | `/api/products/{id}` | human mutation |
 | POST | `/api/products/rescan` | human mutation |
+| GET | `/api/runs`, `/api/runs/next` | read |
+| POST | `/api/runs` | human mutation (source forced to `rescue`) |
+| POST | `/api/runs/{id}/read` | identity only, no CSRF: a reader's receipt, not a person's press — a forged one can only mark a row read |
 | POST | `/worker/claim`, `/worker/claim/release`, `/worker/report`, `/worker/review-report` | trusted network; no application auth |
 | POST | `/mcp`, `/worker/mcp` | trusted network; no application auth |
 
@@ -482,11 +485,25 @@ happened.
 `POST /worker/runs` appends one row to the haystack (`runs`) over the worker
 boundary; `POST /api/runs` is the same append for a person or the rescue (identity
 + CSRF, source forced to `rescue`); `GET /api/runs?since=&limit=&task_id=` pages
-the haystack forward by `id` with a `next` cursor. Rows are appended and never
-edited; the idempotency key of a worker's resend is `(claim_id, attempt, source)`;
-each source has its own required fields; tails are cut at 8 KB (`truncated`);
-the startup sweep blanks `stdout_tail` / `stderr_tail` past `RUNS_RETENTION_DAYS`
-(90) and touches nothing else. The Task Card carries `runs_count`.
+the haystack forward by `id` with a `next` cursor, and `unread=1` keeps only rows
+no reader has finished with. Rows are appended and never edited except for their
+reading receipt; the idempotency key of a worker's resend is
+`(claim_id, attempt, source)`; each source has its own required fields; tails are
+cut at 8 KB (`truncated`); the startup sweep blanks `stdout_tail` / `stderr_tail`
+past `RUNS_RETENTION_DAYS` (90) and touches nothing else. The Task Card carries
+`runs_count` and `runs_unread`.
+
+The reading cursor is the server's, on the row: `read_at` (when a reader said it
+was done) and `read_note` (one line on what it did, cut at 8 KB like `note` and
+flagged the same way). `GET /api/runs/next?source=` answers the oldest row with
+`read_at IS NULL` by `at` (id breaks a tie), or 204 when there is none, and
+changes nothing — the same row comes back until `POST /api/runs/{id}/read`
+stamps it. That route needs identity but no CSRF: the caller is a reader process
+on the trusted network, not a person at a form, and the worst a forged call does
+is mark a row read. It is idempotent — a row already read answers 200 unchanged
+— and an unknown id is 404. A reader declares only after its own work is safe
+(the wiki committed and pushed), so a reader that dies half-way is handed the
+same row again; a rebuilt reader loses nothing because it keeps no watermark.
 
 `GET /api/control` answers
 `{ mergeable, pending_merges, pending_releases, pending_reviews, unreviewed,
