@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { TaskSummary } from "./api";
+  import { blockedByLabel, type TaskSummary } from "./api";
 
   // DESIGN.md, Task list: the status vocabulary order, which is the pipeline
   // read from its start — so `approved` sits between `done` and `merged`,
@@ -104,6 +104,13 @@
                 <span class="name">{item.title}</span>
                 <span class="tail">
                   <span class="badge">{item.status}</span>
+                  {#if item.status === "blocked" && item.blocked_by}
+                    <!-- Who stopped it: a parked task (保留) is a decision, the
+                         other two are jams (DESIGN.md, Status is worn). -->
+                    <span class="badge" data-blocked-by={item.blocked_by}
+                      >{blockedByLabel(item.blocked_by)}</span
+                    >
+                  {/if}
                   {#if item.kind !== "normal"}
                     <span class="badge">{item.kind}</span>
                   {/if}

@@ -21,6 +21,17 @@ export interface TaskSummary {
   updated_at: string;
   // The task this one waits for, so a list can say why a draft is waiting.
   depends_on?: string | null;
+  // Who put a `blocked` task there: a person parking it ("operator"), a
+  // worker's report ("worker"), or the control plane ("system").
+  blocked_by?: BlockedBy | null;
+}
+
+export type BlockedBy = "operator" | "worker" | "system";
+
+// The word a badge wears for who blocked a task. A parked task says so in the
+// operator's own language; the other two name the actor.
+export function blockedByLabel(by: BlockedBy): string {
+  return by === "operator" ? "保留" : by;
 }
 
 // What the latest *finished* review of a task said, read from that review's
@@ -39,6 +50,7 @@ export interface TaskCard {
   title: string;
   body: string;
   status: string;
+  blocked_by?: BlockedBy | null;
   kind: string;
   product_id: string;
   priority: number;

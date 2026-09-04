@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { TaskCard as Task } from "./api";
+  import { blockedByLabel } from "./api";
 
   let {
     task,
@@ -32,6 +33,11 @@
   <p class="product">{task.product_id}</p>
   <p class="badges">
     <span class="badge">{task.status}</span>
+    {#if task.status === "blocked" && task.blocked_by}
+      <span class="badge" data-blocked-by={task.blocked_by}
+        >{blockedByLabel(task.blocked_by)}</span
+      >
+    {/if}
     {#if kind}
       <span class="badge">{kind}</span>
     {/if}

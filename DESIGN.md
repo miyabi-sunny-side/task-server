@@ -721,7 +721,17 @@ counterpart to carry, so it earns no token pair.
 
   **Status is worn, never tinted.** Every status reads through the same
   neutral outline badge and its group heading; no status earns a color,
-  an icon, or a weight of its own. `approved` is told apart from `done`
+  an icon, or a weight of its own. A `blocked` task wears one more
+  outline badge saying who stopped it — `保留` when a person parked it
+  (`blocked_by: operator`), `worker` when a report could not finish,
+  `system` when the control plane did it (a dependency called off) — on
+  the list card and the Task Card alike, after the status badge and
+  before the kind badge, in the same neutral chrome. A parked task is a
+  decision, not a jam: it stands in the `blocked` group with its badge
+  and never in the reconciliation block, whose `stuck` rows the server
+  reserves for `worker` and `system`. Parking is also the `ready → draft`
+  press: a ready task nobody holds goes back to the drawer, offered as
+  an ordinary transition button. `approved` is told apart from `done`
   by where it sits in the vocabulary order — past review, before the
   landing — and that position is the whole of its signal. `approved` is
   also a status this screen never *produces*: a review report alone
@@ -1107,6 +1117,15 @@ counterpart to carry, so it earns no token pair.
       verification excerpt holds a 40-character unbroken token still
       leaves `document.documentElement.scrollWidth` within the
       viewport.
+  35. Who blocked it is worn. A `blocked` card in a status group and a
+      `blocked` Task Card carry a second outline badge after the status:
+      `保留` for `blocked_by: operator`, `worker` and `system` for the
+      others, with `data-blocked-by` naming the value; a blocked row the
+      server did not label carries no second badge. The badge computes
+      the same neutral outline recipe as the status badge, never the
+      danger pair. A task blocked by the operator appears in the
+      `blocked` group and never in the reconciliation block's stuck
+      readout.
   34. Stuck work is stated, not handled. With `stuck` non-empty the
       reconciliation block renders a readout captioned "動いていない task"
       whose count pill equals its rows; each row is an ordinary card link

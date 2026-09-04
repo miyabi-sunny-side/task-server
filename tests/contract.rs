@@ -3652,7 +3652,7 @@ async fn the_haystack_persists_across_reopen_and_the_sweep_keeps_the_rows() {
     assert_eq!(status, StatusCode::CREATED);
 
     let state = reopen(&dir, state);
-    assert_eq!(state.db.schema_version().expect("version"), 16);
+    assert_eq!(state.db.schema_version().expect("version"), 17);
     let now = task_server::clock::Clock::now(&clock);
     let blanked = task_server::runs::prune_tails(&state.db, now, 90).expect("sweep");
     assert_eq!(blanked, 1);
@@ -3951,4 +3951,83 @@ async fn a_dependency_that_already_landed_promotes_over_http() {
     )
     .await;
     assert_eq!(after_release["status"], "ready", "{after_release}");
+}
+
+/// Parking over HTTP: a `ready` task with no claim goes back to `draft` and the
+/// card offers it; a `wip` one answers 409. A blocked pressed by hand wears
+/// `blocked_by: operator` and is not stuck; a worker's blocked is.
+#[tokio::test]
+async fn parking_a_ready_task_is_allowed_and_a_parked_task_is_not_stuck() {
+    let (_dir, state, clock) = clocked_state(60);
+    put_product(&state, "sunny-side/keeper", true).await;
+    for id in ["t-park", "t-held", "t-stop"] {
+        create_task(
+            &state,
+            &json!({"id": id, "title": id, "product_id": "sunny-side/keeper"}),
+        )
+        .await;
+        set_status(&state, id, "ready").await;
+    }
+    let (_, card) = get_task(&state, "t-park").await;
+    assert!(
+        card["available_transitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "draft"),
+        "{card}"
+    );
+    let (status, parked) = post_status(&state, "t-park", "draft").await;
+    assert_eq!(status, StatusCode::OK, "{parked}");
+    assert_eq!(parked["status"], "draft");
+
+    let claim_id = claim_next(&state, "t-held").await;
+    let (status, refused) = post_status(&state, "t-held", "draft").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    let _ = claim_id;
+
+    let (status, stopped) = post_status(&state, "t-stop", "blocked").await;
+    assert_eq!(status, StatusCode::OK, "{stopped}");
+    assert_eq!(stopped["blocked_by"], "operator");
+    let (_, listed) = send(&state, read("/api/tasks")).await;
+    let row = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == "t-stop")
+        .expect("listed");
+    assert_eq!(row["blocked_by"], "operator", "{row}");
+
+    clock.advance_secs(3600);
+    let plane = control(&state).await;
+    let stuck_ids: Vec<&str> = plane["stuck"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["reason"] == "blocked")
+        .map(|s| s["task_id"].as_str().unwrap())
+        .collect();
+    assert!(
+        !stuck_ids.contains(&"t-stop"),
+        "parked is not stuck: {plane}"
+    );
+
+    // A worker's blocked report is stuck.
+    let (status, blocked) = post_report(
+        &state,
+        &json!({"claim_id": claim_id, "commit_sha": "abc1234", "verification": "no checkout",
+                "checks": [], "outcome": "blocked"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{blocked}");
+    assert_eq!(blocked["blocked_by"], "worker");
+    let plane = control(&state).await;
+    assert!(
+        plane["stuck"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["task_id"] == "t-held" && s["reason"] == "blocked"),
+        "{plane}"
+    );
 }

@@ -11,7 +11,8 @@ const COLUMNS: &str = "id, title, body, status, kind, product_id, priority, bran
                        claim_id, claimed_at, claim_expires_at, commit_sha, verification, \
                        release_tag, created_at, updated_at, merge_target_task_id, checks_json, \
                        review_target_task_id, review_verdict, release_level, release_task_id, \
-                       depends_on, done_at, rework_target_task_id, rework_reason, closed_at";
+                       depends_on, done_at, rework_target_task_id, rework_reason, closed_at, \
+                       blocked_by";
 
 /// Every status, in vocabulary order. Used to enumerate legal transitions.
 pub(crate) const ALL_STATUSES: [TaskStatus; 10] = [
@@ -447,6 +448,45 @@ pub struct Task {
     /// once. `None` on everything still open or finished the ordinary way.
     #[serde(default)]
     pub closed_at: Option<String>,
+    /// Who put the task into `blocked`, while it is: a person parking it
+    /// (`operator`), a worker's report (`worker`), or the control plane
+    /// (`system`). Only the last two count as stuck. `None` off `blocked`.
+    #[serde(default)]
+    pub blocked_by: Option<BlockedBy>,
+}
+
+/// The path a task took into `blocked`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlockedBy {
+    /// A person pressed it: the work is parked on purpose, not stuck.
+    #[serde(rename = "operator")]
+    Operator,
+    /// A worker reported it could not finish.
+    #[serde(rename = "worker")]
+    Worker,
+    /// The control plane did it: a dependency was called off, a rework failed.
+    #[serde(rename = "system")]
+    System,
+}
+
+impl BlockedBy {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::Worker => "worker",
+            Self::System => "system",
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self, Error> {
+        match raw {
+            "operator" => Ok(Self::Operator),
+            "worker" => Ok(Self::Worker),
+            "system" => Ok(Self::System),
+            other => Err(Error::Invalid(format!("invalid blocked_by: {other}"))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -703,7 +743,8 @@ fn block_dependants(
     stamp: &str,
 ) -> Result<(), Error> {
     tx.execute(
-        "UPDATE tasks SET status = 'blocked', verification = ?2, updated_at = ?3
+        "UPDATE tasks SET status = 'blocked', verification = ?2, updated_at = ?3,
+                blocked_by = 'system'
          WHERE depends_on = ?1 AND status IN ('draft', 'ready')",
         rusqlite::params![
             called_off_id,
@@ -1148,6 +1189,17 @@ fn operator_refusal(task: &Task, to: TaskStatus) -> Option<Error> {
     // A release attempt is the same shape: `done` is the tag `bump-tag` cut and
     // the shipping of every task it carries, `blocked` is the reason it could
     // not — both are evidence only `report` produces.
+    // Parking is for ordinary work. A review, merge, release or rework the
+    // control plane issued is called off (`cancelled`, `dropped`) and issued
+    // again, never put back in a drawer it was never in.
+    if task.kind != TaskKind::Normal && to == TaskStatus::Draft {
+        return Some(Error::Invalid(format!(
+            "{} task {} is not parked: call it off (cancelled or dropped) and let the control \
+             plane issue it again",
+            attempt_noun(task.kind),
+            task.id
+        )));
+    }
     if matches!(task.kind, TaskKind::InstantMerge | TaskKind::InstantRelease)
         && matches!(to, TaskStatus::Done | TaskStatus::Blocked)
     {
@@ -1307,11 +1359,21 @@ fn set_status_pressed_by(
         {
             return Err(refusal);
         }
+        if to == TaskStatus::Draft && task.status == TaskStatus::Wip {
+            return Err(Error::Conflict(format!(
+                "task {id} is wip: a claimed task is handed back by its worker, not parked by hand"
+            )));
+        }
         if !can_transition(task.status, to) {
             return Err(Error::Invalid(format!(
                 "cannot move task {id} from {} to {}",
                 task.status.as_str(),
                 to.as_str()
+            )));
+        }
+        if to == TaskStatus::Draft && task.claim_id.is_some() {
+            return Err(Error::Conflict(format!(
+                "task {id} is held by a claim and cannot be parked"
             )));
         }
         // While a rework holds the branch, the target goes nowhere by hand:
@@ -1353,14 +1415,23 @@ fn set_status_pressed_by(
                 "product {product_id} does not release"
             )));
         }
+        // Who blocked it travels with the status: a press is the operator's
+        // parking, a control-plane transition is the system's; anything else
+        // clears the mark.
+        let blocked_by = match (to, presser) {
+            (TaskStatus::Blocked, Presser::Operator) => Some(BlockedBy::Operator.as_str()),
+            (TaskStatus::Blocked, Presser::ControlPlane) => Some(BlockedBy::System.as_str()),
+            _ => None,
+        };
         tx.execute(
             "UPDATE tasks SET status = ?2, updated_at = ?3,
                     done_at = CASE WHEN ?2 = 'done' AND kind = 'normal'
                               THEN COALESCE(done_at, ?3) ELSE done_at END,
                     closed_at = CASE WHEN ?2 IN ('cancelled', 'dropped')
-                                THEN COALESCE(closed_at, ?3) ELSE closed_at END
+                                THEN COALESCE(closed_at, ?3) ELSE closed_at END,
+                    blocked_by = ?4
              WHERE id = ?1",
-            rusqlite::params![id, to.as_str(), stamp],
+            rusqlite::params![id, to.as_str(), stamp, blocked_by],
         )?;
         // The landing promotes what waited for it; a task called off blocks
         // what waited for it. Both here, so a status the control plane grants
@@ -1871,7 +1942,7 @@ fn report_blocked(
         TaskStatus::Wip => {
             tx.execute(
                 "UPDATE tasks SET status = 'blocked', verification = ?2, checks_json = ?3,
-                        updated_at = ?4
+                        updated_at = ?4, blocked_by = 'worker'
                  WHERE id = ?1",
                 rusqlite::params![task.id, reason, checks_json, stamp],
             )?;
@@ -1883,7 +1954,8 @@ fn report_blocked(
                 && let Some(target_id) = task.rework_target_task_id.as_deref()
             {
                 tx.execute(
-                    "UPDATE tasks SET status = 'blocked', verification = ?2, updated_at = ?3
+                    "UPDATE tasks SET status = 'blocked', verification = ?2, updated_at = ?3,
+                            blocked_by = 'worker'
                      WHERE id = ?1 AND status = 'wip' AND claim_id IS NULL",
                     rusqlite::params![target_id, reason, stamp],
                 )?;
@@ -3139,7 +3211,7 @@ pub fn stuck(
         collect(
             StuckReason::Blocked,
             "SELECT id, kind, status, updated_at FROM tasks
-             WHERE status = 'blocked'
+             WHERE status = 'blocked' AND COALESCE(blocked_by, 'worker') != 'operator'
              ORDER BY updated_at ASC, id ASC",
             &[],
         )?;
@@ -3178,7 +3250,9 @@ pub fn can_transition(from: TaskStatus, to: TaskStatus) -> bool {
     matches!(
         (from, to),
         (TaskStatus::Draft | TaskStatus::Blocked, TaskStatus::Ready)
-            | (TaskStatus::Ready, TaskStatus::Wip)
+            // Parking: back to the drawer while nobody holds it. `wip` does
+            // not come back this way — returning a claim is the worker's act.
+            | (TaskStatus::Ready, TaskStatus::Draft | TaskStatus::Wip)
             | (TaskStatus::Wip, TaskStatus::Done | TaskStatus::Ready)
             | (TaskStatus::Done, TaskStatus::Approved)
             | (TaskStatus::Approved, TaskStatus::Merged)
@@ -3233,6 +3307,11 @@ fn from_row(row: &Row<'_>) -> Result<Task, Error> {
         rework_target_task_id: row.get(25)?,
         rework_reason: decode_reason(row.get::<_, Option<String>>(26)?.as_deref())?,
         closed_at: row.get(27)?,
+        blocked_by: row
+            .get::<_, Option<String>>(28)?
+            .as_deref()
+            .map(BlockedBy::parse)
+            .transpose()?,
     })
 }
 
@@ -3256,9 +3335,9 @@ mod tests {
     use time::macros::datetime;
 
     use super::{
-        ALL_STATUSES, Check, NewTask, Releasable, ReleaseLevel, ReportOutcome, ReviewVerdict,
-        ReworkReason, StuckReason, StuckThresholds, Task, TaskKind, TaskPatch, TaskStatus,
-        available_transitions, can_transition, claim, closed_moment, create, delete,
+        ALL_STATUSES, BlockedBy, Check, NewTask, Releasable, ReleaseLevel, ReportOutcome,
+        ReviewVerdict, ReworkReason, StuckReason, StuckThresholds, Task, TaskKind, TaskPatch,
+        TaskStatus, available_transitions, can_transition, claim, closed_moment, create, delete,
         dependency_status, get, has_landed, issue_merge, issue_release, issue_review,
         latest_review, list, list_active, list_by_status, list_closed, list_done, merge_task_id,
         mergeable, offered_transitions, pending_merges, pending_releases, pending_reviews,
@@ -8364,5 +8443,117 @@ mod tests {
         )
         .unwrap();
         assert_eq!(blocked.status, TaskStatus::Blocked);
+    }
+
+    // --- parking ---
+
+    /// A `ready` task nobody holds goes back to `draft` by hand; a claimed one
+    /// (`wip`) does not — handing a claim back is the worker's act. Parking is
+    /// offered on the card.
+    #[test]
+    fn a_ready_task_is_parked_back_to_draft_unless_a_worker_holds_it() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        set_status(&db, "t-1", TaskStatus::Ready, now()).unwrap();
+        assert!(
+            offered_transitions(&db, &get(&db, "t-1").unwrap())
+                .unwrap()
+                .contains(&TaskStatus::Draft)
+        );
+        let parked = set_status_by_operator(&db, "t-1", TaskStatus::Draft, later()).unwrap();
+        assert_eq!(parked.status, TaskStatus::Draft);
+        assert!(parked.verification.is_none());
+
+        set_status(&db, "t-1", TaskStatus::Ready, later()).unwrap();
+        let leased = claim(&db, "worker", &[TaskKind::Normal], later(), 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(leased.id, "t-1");
+        let refused = set_status_by_operator(&db, "t-1", TaskStatus::Draft, even_later());
+        assert!(
+            matches!(refused, Err(Error::Conflict(_))),
+            "a claimed task is not parked by hand: {refused:?}"
+        );
+        assert!(
+            !offered_transitions(&db, &get(&db, "t-1").unwrap())
+                .unwrap()
+                .contains(&TaskStatus::Draft)
+        );
+    }
+
+    /// Who blocked a task decides whether it is stuck: a person's parking is
+    /// not, a worker's report and a called-off dependency are.
+    #[test]
+    fn only_a_workers_or_the_systems_blocked_counts_as_stuck() {
+        let db = db_with_product();
+        for id in ["t-parked", "t-dep"] {
+            create(&db, &new_task(id, TaskKind::Normal, 0), now()).unwrap();
+            set_status(&db, id, TaskStatus::Ready, now()).unwrap();
+        }
+        let parked = set_status_by_operator(&db, "t-parked", TaskStatus::Blocked, now()).unwrap();
+        assert_eq!(parked.blocked_by, Some(BlockedBy::Operator));
+
+        create(&db, &new_task("t-worker", TaskKind::Normal, 0), now()).unwrap();
+        set_status(&db, "t-worker", TaskStatus::Ready, now()).unwrap();
+        let leased = claim(&db, "worker", &[TaskKind::Normal], now(), 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(leased.id, "t-dep", "priority order: the oldest ready first");
+        let leased = claim(&db, "worker", &[TaskKind::Normal], now(), 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(leased.id, "t-worker");
+        report(
+            &db,
+            &leased.claim_id.unwrap(),
+            "abc1234",
+            "no checkout",
+            &[],
+            ReportOutcome::Blocked,
+            None,
+            later(),
+        )
+        .unwrap();
+        assert_eq!(
+            get(&db, "t-worker").unwrap().blocked_by,
+            Some(BlockedBy::Worker)
+        );
+
+        create(&db, &new_task("t-waits", TaskKind::Normal, 0), now()).unwrap();
+        update(
+            &db,
+            "t-waits",
+            &TaskPatch {
+                depends_on: Some(Some("t-dep".into())),
+                ..TaskPatch::default()
+            },
+            now(),
+        )
+        .unwrap();
+        // t-dep is wip (claimed above); cancelling it blocks the dependant.
+        set_status_by_operator(&db, "t-dep", TaskStatus::Cancelled, later()).unwrap();
+        assert_eq!(get(&db, "t-waits").unwrap().status, TaskStatus::Blocked);
+        assert_eq!(
+            get(&db, "t-waits").unwrap().blocked_by,
+            Some(BlockedBy::System)
+        );
+
+        let stuck_blocked: Vec<String> = stuck(&db, even_later(), &thresholds())
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.reason == StuckReason::Blocked)
+            .map(|row| row.task_id)
+            .collect();
+        assert!(stuck_blocked.contains(&"t-worker".to_owned()));
+        assert!(stuck_blocked.contains(&"t-waits".to_owned()));
+        assert!(
+            !stuck_blocked.contains(&"t-parked".to_owned()),
+            "parking is a decision, not a jam: {stuck_blocked:?}"
+        );
+
+        // Leaving blocked clears the mark.
+        let back =
+            set_status_by_operator(&db, "t-parked", TaskStatus::Ready, even_later()).unwrap();
+        assert_eq!(back.blocked_by, None);
     }
 }

@@ -243,4 +243,36 @@ describe("StatusTaskList", () => {
     )!;
     expect(first.querySelector("[data-depends-on]")).toBeNull();
   });
+
+  it("says who blocked a blocked card, and calls a parked one 保留", () => {
+    render(StatusTaskList, {
+      props: {
+        fetchState: "ready",
+        items: [
+          { ...summary("t-parked", "blocked"), blocked_by: "operator" },
+          { ...summary("t-jam", "blocked"), blocked_by: "worker" },
+          { ...summary("t-dep", "blocked"), blocked_by: "system" },
+          summary("t-old", "blocked"),
+        ],
+      },
+    });
+
+    const labels = (id: string) =>
+      [
+        ...document.querySelectorAll<HTMLElement>(
+          `a[href="/tasks/${id}"] .badge`,
+        ),
+      ].map((badge) => badge.textContent?.trim());
+    expect(labels("t-parked")).toEqual(["blocked", "保留"]);
+    expect(labels("t-jam")).toEqual(["blocked", "worker"]);
+    expect(labels("t-dep")).toEqual(["blocked", "system"]);
+    // A row the server did not label (pre-migration) wears no second badge.
+    expect(labels("t-old")).toEqual(["blocked"]);
+    const parked = document.querySelector<HTMLElement>(
+      'a[href="/tasks/t-parked"] [data-blocked-by]',
+    )!;
+    expect(parked.dataset.blockedBy).toBe("operator");
+    // The badge is neutral chrome like the status badge: no error tint.
+    expect(parked.classList.contains("error-banner")).toBe(false);
+  });
 });
