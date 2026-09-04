@@ -74,6 +74,10 @@ pub struct NewRun {
     pub worker: Option<String>,
     #[serde(default)]
     pub task_id: Option<String>,
+    /// The product the run was for. Absent on the wire, the server reads it off
+    /// the task; it is never guessed from the task id.
+    #[serde(default)]
+    pub product_id: Option<String>,
     #[serde(default)]
     pub kind: Option<String>,
     #[serde(default)]
@@ -182,6 +186,9 @@ pub struct Run {
     /// What the reader did with it, one line, kept apart from the row's own
     /// `note`.
     pub read_note: Option<String>,
+    /// The product the run was for; `None` when neither the wire nor the task
+    /// said (a reader makes no product page for such a run).
+    pub product_id: Option<String>,
 }
 
 /// Cut `text` to [`TAIL_LIMIT_BYTES`] on a character boundary. Returns whether
@@ -242,6 +249,20 @@ pub fn append(db: &Db, new: &NewRun, now: OffsetDateTime) -> Result<(Run, bool),
         let stdout_tail = cut(&new.stdout_tail);
         let stderr_tail = cut(&new.stderr_tail);
         let note = cut(&new.note);
+        // The product comes from the wire, else from the task; never from the
+        // shape of the task id.
+        let product_id = match (&new.product_id, &new.task_id) {
+            (Some(product), _) => Some(product.clone()),
+            (None, Some(task_id)) => tx
+                .query_row(
+                    "SELECT product_id FROM tasks WHERE id = ?1",
+                    params![task_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten(),
+            (None, None) => None,
+        };
         let checks = serde_json::to_string(&new.checks)
             .map_err(|error| Error::Invalid(error.to_string()))?;
         let diff_stat = new
@@ -253,9 +274,10 @@ pub fn append(db: &Db, new: &NewRun, now: OffsetDateTime) -> Result<(Run, bool),
         tx.execute(
             "INSERT INTO runs (at, source, worker, task_id, kind, claim_id, attempt, profile,
                                model, skill_sha, outcome, checks, commit_sha, diff_stat,
-                               agent_exit, agent_secs, stdout_tail, stderr_tail, note, truncated)
+                               agent_exit, agent_secs, stdout_tail, stderr_tail, note, truncated,
+                               product_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18, ?19, ?20)",
+                     ?18, ?19, ?20, ?21)",
             params![
                 stamp,
                 source.as_str(),
@@ -277,6 +299,7 @@ pub fn append(db: &Db, new: &NewRun, now: OffsetDateTime) -> Result<(Run, bool),
                 stderr_tail,
                 note,
                 i64::from(truncated),
+                product_id,
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -286,7 +309,7 @@ pub fn append(db: &Db, new: &NewRun, now: OffsetDateTime) -> Result<(Run, bool),
 
 const COLUMNS: &str = "id, at, source, worker, task_id, kind, claim_id, attempt, profile, model,
                        skill_sha, outcome, checks, commit_sha, diff_stat, agent_exit, agent_secs,
-                       stdout_tail, stderr_tail, note, truncated, read_at, read_note";
+                       stdout_tail, stderr_tail, note, truncated, read_at, read_note, product_id";
 
 fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     let source: String = row.get(2)?;
@@ -318,6 +341,7 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         truncated: row.get::<_, i64>(20)? != 0,
         read_at: row.get(21)?,
         read_note: row.get(22)?,
+        product_id: row.get(23)?,
     })
 }
 
@@ -344,6 +368,7 @@ pub fn list(
     limit: Option<usize>,
     task_id: Option<&str>,
     unread: bool,
+    product_id: Option<&str>,
 ) -> Result<Page, Error> {
     let limit = limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
     db.with_conn(|conn| {
@@ -351,13 +376,14 @@ pub fn list(
             "SELECT {COLUMNS} FROM runs
              WHERE id > ?1 AND (?2 IS NULL OR task_id = ?2)
                AND (?4 = 0 OR read_at IS NULL)
+               AND (?5 IS NULL OR product_id = ?5)
              ORDER BY id ASC LIMIT ?3"
         );
         let mut statement = conn.prepare(&sql)?;
         let limit_param = i64::try_from(limit).unwrap_or(i64::MAX);
         let runs = statement
             .query_map(
-                params![since, task_id, limit_param, i64::from(unread)],
+                params![since, task_id, limit_param, i64::from(unread), product_id],
                 row_to_run,
             )?
             .collect::<Result<Vec<_>, _>>()?;
@@ -375,16 +401,21 @@ pub fn list(
 ///
 /// # Errors
 /// `Error::Db` when the query fails.
-pub fn next_unread(db: &Db, source: Option<Source>) -> Result<Option<Run>, Error> {
+pub fn next_unread(
+    db: &Db,
+    source: Option<Source>,
+    product_id: Option<&str>,
+) -> Result<Option<Run>, Error> {
     db.with_conn(|conn| {
         Ok(conn
             .query_row(
                 &format!(
                     "SELECT {COLUMNS} FROM runs
                      WHERE read_at IS NULL AND (?1 IS NULL OR source = ?1)
+                       AND (?2 IS NULL OR product_id = ?2)
                      ORDER BY at ASC, id ASC LIMIT 1"
                 ),
-                params![source.map(Source::as_str)],
+                params![source.map(Source::as_str), product_id],
                 row_to_run,
             )
             .optional()?)
@@ -615,37 +646,43 @@ mod tests {
         other.task_id = Some("t-2".into());
         append(&db, &other, now()).unwrap();
 
-        let page = list(&db, 0, Some(2), None, false).unwrap();
+        let page = list(&db, 0, Some(2), None, false, None).unwrap();
         assert_eq!(
             page.runs.iter().map(|run| run.id).collect::<Vec<_>>(),
             [1, 2]
         );
         assert_eq!(page.next, Some(2));
-        let page = list(&db, 2, Some(2), None, false).unwrap();
+        let page = list(&db, 2, Some(2), None, false, None).unwrap();
         assert_eq!(
             page.runs.iter().map(|run| run.id).collect::<Vec<_>>(),
             [3, 4]
         );
         assert_eq!(page.next, Some(4));
-        let page = list(&db, 4, Some(2), None, false).unwrap();
+        let page = list(&db, 4, Some(2), None, false, None).unwrap();
         assert_eq!(
             page.runs.iter().map(|run| run.id).collect::<Vec<_>>(),
             [5, 6]
         );
         assert_eq!(page.next, Some(6), "a full page always offers a cursor");
-        let page = list(&db, 6, Some(2), None, false).unwrap();
+        let page = list(&db, 6, Some(2), None, false, None).unwrap();
         assert!(page.runs.is_empty());
         assert_eq!(page.next, None);
 
-        let only_t2 = list(&db, 0, None, Some("t-2"), false).unwrap();
+        let only_t2 = list(&db, 0, None, Some("t-2"), false, None).unwrap();
         assert_eq!(only_t2.runs.len(), 1);
         assert_eq!(only_t2.runs[0].task_id.as_deref(), Some("t-2"));
         assert_eq!(only_t2.next, None);
 
         // The limit is clamped, never trusted.
-        assert_eq!(list(&db, 0, Some(0), None, false).unwrap().runs.len(), 1);
         assert_eq!(
-            list(&db, 0, Some(10_000), None, false).unwrap().runs.len(),
+            list(&db, 0, Some(0), None, false, None).unwrap().runs.len(),
+            1
+        );
+        assert_eq!(
+            list(&db, 0, Some(10_000), None, false, None)
+                .unwrap()
+                .runs
+                .len(),
             6
         );
     }
@@ -682,14 +719,16 @@ mod tests {
         rescue.source = Some(Source::Librarian);
         append(&db, &rescue, now() - time::Duration::hours(1)).unwrap();
 
-        let first = next_unread(&db, None).unwrap().unwrap();
+        let first = next_unread(&db, None, None).unwrap().unwrap();
         assert_eq!(first.id, 5, "the oldest by `at`, whatever its id");
         assert_eq!(
-            next_unread(&db, None).unwrap().unwrap().id,
+            next_unread(&db, None, None).unwrap().unwrap().id,
             5,
             "asking again changes nothing"
         );
-        let workers_first = next_unread(&db, Some(Source::Worker)).unwrap().unwrap();
+        let workers_first = next_unread(&db, Some(Source::Worker), None)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             workers_first.id, 2,
             "`source` narrows; ties on `at` go by id"
@@ -715,27 +754,34 @@ mod tests {
         ));
 
         // Ties on `at`: id 2 (worker) before id 4 (rescue).
-        assert_eq!(next_unread(&db, None).unwrap().unwrap().id, 2);
+        assert_eq!(next_unread(&db, None, None).unwrap().unwrap().id, 2);
         mark_read(&db, 2, None, now()).unwrap();
-        assert_eq!(next_unread(&db, None).unwrap().unwrap().id, 4);
+        assert_eq!(next_unread(&db, None, None).unwrap().unwrap().id, 4);
         assert_eq!(
-            next_unread(&db, Some(Source::Worker)).unwrap().unwrap().id,
+            next_unread(&db, Some(Source::Worker), None)
+                .unwrap()
+                .unwrap()
+                .id,
             3
         );
 
-        let unread = list(&db, 0, None, None, true).unwrap();
+        let unread = list(&db, 0, None, None, true, None).unwrap();
         assert_eq!(
             unread.runs.iter().map(|run| run.id).collect::<Vec<_>>(),
             [1, 3, 4],
             "`unread` lists what is left, still in id order"
         );
-        assert_eq!(list(&db, 0, None, None, false).unwrap().runs.len(), 5);
+        assert_eq!(list(&db, 0, None, None, false, None).unwrap().runs.len(), 5);
 
         for id in [1, 3, 4] {
             mark_read(&db, id, None, now()).unwrap();
         }
-        assert!(next_unread(&db, None).unwrap().is_none());
-        assert!(next_unread(&db, Some(Source::Rescue)).unwrap().is_none());
+        assert!(next_unread(&db, None, None).unwrap().is_none());
+        assert!(
+            next_unread(&db, Some(Source::Rescue), None)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(count_unread_for_task(&db, "t-1").unwrap(), 0);
 
         // The receipt's note is cut like the row's own note, and flagged.
@@ -751,6 +797,62 @@ mod tests {
         assert!(cut.truncated, "a cut receipt note is said like a cut note");
     }
 
+    /// A run carries its product: given on the wire, or read from its task when
+    /// the wire says nothing, or nothing when the task is gone. Lists and the
+    /// reading cursor narrow by it.
+    #[test]
+    fn a_run_carries_its_product_read_from_the_task_when_the_wire_says_nothing() {
+        let db = Db::open_in_memory().unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO tasks (id, title, status, kind, product_id, created_at, updated_at)
+                 VALUES ('t-1', 'x', 'done', 'normal', 'sunny-side/task-worker', 'now', 'now');",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let mut given = worker_run("c-1", 1);
+        given.product_id = Some("miyabisun/sandbox-server".into());
+        let (explicit, _) = append(&db, &given, now()).unwrap();
+        assert_eq!(
+            explicit.product_id.as_deref(),
+            Some("miyabisun/sandbox-server")
+        );
+
+        let mut from_task = worker_run("c-2", 1);
+        from_task.task_id = Some("t-1".into());
+        let (filled, _) = append(&db, &from_task, now()).unwrap();
+        assert_eq!(
+            filled.product_id.as_deref(),
+            Some("sunny-side/task-worker"),
+            "the server reads the product off the task"
+        );
+
+        let mut orphan = worker_run("c-3", 1);
+        orphan.task_id = Some("t-gone".into());
+        let (none, _) = append(&db, &orphan, now()).unwrap();
+        assert_eq!(none.product_id, None, "no task, no guess");
+
+        let only = list(&db, 0, None, None, false, Some("sunny-side/task-worker")).unwrap();
+        assert_eq!(
+            only.runs.iter().map(|run| run.id).collect::<Vec<_>>(),
+            [filled.id]
+        );
+        assert_eq!(list(&db, 0, None, None, false, None).unwrap().runs.len(), 3);
+        assert_eq!(
+            next_unread(&db, None, Some("miyabisun/sandbox-server"))
+                .unwrap()
+                .unwrap()
+                .id,
+            explicit.id
+        );
+        assert!(
+            next_unread(&db, None, Some("nobody/knows"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
     /// The sweep blanks only the tails, only past retention, and keeps the rest.
     #[test]
     fn the_sweep_blanks_old_tails_and_nothing_else() {
@@ -764,7 +866,7 @@ mod tests {
         append(&db, &fresh, now() - time::Duration::days(89)).unwrap();
 
         assert_eq!(prune_tails(&db, now(), 90).unwrap(), 1);
-        let page = list(&db, 0, None, None, false).unwrap();
+        let page = list(&db, 0, None, None, false, None).unwrap();
         let old_row = &page.runs[0];
         assert_eq!(old_row.stdout_tail, None);
         assert_eq!(old_row.stderr_tail, None);

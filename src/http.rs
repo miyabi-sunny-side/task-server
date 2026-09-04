@@ -806,6 +806,9 @@ pub struct RunsQuery {
     /// `unread=1` (or `true`): only rows no reader has finished with.
     #[serde(default)]
     pub unread: Option<String>,
+    /// Only one product's rows.
+    #[serde(default)]
+    pub product_id: Option<String>,
 }
 
 /// Read the haystack forward from a watermark: `{ runs, next }`, `next` being
@@ -823,6 +826,7 @@ pub async fn api_runs(
         query.limit,
         query.task_id.as_deref(),
         unread,
+        query.product_id.as_deref(),
     )?))
 }
 
@@ -830,6 +834,9 @@ pub async fn api_runs(
 pub struct NextRunQuery {
     #[serde(default)]
     pub source: Option<String>,
+    /// Only one product's rows.
+    #[serde(default)]
+    pub product_id: Option<String>,
 }
 
 /// The reading cursor, kept by the server: the oldest unread row, or 204 when
@@ -846,10 +853,12 @@ pub async fn api_runs_next(
         .as_deref()
         .map(runs::Source::parse)
         .transpose()?;
-    Ok(match runs::next_unread(&state.db, source)? {
-        Some(run) => Json(run).into_response(),
-        None => StatusCode::NO_CONTENT.into_response(),
-    })
+    Ok(
+        match runs::next_unread(&state.db, source, query.product_id.as_deref())? {
+            Some(run) => Json(run).into_response(),
+            None => StatusCode::NO_CONTENT.into_response(),
+        },
+    )
 }
 
 #[derive(Debug, Default, Deserialize)]

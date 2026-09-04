@@ -3767,6 +3767,61 @@ async fn a_summary_rides_the_report_and_the_patch_and_reaches_the_closed_list() 
     assert_eq!(cleared["summary"], Value::Null);
 }
 
+/// A run's product over HTTP: given in the body it is kept, absent it is read
+/// off the task, and both `GET /api/runs` and `/api/runs/next` narrow by it.
+#[tokio::test]
+async fn a_run_carries_its_product_and_the_haystack_narrows_by_it() {
+    let state = AppState::for_test();
+    put_product(&state, PRODUCT, true).await;
+    put_product(&state, "sunny-side/task-worker", true).await;
+    create_task(
+        &state,
+        &json!({"id": "task-worker-x", "title": "x", "product_id": "sunny-side/task-worker"}),
+    )
+    .await;
+
+    let (status, filled) = send(
+        &state,
+        worker(
+            "/worker/runs",
+            &json!({"source": "worker", "task_id": "task-worker-x", "claim_id": "c-1",
+                    "attempt": 1, "outcome": "done"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{filled}");
+    assert_eq!(
+        filled["product_id"], "sunny-side/task-worker",
+        "read off the task, not guessed from the id: {filled}"
+    );
+    let (status, given) = send(
+        &state,
+        human(
+            "POST",
+            "/api/runs",
+            &json!({"task_id": "task-worker-x", "note": "looked", "product_id": PRODUCT}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{given}");
+    assert_eq!(
+        given["product_id"], PRODUCT,
+        "a given product is kept: {given}"
+    );
+
+    let (_, page) = send(&state, read("/api/runs?product_id=sunny-side/task-worker")).await;
+    assert_eq!(ids_of_runs(&page), [filled["id"].as_i64().unwrap()]);
+    let (_, everything) = send(&state, read("/api/runs")).await;
+    assert_eq!(everything["runs"].as_array().unwrap().len(), 2);
+    let (status, next) = send(
+        &state,
+        read(&format!("/api/runs/next?product_id={PRODUCT}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{next}");
+    assert_eq!(next["id"], given["id"], "{next}");
+}
+
 /// The reading cursor over HTTP: `GET /api/runs/next` hands the oldest unread
 /// row out (identity, no CSRF) and keeps handing it out until
 /// `POST /api/runs/{id}/read` (identity, no CSRF) marks it; reading twice is a
@@ -3900,7 +3955,7 @@ async fn the_haystack_persists_across_reopen_and_the_sweep_keeps_the_rows() {
     assert_eq!(status, StatusCode::CREATED);
 
     let state = reopen(&dir, state);
-    assert_eq!(state.db.schema_version().expect("version"), 19);
+    assert_eq!(state.db.schema_version().expect("version"), 20);
     let now = task_server::clock::Clock::now(&clock);
     let blanked = task_server::runs::prune_tails(&state.db, now, 90).expect("sweep");
     assert_eq!(blanked, 1);
