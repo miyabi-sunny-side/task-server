@@ -147,6 +147,8 @@ pub struct ClosedSummary {
     pub product_id: Option<String>,
     pub release_tag: Option<String>,
     pub verification: Option<String>,
+    /// The line a person reads on the list; `verification` is the log behind it.
+    pub summary: Option<String>,
     pub done_at: Option<String>,
     pub closed_at: String,
 }
@@ -161,6 +163,7 @@ impl From<Task> for ClosedSummary {
             product_id: task.product_id,
             release_tag: task.release_tag,
             verification: task.verification,
+            summary: task.summary,
             done_at: task.done_at,
             closed_at,
         }
@@ -215,6 +218,10 @@ pub struct ReportBody {
     /// to be kept on the task rather than thrown away with a refusal.
     #[serde(default)]
     pub outcome: Option<String>,
+    /// The completion report a person reads: one or two sentences, 120
+    /// characters at most (400 past that). `verification` stays the log.
+    #[serde(default)]
+    pub summary: Option<String>,
     /// The tag a release cut. Required on a `done` report of an
     /// `instant:release` task, and meaningless on every other kind.
     #[serde(default)]
@@ -729,7 +736,7 @@ pub async fn worker_report(
     Json(body): Json<ReportBody>,
 ) -> Result<Json<TaskCard>, Error> {
     let outcome = ReportOutcome::parse_optional(body.outcome.as_deref())?;
-    let reported = task::report(
+    let reported = task::report_with_summary(
         &state.db,
         &body.claim_id,
         &body.commit_sha,
@@ -737,6 +744,7 @@ pub async fn worker_report(
         &body.checks,
         outcome,
         body.release_tag.as_deref(),
+        body.summary.as_deref(),
         state.clock.now(),
     )?;
     Ok(Json(card(&state.db, reported)?))

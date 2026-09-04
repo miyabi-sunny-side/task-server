@@ -807,6 +807,51 @@ async fn task_create_files_the_release_level_and_defaults_it_to_patch() {
     );
 }
 
+/// `summary` is set and cleared over MCP, and a long one is refused unchanged.
+#[tokio::test]
+async fn task_update_sets_and_clears_the_summary_and_refuses_a_long_one() {
+    let (_dir, state) = file_backed_state();
+    let router = task_server::app(state);
+    catalogue(&router, "sunny-side/task-server").await;
+    let mut admin = McpClient::new(&router, "/mcp", STALE_MCP_CAPABILITY);
+    admin.initialize().await;
+    admin
+        .call(
+            "task_create",
+            json!({ "id": "t-1", "title": "first", "product_id": "sunny-side/task-server" }),
+        )
+        .await;
+    let set = admin
+        .call(
+            "task_update",
+            json!({ "id": "t-1", "summary": "要約を書いた。" }),
+        )
+        .await;
+    assert_eq!(set["isError"], json!(false), "{set}");
+    assert_eq!(
+        set["structuredContent"]["task"]["summary"],
+        "要約を書いた。"
+    );
+    let long = admin
+        .call(
+            "task_update",
+            json!({ "id": "t-1", "summary": "あ".repeat(121) }),
+        )
+        .await;
+    assert_eq!(long["isError"], json!(true), "{long}");
+    assert_eq!(long["structuredContent"]["code"], "invalid");
+    assert_eq!(
+        admin.call("task_get", json!({ "id": "t-1" })).await["structuredContent"]["task"]["summary"],
+        "要約を書いた。",
+        "a refused update changes nothing"
+    );
+    let cleared = admin
+        .call("task_update", json!({ "id": "t-1", "summary": null }))
+        .await;
+    assert_eq!(cleared["isError"], json!(false), "{cleared}");
+    assert_eq!(cleared["structuredContent"]["task"]["summary"], Value::Null);
+}
+
 /// `depends_on` is filed and cleared over MCP the same way HTTP does it, it
 /// never refuses `ready`, and `task_get` says what the dependency is doing.
 #[tokio::test]

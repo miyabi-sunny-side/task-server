@@ -28,6 +28,57 @@ const FIXTURE: Task = {
 describe("TaskCard", () => {
   afterEach(cleanup);
 
+  it("puts the summary first and folds the log, the checks and the findings into closed details", () => {
+    render(TaskCard, {
+      props: {
+        task: {
+          ...FIXTURE,
+          summary: "依存の順序を claim 側へ移した。全 test 緑。",
+          checks: [{ name: "cargo test", exit_code: 0 }],
+          latest_review: {
+            review_task_id: "review:t-1",
+            verdict: "approve",
+            findings: "英語の長い所見",
+            subject_commit_sha: "abc1234",
+            reported_at: "2026-09-04T00:00:00Z",
+          },
+        },
+      },
+    });
+
+    const summary = document.querySelector<HTMLElement>(
+      '[data-field="summary"]',
+    )!;
+    expect(summary.textContent?.trim()).toBe(
+      "依存の順序を claim 側へ移した。全 test 緑。",
+    );
+    const log = document.querySelector<HTMLDetailsElement>(
+      'details[data-field="verification"]',
+    )!;
+    expect(log.open).toBe(false);
+    expect(log.querySelector("summary")?.textContent?.trim()).toBe("作業記録");
+    expect(log.textContent).toContain(FIXTURE.verification as string);
+    const checks = document.querySelector<HTMLDetailsElement>(
+      'details[data-field="checks"]',
+    )!;
+    expect(checks.open).toBe(false);
+    expect(checks.textContent).toContain("cargo test");
+    const findings = document.querySelector<HTMLDetailsElement>(
+      "details[data-findings]",
+    )!;
+    expect(findings.open).toBe(false);
+    expect(findings.textContent).toContain("英語の長い所見");
+    // The summary comes before the folded log.
+    expect(
+      summary.compareDocumentPosition(log) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    cleanup();
+    render(TaskCard, { props: { task: FIXTURE } });
+    expect(document.querySelector('[data-field="summary"]')).toBeNull();
+    expect(document.querySelector('details[data-field="checks"]')).toBeNull();
+  });
+
   it("renders body, verification, commit, and one button per available transition", () => {
     render(TaskCard, { props: { task: FIXTURE } });
 
@@ -145,7 +196,9 @@ describe("TaskCard", () => {
     expect(block!.textContent).toContain("レビュー");
     expect(screen.getByText("request_changes").classList).toContain("badge");
 
-    const findings = block!.querySelector<HTMLElement>("[data-findings]");
+    const findings = block!.querySelector<HTMLElement>(
+      "[data-findings] .findings",
+    );
     expect(findings?.textContent).toBe(
       "境界値が抜けています。\n再提出してください。",
     );

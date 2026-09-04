@@ -122,6 +122,12 @@ pub struct TaskUpdateArgs {
     #[serde(default, deserialize_with = "task::double_option")]
     #[schemars(with = "Option<String>")]
     pub depends_on: Option<Option<String>>,
+    /// The completion report a person reads: one or two sentences in Japanese,
+    /// 120 characters at most (`invalid` past that). Pass `null` to clear it.
+    /// `verification` stays the log.
+    #[serde(default, deserialize_with = "task::double_option")]
+    #[schemars(with = "Option<String>")]
+    pub summary: Option<Option<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -376,6 +382,7 @@ impl Admin {
             branch: args.branch,
             release_level,
             depends_on: args.depends_on,
+            summary: args.summary,
         };
         answer(
             task::update(&self.state.db, &args.id, &patch, self.state.clock.now())

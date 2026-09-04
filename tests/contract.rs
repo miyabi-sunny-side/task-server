@@ -3683,6 +3683,90 @@ async fn people_append_rescue_notes_and_read_the_haystack_forward() {
     assert_eq!(ids_of_runs(&nobody_page), Vec::<i64>::new());
 }
 
+/// `summary` over HTTP: a worker's report carries it onto the card, a PATCH sets
+/// or clears it, 121 characters is a 400 on both doors, and the closed list
+/// carries it beside the log it replaces for a reader.
+#[tokio::test]
+async fn a_summary_rides_the_report_and_the_patch_and_reaches_the_closed_list() {
+    let state = AppState::for_test();
+    put_product(&state, PRODUCT, true).await;
+    ready_task(&state, "t-sum", 0).await;
+    let (_, leased) = send(&state, worker("/worker/claim", &json!({"worker": "w"}))).await;
+    let claim_id = leased["claim_id"].as_str().unwrap().to_owned();
+
+    let long = "あ".repeat(121);
+    let (status, refused) = send(
+        &state,
+        worker(
+            "/worker/report",
+            &json!({"claim_id": claim_id, "commit_sha": "abc1234", "verification": "cargo test",
+                    "summary": long}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    let (_, still) = get_task(&state, "t-sum").await;
+    assert_eq!(still["status"], "wip");
+
+    let (status, card) = send(
+        &state,
+        worker(
+            "/worker/report",
+            &json!({"claim_id": claim_id, "commit_sha": "abc1234",
+                    "verification": "cargo test --locked\n178 passed",
+                    "summary": "依存の順序を claim 側へ移した。全 test 緑。"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{card}");
+    assert_eq!(
+        card["summary"],
+        "依存の順序を claim 側へ移した。全 test 緑。"
+    );
+    assert_eq!(card["verification"], "cargo test --locked\n178 passed");
+
+    let (status, patched) = send(
+        &state,
+        human(
+            "PATCH",
+            "/api/tasks/t-sum",
+            &json!({"summary": "言い直した要約"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    assert_eq!(patched["summary"], "言い直した要約");
+    let (status, refused) = send(
+        &state,
+        human(
+            "PATCH",
+            "/api/tasks/t-sum",
+            &json!({"summary": "あ".repeat(121)}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+
+    let (status, closed) = send(&state, read("/api/closed")).await;
+    assert_eq!(status, StatusCode::OK, "{closed}");
+    let row = closed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "t-sum")
+        .expect("the done task is on the closed list");
+    assert_eq!(row["summary"], "言い直した要約", "{row}");
+    assert_eq!(row["verification"], "cargo test --locked\n178 passed");
+
+    let (status, cleared) = send(
+        &state,
+        human("PATCH", "/api/tasks/t-sum", &json!({"summary": null})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{cleared}");
+    assert_eq!(cleared["summary"], Value::Null);
+}
+
 /// The reading cursor over HTTP: `GET /api/runs/next` hands the oldest unread
 /// row out (identity, no CSRF) and keeps handing it out until
 /// `POST /api/runs/{id}/read` (identity, no CSRF) marks it; reading twice is a
@@ -3816,7 +3900,7 @@ async fn the_haystack_persists_across_reopen_and_the_sweep_keeps_the_rows() {
     assert_eq!(status, StatusCode::CREATED);
 
     let state = reopen(&dir, state);
-    assert_eq!(state.db.schema_version().expect("version"), 18);
+    assert_eq!(state.db.schema_version().expect("version"), 19);
     let now = task_server::clock::Clock::now(&clock);
     let blanked = task_server::runs::prune_tails(&state.db, now, 90).expect("sweep");
     assert_eq!(blanked, 1);

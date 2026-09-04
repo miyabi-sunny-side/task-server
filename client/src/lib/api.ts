@@ -69,6 +69,10 @@ export interface TaskCard {
   updated_at: string;
   available_transitions: string[];
   latest_review?: ReviewOutcome;
+  // One or two sentences a person reads first; the log lives in verification.
+  summary?: string | null;
+  // The checks the worker ran, as reported.
+  checks?: { name: string; exit_code: number }[];
   // How far shipping this work steps the version; on a release task, the
   // largest level it ships. Optional here only so fixtures written before the
   // field existed still type-check; the server always sends it.
@@ -150,6 +154,8 @@ export interface DoneTask {
   product_id: string | null;
   release_tag: string | null;
   verification: string | null;
+  // The completion report a person reads; `verification` is the log behind it.
+  summary?: string | null;
   done_at: string | null;
 }
 

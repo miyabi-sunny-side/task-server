@@ -40,14 +40,14 @@
       : fetchState,
   );
 
-  // DESIGN.md, Closed page: the first one or two source lines, not a
-  // CSS-clamped truncation, and no element at all when there is nothing to
-  // show.
-  function excerpt(verification: string | null): string {
-    if (!verification || verification.trim() === "") {
-      return "";
-    }
-    return verification.split("\n").slice(0, 2).join("\n");
+  // DESIGN.md, Closed page: the list is the forest. The summary a person
+  // wrote; failing that, the first line of the log cut at 80 code points; and
+  // no element at all when there is nothing to show.
+  function digest(item: ClosedTask): string {
+    const summary = item.summary?.trim();
+    if (summary) return summary;
+    const first = (item.verification ?? "").split("\n")[0].trim();
+    return Array.from(first).slice(0, 80).join("");
   }
 
   // The same rhythm as the top page and the detail: reload while visible,
@@ -80,23 +80,24 @@
     {:else}
       <ul class="cards">
         {#each items as item (item.id)}
-          {@const shown = excerpt(item.verification)}
+          {@const shown = digest(item)}
           <li>
+            <!-- Forest before trees (DESIGN.md, Closed page): product, title,
+                 the summary, then when and how it closed. The log never sits
+                 on a list; the Task Card folds it away. -->
             <a class="card" href={`/tasks/${item.id}`}>
-              <span class="line">
-                <span class="name">{item.title}</span>
-                <span class="tail">
-                  <span class="badge">{item.status}</span>
-                  {#if item.release_tag}
-                    <span class="badge">{item.release_tag}</span>
-                  {/if}
-                  <span class="product">{item.product_id}</span>
-                  <span class="done-at">{item.closed_at}</span>
-                </span>
-              </span>
+              <span class="product product-first">{item.product_id}</span>
+              <span class="name">{item.title}</span>
               {#if shown}
-                <span class="excerpt">{shown}</span>
+                <span class="summary">{shown}</span>
               {/if}
+              <span class="tail">
+                <span class="done-at">{item.closed_at}</span>
+                <span class="badge">{item.status}</span>
+                {#if item.release_tag}
+                  <span class="badge">{item.release_tag}</span>
+                {/if}
+              </span>
             </a>
           </li>
         {/each}
@@ -113,12 +114,21 @@
     align-items: stretch
     gap: var(--sp-2)
 
-  .line
-    display: flex
-    flex-wrap: wrap
-    align-items: baseline
-    justify-content: space-between
-    gap: var(--sp-1) var(--sp-2)
+  // The product is the first thing read, so it is body-colored and small
+  // rather than the muted caption the row recipe gives it.
+  .product-first
+    font-size: var(--fs-sm)
+    line-height: 1.4
+    color: var(--c-on-surface)
+
+  .name
+    overflow-wrap: anywhere
+
+  .summary
+    font-size: var(--fs-sm)
+    line-height: 1.5
+    color: var(--c-on-surface)
+    overflow-wrap: anywhere
 
   .tail
     display: flex
@@ -131,10 +141,4 @@
     line-height: 1.4
     color: var(--c-muted)
 
-  .excerpt
-    font-size: var(--fs-sm)
-    line-height: 1.5
-    color: var(--c-muted)
-    white-space: pre-line
-    overflow-wrap: anywhere
 </style>

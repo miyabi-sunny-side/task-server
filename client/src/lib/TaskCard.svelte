@@ -43,14 +43,30 @@
     {/if}
   </p>
 </div>
+<!-- The forest first: the one or two sentences a person reads as the
+     completion report. The log (verification, checks) is folded below it,
+     closed by default (DESIGN.md, Task Card). -->
+{#if task.summary}
+  <p class="summary" data-field="summary">{task.summary}</p>
+{/if}
 <p class="caption" data-field={commitField}>
   <span class="caption-label">{commitField}</span>
   {task.commit_sha ?? ""}
 </p>
-<p class="caption" data-field="verification">
-  <span class="caption-label">verification</span>
-  {task.verification ?? ""}
-</p>
+<details class="record" data-field="verification">
+  <summary class="caption record-head">作業記録</summary>
+  <p class="record-text">{task.verification ?? ""}</p>
+</details>
+{#if task.checks && task.checks.length > 0}
+  <details class="record" data-field="checks">
+    <summary class="caption record-head">確認結果</summary>
+    <ul class="checks">
+      {#each task.checks as check (check.name)}
+        <li class="record-text">{check.name}: exit {check.exit_code}</li>
+      {/each}
+    </ul>
+  </details>
+{/if}
 <!-- A task that waits for another says so beside the other captions; a
      ready one whose dependency has not landed says, in one more muted line,
      that this is why no worker has it yet (DESIGN.md, Dependency). -->
@@ -80,7 +96,11 @@
       レビュー
       <span class="badge">{review.verdict}</span>
     </p>
-    <p class="findings" data-findings>{review.findings ?? ""}</p>
+    <!-- The verdict is read at once; the findings are the trees, folded. -->
+    <details class="record" data-findings>
+      <summary class="caption record-head">レビュー所見</summary>
+      <p class="findings">{review.findings ?? ""}</p>
+    </details>
   </section>
 {/if}
 <p class="body-text">{task.body}</p>
@@ -132,6 +152,33 @@
 
   .caption-label
     margin-right: var(--sp-2)
+
+  .summary
+    margin: 0 0 var(--sp-3)
+    font-size: var(--fs-md)
+    line-height: 1.6
+    color: var(--c-on-surface)
+    overflow-wrap: anywhere
+
+  // The folded log: a caption-toned summary line the reader opens on purpose.
+  .record
+    margin: 0 0 var(--sp-2)
+
+  .record-head
+    cursor: pointer
+    margin: 0
+
+  .record-text
+    margin: var(--sp-1) 0 0
+    font-size: var(--fs-sm)
+    line-height: 1.5
+    color: var(--c-on-surface)
+    white-space: pre-line
+    overflow-wrap: anywhere
+
+  .checks
+    margin: var(--sp-1) 0 0
+    padding-left: var(--sp-4)
 
   .dependency
     margin-right: var(--sp-2)

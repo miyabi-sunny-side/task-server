@@ -751,9 +751,14 @@ counterpart to carry, so it earns no token pair.
   (caption type, 1px border, muted text; neutral chrome, not a data
   color) — the status, and for a task whose kind is not `normal`
   (`instant:merge`, `review`, `rework`) a second badge naming that kind. Below
-  the head, `commit_sha` and `verification` as muted captions when
-  present, body text (body, 1.6, pre-line), and `available_transitions`
-  as a row of default buttons, one per reachable status. The `ready` transition, when present,
+  the head comes **the summary** (`summary`, body text, on-surface) when
+  the task has one — the one or two sentences a person reads as the
+  completion report — then `commit_sha` as a muted caption, then the
+  **work record folded away**: `verification` and `checks` each sit in a
+  `<details>` element (summary lines 作業記録 and 確認結果) that is closed
+  by default, because they are the log, not the report. Then the body
+  text (body, 1.6, pre-line), and `available_transitions` as a row of
+  default buttons, one per reachable status. The `ready` transition, when present,
   is the single primary (accent-filled) button — it is the human
   decision the screen exists for. After a successful transition the
   card reloads so status and buttons update. There is no
@@ -797,9 +802,12 @@ counterpart to carry, so it earns no token pair.
   for (`review_verdict` and `review_findings`, however the server
   sources them) renders one block **between the caption row and the
   body**: a muted caption heading レビュー carrying the verdict as an
-  outline badge, then the findings as body-sm text with `white-space:
-  pre-line`, the whole block built from the card recipe
-  (surface-raised, 1px hairline, md radius, 10px padding). It sits
+  outline badge, then the findings **folded in a `<details>`** (summary
+  line レビュー所見, closed by default) as body-sm text with
+  `white-space: pre-line` — the verdict is the forest a reader needs at
+  once, the findings are the trees — the whole block built from the
+  card recipe (surface-raised, 1px hairline, md radius, 10px padding).
+  It sits
   above the body because a worker reopening a task that came back to
   `ready` has to read the correction before the instruction it
   corrects; a reader who has to scroll past the brief to find out why
@@ -838,20 +846,23 @@ counterpart to carry, so it earns no token pair.
 
   Each row reuses the **card recipe** (`.cards` / `.card`:
   surface-raised, 1px hairline, `--radius-md`, 10px padding, 8px gaps
-  between rows), stacked exactly like a blocked merge-train card — a
-  `.name`/`.tail` header line, then one optional line under it — so the
-  whole row is **one link to the Task Card and never a second focus
-  stop**. The header line holds the title (`.name`) on the left; the
-  tail (right, baseline-aligned) holds, in order, the **status badge**
-  (outline badge recipe — neutral, never tinted, per Status is worn,
-  never tinted), the **release tag** when present (the same outline
-  badge recipe, a second chip), the `.product` id, then the completion
-  timestamp as a muted caption. Under the header line, when
-  `verification` is non-empty, an excerpt line renders its **first one
-  or two source lines** (split on `\n`, not CSS-clamped) as muted
-  body-sm text with `white-space: pre-line` and `overflow-wrap: anywhere`
-  — a task with empty or absent verification renders no excerpt line,
-  never an empty one, the same rule the review block already keeps.
+  between rows), stacked so the whole row is **one link to the Task Card
+  and never a second focus stop**. It reads **forest before trees**, in
+  this order: the product id first (`.product-first`, body-sm,
+  on-surface, as on the top page), the title (`.name`), then **the
+  summary** (`.summary`: body-sm, on-surface, `overflow-wrap: anywhere`)
+  — the one or two sentences a person reads as the completion report —
+  and last the tail (baseline-aligned) with the completion timestamp as
+  a muted caption, the **status badge** (outline badge recipe — neutral,
+  never tinted, per Status is worn, never tinted) and the **release tag**
+  when present (the same outline badge recipe, a second chip). The list
+  never shows the log: when a task has no `summary`, the summary line
+  shows the **first line of `verification` cut at 80 characters** (by
+  code point, no ellipsis) and nothing after it; a task with neither
+  renders no summary line at all, never an empty one. The rule of this
+  screen and the Task Card together: **a list is the forest (summary);
+  the Task Card's folded details are the trees (verification, checks,
+  review findings).**
 
   The list container carries `data-state="loading|empty|error|success"`
   on the task list's own discipline: _loading_ is the centered accent
@@ -940,9 +951,15 @@ counterpart to carry, so it earns no token pair.
      it. Item 1 reads テーマ設定 and opens the centered theme modal.
   8. A Task Card sub-header contains the task title and zero
      buttons or links.
-  9. A Task Card shows body, verification, commit_sha, status, and one
-     control per available transition, with `ready` as the only primary
-     button when it is offered. Its head opens with the product id: in
+  9. A Task Card shows body, commit_sha, status, and one control per
+     available transition, with `ready` as the only primary button when
+     it is offered. When the card payload carries `summary` it renders
+     first among the fields under the head (`data-field="summary"`);
+     `verification` and `checks` each sit inside a `<details>`
+     (`data-field="verification"` / `"checks"`) whose `open` is false on
+     render and whose `<summary>` reads 作業記録 / 確認結果; a task without
+     `checks` renders no checks details, and a task without `summary`
+     renders no summary element. Its head opens with the product id: in
      document order the product precedes the status badge, and the kind
      badge (when the kind is not `normal`) follows the status badge.
      After a successful POST the displayed status and buttons match the
@@ -1147,23 +1164,24 @@ counterpart to carry, so it earns no token pair.
   32. Closed row composition and single focus stop. Each row computes the
       card recipe (1px border, 8px radius, 10px padding) and contains
       exactly one focusable element — the row's own link — regardless
-      of whether a release-tag chip or a verification excerpt is
-      present. The status badge and any release-tag chip both compute
-      `border-radius` 9999px and sit in the row's tail alongside the
-      product id and the completion timestamp. A row whose task has
-      empty or absent `verification` renders no excerpt element at all
-      — not an empty one — and a row whose `verification` holds more
-      than two lines shows only its first two, joined by a single
-      `\n`, in the rendered `textContent`.
+      of whether a release-tag chip or a summary line is present. In
+      document order the product id precedes the title and the title
+      precedes the `.summary` line; the status badge and any release-tag
+      chip both compute `border-radius` 9999px and sit in the row's tail
+      with the completion timestamp. With `summary` present the row's
+      `textContent` contains the summary and no text of `verification`;
+      with `summary` absent and `verification` present, the `.summary`
+      line's `textContent` is exactly the first line of `verification`
+      cut to its first 80 code points; with neither, no `.summary`
+      element exists.
   33. Closed page states. With no closed tasks the list renders
       exactly one `.state` element reading "閉じたタスクがありません"
       and no row, no heading, and no pill. While loading it renders the
       centered accent spinner and no rows. On a failed fetch it renders
       the `.state.error` line plus a default-styled "再試行" button
       that re-fires the request on click. At 375px, a row whose
-      verification excerpt holds a 40-character unbroken token still
-      leaves `document.documentElement.scrollWidth` within the
-      viewport.
+      summary line holds a 40-character unbroken token still leaves
+      `document.documentElement.scrollWidth` within the viewport.
   34. Stuck work is stated, not handled. With `stuck` non-empty the
       reconciliation block renders a readout with one group per reason
       (`data-reason`), in the server's order, each captioned with the
@@ -1242,8 +1260,8 @@ counterpart to carry, so it earns no token pair.
 - Do keep a done row a single link with one focus stop, its status and
   release tag riding the existing outline badge recipe; don't add a
   second link or button inside a row for the tag or the status.
-- Do drop a done row's verification excerpt entirely when there is
-  nothing to show; don't render an empty excerpt line.
+- Do drop a closed row's summary line entirely when there is nothing to
+  show; don't render an empty line, and never put the log on a list.
 - Don't use emoji or text glyphs as icons; every UI icon is an
   `Icon.svelte` dictionary entry.
 - Do render every app-icon raster from `client/public/icon.svg` and track

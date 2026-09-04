@@ -81,6 +81,7 @@ const ROWS: ClosedTask[] = [
     title: "最新の完了",
     status: "done",
     done_at: "2026-08-17T09:00:00Z",
+    summary: "依存の順序を claim 側へ移した。全 test 緑。",
     verification: "line one\nline two\nline three",
   }),
   task({
@@ -104,7 +105,7 @@ const ROWS: ClosedTask[] = [
     status: "released",
     release_tag: "v1.0.0",
     done_at: "2026-08-15T09:00:00Z",
-    verification: "shipped it",
+    verification: "x".repeat(100) + "\nsecond line of the log",
   }),
 ];
 
@@ -135,22 +136,39 @@ describe("Closed", () => {
     expect(calledOff.textContent).toContain("2026-08-16T12:00:00Z");
   });
 
-  it("shows product, status, release tag, done_at, and a two-line excerpt", async () => {
+  it("reads product, title, summary, then the tail; the log never reaches the list", async () => {
     stubFetch(() => jsonResponse(ROWS));
 
     render(Closed);
     await waitFor(() => expect(region().dataset.state).toBe("success"));
 
     const [newest, , , oldest] = cards();
-    expect(newest.textContent).toContain("最新の完了");
-    expect(newest.textContent).toContain(PRODUCT);
+    // Forest, not trees: product → title → summary → when / status / tag.
+    const product = newest.querySelector(".product-first")!;
+    const name = newest.querySelector(".name")!;
+    const summary = newest.querySelector(".summary")!;
+    expect(product.textContent).toBe(PRODUCT);
+    expect(name.textContent).toBe("最新の完了");
+    expect(summary.textContent).toBe(
+      "依存の順序を claim 側へ移した。全 test 緑。",
+    );
+    expect(
+      product.compareDocumentPosition(name) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      name.compareDocumentPosition(summary) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
     expect(newest.textContent).toContain("2026-08-17T09:00:00Z");
     expect(newest.querySelector(".badge")?.textContent?.trim()).toBe("done");
-    // Only the first two source lines, never the third.
-    expect(newest.textContent).toContain("line one");
-    expect(newest.textContent).toContain("line two");
-    expect(newest.textContent).not.toContain("line three");
+    // With a summary the log stays off the list entirely.
+    expect(newest.textContent).not.toContain("line one");
+    expect(newest.querySelector(".excerpt")).toBeNull();
 
+    // Without a summary: the log's first line, cut at 80 characters, nothing more.
+    const fallback = oldest.querySelector(".summary")!;
+    expect(fallback.textContent).toBe("x".repeat(80));
+    expect(oldest.textContent).not.toContain("second line");
+    expect(oldest.textContent).not.toContain("x".repeat(81));
     expect(
       [...oldest.querySelectorAll(".badge")].map((badge) =>
         badge.textContent?.trim(),
@@ -158,13 +176,14 @@ describe("Closed", () => {
     ).toEqual(["released", "v1.0.0"]);
   });
 
-  it("renders no excerpt element for a row with no verification", async () => {
+  it("renders no summary element for a row with neither summary nor verification", async () => {
     stubFetch(() => jsonResponse(ROWS));
 
     render(Closed);
     await waitFor(() => expect(region().dataset.state).toBe("success"));
 
     const [, middle] = cards();
+    expect(middle.querySelector(".summary")).toBeNull();
     expect(middle.querySelector(".excerpt")).toBeNull();
   });
 

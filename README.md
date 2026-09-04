@@ -150,6 +150,7 @@ report=$(curl -fsS "$TASK_SERVER_URL/worker/report" -H "$json" \
         --arg commit_sha "$commit_sha" \
         '{claim_id: $claim_id,
           commit_sha: $commit_sha,
+          summary: "依存の順序を claim 側へ移した。全 test 緑。",
           verification: "cargo test",
           checks: [{name: "cargo test", exit_code: 0}],
           outcome: "done"}')")
@@ -169,7 +170,20 @@ no branch of its own is given `task/<id>` as the claim is granted. The script
 reads three more, and none of them decides how the work is done: `status`
 separates an empty queue from a card, and `id` and `title` go to the log so a
 human can see which task this run took. Going the other way, the report hands
-back `commit_sha`, the `verification` a human reads, and the `checks` that ran.
+back `commit_sha`, the `summary` a human reads, the `verification` log, and the
+`checks` that ran.
+
+**`summary` is the one completion report a person reads; `verification` is the
+log.** `summary` is one or two sentences in Japanese, 120 characters at most
+(the server counts characters and answers 400 past that): what changed in one
+sentence, how it was checked in another. It is written by the worker's report
+(`summary` in the body), or by hand with `PATCH /api/tasks/{id}` and the MCP
+`task_update` (`null` clears it); a report without one leaves whatever summary
+the task already has. The closed list shows the summary (or, for a task without
+one, the first line of `verification` cut at 80 characters) and never the log;
+the Task Card puts the summary first and folds `verification`, `checks` and the
+review findings away. `verification` keeps the evidence — command output, shas,
+paths — and is never shortened.
 The other kinds answer elsewhere and are deliberately not repeated here: a
 review is claimed with `{"kinds": ["review"]}` and answered with a verdict on
 `/worker/review-report`, a rework with `{"kinds": ["rework"]}` and finished on

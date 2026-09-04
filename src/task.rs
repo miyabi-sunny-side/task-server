@@ -12,7 +12,7 @@ const COLUMNS: &str = "id, title, body, status, kind, product_id, priority, bran
                        release_tag, created_at, updated_at, merge_target_task_id, checks_json, \
                        review_target_task_id, review_verdict, release_level, release_task_id, \
                        depends_on, done_at, rework_target_task_id, rework_reason, closed_at, \
-                       blocked_by";
+                       blocked_by, summary";
 
 /// Every status, in vocabulary order. Used to enumerate legal transitions.
 pub(crate) const ALL_STATUSES: [TaskStatus; 10] = [
@@ -452,6 +452,11 @@ pub struct Task {
     /// (`system`). Only the last two count as stuck. `None` off `blocked`.
     #[serde(default)]
     pub blocked_by: Option<BlockedBy>,
+    /// The completion report a person reads: one or two sentences, at most
+    /// [`SUMMARY_LIMIT`] characters, written by the worker's report or by hand.
+    /// `verification` is the log; this is the line above it.
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 /// The path a task took into `blocked`.
@@ -517,6 +522,31 @@ pub struct TaskPatch {
     /// dependency is how a person skips the order on purpose.
     #[serde(deserialize_with = "double_option")]
     pub depends_on: Option<Option<String>>,
+    /// Absent leaves the summary alone; an explicit `null` clears it; a string
+    /// sets it (blank counts as clearing). At most [`SUMMARY_LIMIT`] characters.
+    #[serde(deserialize_with = "double_option")]
+    pub summary: Option<Option<String>>,
+}
+
+/// The longest a `summary` may be, in characters: one or two sentences a person
+/// reads off a list, never a log.
+pub const SUMMARY_LIMIT: usize = 120;
+
+/// Trim a summary and refuse one that is too long. Blank is no summary.
+///
+/// # Errors
+/// `Error::Invalid` when it runs past [`SUMMARY_LIMIT`] characters.
+pub fn check_summary(summary: Option<&str>) -> Result<Option<String>, Error> {
+    let Some(text) = summary.map(str::trim).filter(|text| !text.is_empty()) else {
+        return Ok(None);
+    };
+    let length = text.chars().count();
+    if length > SUMMARY_LIMIT {
+        return Err(Error::Invalid(format!(
+            "summary is {length} characters; at most {SUMMARY_LIMIT} — one or two sentences a person reads, not a log"
+        )));
+    }
+    Ok(Some(text.to_owned()))
 }
 
 /// `null` and "not sent" are different answers for an optional field that can
@@ -926,9 +956,13 @@ pub fn update(db: &Db, id: &str, patch: &TaskPatch, now: OffsetDateTime) -> Resu
         if patch.depends_on.is_some() {
             check_dependency(tx, id, depends_on)?;
         }
+        let summary = match &patch.summary {
+            Some(next) => check_summary(next.as_deref())?,
+            None => task.summary.clone(),
+        };
         tx.execute(
             "UPDATE tasks SET title = ?2, body = ?3, product_id = ?4, priority = ?5, branch = ?6,
-                    release_level = ?7, depends_on = ?8, updated_at = ?9
+                    release_level = ?7, depends_on = ?8, updated_at = ?9, summary = ?10
              WHERE id = ?1",
             rusqlite::params![
                 id,
@@ -940,6 +974,7 @@ pub fn update(db: &Db, id: &str, patch: &TaskPatch, now: OffsetDateTime) -> Resu
                 patch.release_level.unwrap_or(task.release_level).as_str(),
                 depends_on,
                 stamp,
+                summary,
             ],
         )?;
         read(tx, id)
@@ -1733,11 +1768,42 @@ pub fn report(
     release_tag: Option<&str>,
     now: OffsetDateTime,
 ) -> Result<Task, Error> {
+    report_with_summary(
+        db,
+        claim_id,
+        commit_sha,
+        verification,
+        checks,
+        outcome,
+        release_tag,
+        None,
+        now,
+    )
+}
+
+/// [`report`] that also writes the `summary` a person reads. A report without
+/// one leaves whatever summary the row already has.
+///
+/// # Errors
+/// As [`report`], plus `Error::Invalid` for a summary past [`SUMMARY_LIMIT`].
+#[allow(clippy::too_many_arguments)]
+pub fn report_with_summary(
+    db: &Db,
+    claim_id: &str,
+    commit_sha: &str,
+    verification: &str,
+    checks: &[Check],
+    outcome: ReportOutcome,
+    release_tag: Option<&str>,
+    summary: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<Task, Error> {
     if commit_sha.trim().is_empty() || verification.trim().is_empty() {
         return Err(Error::Invalid(
             "commit_sha and verification are required".into(),
         ));
     }
+    let summary = check_summary(summary)?;
     let stamp = format_z(now);
     let checks_json = if checks.is_empty() {
         None
@@ -1758,6 +1824,12 @@ pub fn report(
                  (POST /worker/review-report), not by a work report",
                 task.id
             )));
+        }
+        if let Some(summary) = summary.as_deref() {
+            tx.execute(
+                "UPDATE tasks SET summary = ?2 WHERE id = ?1",
+                rusqlite::params![task.id, summary],
+            )?;
         }
         if outcome == ReportOutcome::Blocked {
             return report_blocked(
@@ -3243,6 +3315,7 @@ fn from_row(row: &Row<'_>) -> Result<Task, Error> {
             .as_deref()
             .map(BlockedBy::parse)
             .transpose()?,
+        summary: row.get(29)?,
     })
 }
 
@@ -3272,9 +3345,9 @@ mod tests {
         dependency_status, get, has_landed, issue_merge, issue_release, issue_review,
         latest_review, list, list_active, list_by_status, list_closed, list_done, merge_task_id,
         mergeable, offered_transitions, pending_merges, pending_releases, pending_reviews,
-        releasable, release_claim, release_task_id, report, review_report, review_task_id,
-        rework_task_id, set_status, set_status_by_operator, stuck, sweep_called_off, unreviewed,
-        update,
+        releasable, release_claim, release_task_id, report, report_with_summary, review_report,
+        review_task_id, rework_task_id, set_status, set_status_by_operator, stuck,
+        sweep_called_off, unreviewed, update,
     };
     use crate::clock::format_z;
     use crate::db::Db;
@@ -8378,6 +8451,128 @@ mod tests {
             "t-later",
             "a landed dependency is no dependency to the claim"
         );
+    }
+
+    // --- summary ---
+
+    /// `summary` is the one line a person reads: a worker's report or a PATCH
+    /// writes it, it is kept apart from `verification` (the log), it is at most
+    /// 120 characters, and a PATCH clears it with an explicit null.
+    #[test]
+    fn a_summary_is_a_short_line_kept_apart_from_the_log() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        set_status(&db, "t-1", TaskStatus::Ready, now()).unwrap();
+        let leased = claim(&db, "worker", &[TaskKind::Normal], now(), 60)
+            .unwrap()
+            .unwrap();
+        let claim_id = leased.claim_id.clone().unwrap();
+        let long = "あ".repeat(121);
+        let refused = report_with_summary(
+            &db,
+            &claim_id,
+            "abc1234",
+            "cargo test",
+            &[],
+            ReportOutcome::Done,
+            None,
+            Some(&long),
+            later(),
+        );
+        assert!(matches!(refused, Err(Error::Invalid(_))), "{refused:?}");
+        assert_eq!(
+            get(&db, "t-1").unwrap().status,
+            TaskStatus::Wip,
+            "a refused report changes nothing"
+        );
+
+        let just_right = "あ".repeat(120);
+        let reported = report_with_summary(
+            &db,
+            &claim_id,
+            "abc1234",
+            "cargo test\nlong english log",
+            &[],
+            ReportOutcome::Done,
+            None,
+            Some(&just_right),
+            later(),
+        )
+        .unwrap();
+        assert_eq!(reported.summary.as_deref(), Some(just_right.as_str()));
+        assert_eq!(
+            reported.verification.as_deref(),
+            Some("cargo test\nlong english log")
+        );
+    }
+
+    /// A PATCH sets the summary, refuses a long one unchanged, treats blank as
+    /// none, and clears it with an explicit null.
+    #[test]
+    fn a_patch_sets_trims_refuses_and_clears_the_summary() {
+        let db = db_with_product();
+        create(&db, &new_task("t-1", TaskKind::Normal, 0), now()).unwrap();
+        let long = "あ".repeat(121);
+        let patched = update(
+            &db,
+            "t-1",
+            &TaskPatch {
+                summary: Some(Some("依存の順序を claim 側に移した。全 test 緑。".into())),
+                ..TaskPatch::default()
+            },
+            later(),
+        )
+        .unwrap();
+        assert_eq!(
+            patched.summary.as_deref(),
+            Some("依存の順序を claim 側に移した。全 test 緑。")
+        );
+        let too_long = update(
+            &db,
+            "t-1",
+            &TaskPatch {
+                summary: Some(Some(long.clone())),
+                ..TaskPatch::default()
+            },
+            later(),
+        );
+        assert!(matches!(too_long, Err(Error::Invalid(_))));
+        assert_eq!(
+            get(&db, "t-1").unwrap().summary.as_deref(),
+            Some("依存の順序を claim 側に移した。全 test 緑。")
+        );
+        let blank = update(
+            &db,
+            "t-1",
+            &TaskPatch {
+                summary: Some(Some("   ".into())),
+                ..TaskPatch::default()
+            },
+            later(),
+        )
+        .unwrap();
+        assert_eq!(blank.summary, None, "blank is no summary");
+        update(
+            &db,
+            "t-1",
+            &TaskPatch {
+                summary: Some(Some("要約".into())),
+                ..TaskPatch::default()
+            },
+            later(),
+        )
+        .unwrap();
+        let cleared = update(
+            &db,
+            "t-1",
+            &TaskPatch {
+                summary: Some(None),
+                ..TaskPatch::default()
+            },
+            later(),
+        )
+        .unwrap();
+        assert_eq!(cleared.summary, None);
     }
 
     // --- parking ---
