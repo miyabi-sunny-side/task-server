@@ -17,6 +17,8 @@
   --c-link: #14506e
   --c-danger: #9c2b1d
   --c-danger-subtle: #f9e9e4
+  --c-info: #1d5d8a
+  --c-info-subtle: #e6eff6
   --c-wash-base: #e6eef0
   --c-wash-raised: #eef4f5
   --c-hover-1: rgba(47, 111, 126, 0.1)
@@ -51,6 +53,8 @@
   --c-link: #7fdbff
   --c-danger: #ff6b6b
   --c-danger-subtle: #3a1a1a
+  --c-info: #7fb8e6
+  --c-info-subtle: #16232e
   --c-wash-base: #232323
   --c-wash-raised: var(--c-surface)
   --c-hover-1: #333333
@@ -203,6 +207,16 @@ a
   border-radius: var(--radius-sm)
   background: var(--c-danger-subtle)
   color: var(--c-danger)
+  font-size: var(--fs-sm)
+  line-height: 1.5
+
+// A standing state to look at, not a failure: the reconciliation frame.
+.info-banner
+  margin: 0
+  padding: var(--sp-2)
+  border-radius: var(--radius-sm)
+  background: var(--c-info-subtle)
+  color: var(--c-info)
   font-size: var(--fs-sm)
   line-height: 1.5
 

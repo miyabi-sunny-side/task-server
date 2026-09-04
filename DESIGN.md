@@ -28,6 +28,11 @@ colors:
   link: "#14506e"
   danger: "#9c2b1d"
   danger-subtle: "#f9e9e4"
+  # Information, not alarm: the tint of a standing state the operator
+  # should notice and think about (reconciliation). Blue, because green
+  # would say "fine" and yellow or orange would say "careful".
+  info: "#1d5d8a"
+  info-subtle: "#e6eff6"
   # Sprinkle indirection hooks (see Colors): neutral in Sumi, accent wash
   # in Kinari. Components consume these, never accent-subtle directly,
   # for band/hover jobs.
@@ -142,6 +147,12 @@ components:
     typography: "{typography.body-sm}"
     rounded: "{rounded.sm}"
     padding: 8px
+  info-banner:
+    backgroundColor: "{colors.info-subtle}"
+    textColor: "{colors.info}"
+    typography: "{typography.body-sm}"
+    rounded: "{rounded.sm}"
+    padding: 8px
   spinner:
     textColor: "{colors.accent}"
     size: 18px
@@ -217,7 +228,14 @@ implemented in `client/src/global.sass`.
   element per screen region. The selected-state tint is `accent-subtle`
   (rgba(47,111,126,.10) / rgba(94,184,199,.15)).
 - **Link (#14506e / #7fdbff)**, **Danger (#9c2b1d / #ff6b6b)** with
-  `danger-subtle` tints (#f9e9e4 / #3a1a1a) for error banners.
+  `danger-subtle` tints (#f9e9e4 / #3a1a1a) for error banners. Danger
+  means a request failed or something is broken — never "please look at
+  this".
+- **Info (#1d5d8a / #7fb8e6)** with `info-subtle` tints (#e6eff6 /
+  #16232e) for the one standing-state banner, reconciliation: the
+  pipeline is holding work and a person should think about it. Blue, not
+  red (nothing is broken), not green (nothing is fine), not yellow or
+  orange (nothing is dangerous).
 - **Scrim (rgba(58,47,40,.4) / rgba(0,0,0,.6)):** modal backdrop.
 
 **Sprinkle indirection (the Kinari license, made mechanical).** Four
@@ -543,9 +561,9 @@ counterpart to carry, so it earns no token pair.
   quiet pipeline is a state worth naming, not an empty box.
 
   A readout has no status heading over it, so **its cards wear the
-  neutral outline status badge** beside the product id — the same badge
-  a status-group card wears as its last line, so a card reads the same
-  wherever it sits.
+  neutral outline status badge** — and they are the same card a status
+  group draws (one component: product first, title, then status / who
+  blocked it / kind), so a task reads the same wherever it sits.
 
   **Review queue.** The pending `review` tasks, under the caption "review
   待ち". This is normal running: in a healthy pipeline the queue is
@@ -610,33 +628,55 @@ counterpart to carry, so it earns no token pair.
   live release. Every set is empty in a healthy pipeline, which is what
   makes them a different kind of thing from the queues above and forbids
   giving them the same look. This is the panel's
-  **one danger-framed block**: the error-banner recipe (danger text on
-  `danger-subtle`, sm radius, 8px padding, body-sm) carrying
-  `role="status"` — a standing state the operator has to notice, not the
-  outcome of a request they just made, so never `role="alert"`. It holds
-  one captioned line with its count pill per non-empty set — "review が
-  発行されていない task" / "merge が発行されていない task" / "release が
-  発行されていない product" — and under each the ordinary card list (for
-  the release set, one row per product carrying the count of tasks it
-  would ship), whose cards keep the neutral card recipe:
-  **the danger tint frames the fact that the pipeline is holding work,
-  and never tints the tasks themselves**, which are ordinary work. This
-  is the single extension of the danger tokens past "a request failed",
-  and it is earned: the automation dropping work silently is the only
-  other thing in this product that must never go unread.
+  **one info-framed block**: the info-banner recipe (info text on
+  `info-subtle`, sm radius, 8px padding, body-sm) carrying
+  `role="status"` — a standing state the operator has to notice and think
+  about, not the outcome of a request they just made, so never
+  `role="alert"`, and not danger: nothing failed, the pipeline is holding
+  work and a person is being asked to look. It holds one captioned line
+  with its count pill per non-empty set — "review が発行されていない
+  task" / "merge が発行されていない task" / "release が発行されていない
+  product" — and under each the ordinary card list (for the release set,
+  one row per product carrying the count of tasks it would ship), whose
+  cards keep the neutral card recipe: **the info tint frames the fact
+  that the pipeline is holding work, and never tints the tasks
+  themselves**, which are ordinary work. The card is the border and
+  everything inside it: no second frame is drawn inside a card, so the
+  whole of it is what the pointer and the focus ring pick up. The
+  `releasable` set shares the tint for the same reason the others do — a
+  product waiting for its release is held work, not a failure.
 
   **Stuck, inside reconciliation.** The server also measures waiting:
   `GET /api/control` carries `stuck`, one row per task that has sat past
-  a threshold (a task never appears under two reasons), each with a fixed `reason` (`unclaimed`, `lease-expired`,
-  `no-subtask`, `subtask-unclaimed`, `blocked`, `release-stalled`). The
-  block renders it as its last readout under the caption "動いていない
-  task" with the count pill, one ordinary card per row linking to the
-  task, wearing the reason and the status as outline badges and the
-  `since` timestamp as the muted tail. The judgment is the server's
-  (a clock and a threshold), never the screen's: the readout states the
-  rows, sorts nothing, holds no button, and follows the same rule as
-  `releasable` — issued by nobody, pressed by nobody. It is absent from
-  the DOM while `stuck` is empty.
+  a threshold (a task never appears under two reasons), each with a fixed
+  `reason` (`unclaimed`, `lease-expired`, `no-subtask`,
+  `subtask-unclaimed`, `blocked`, `release-stalled`). The block renders
+  it as its last readout, **one captioned group per reason** in the order
+  the server listed them: the caption is the reason in plain Japanese
+  with its count pill, and under the caption one muted line says what to
+  do about it. The wording is fixed here:
+
+  | reason              | caption                          | note                                                      |
+  | ------------------- | -------------------------------- | --------------------------------------------------------- |
+  | `blocked`           | 長時間 blocked 状態              | 追加の議論が必要でしょうか。ご確認ください                |
+  | `unclaimed`         | 長時間 claim されていない        | worker が動いているかご確認ください                       |
+  | `lease-expired`     | lease が切れた                   | worker が途中で止まった可能性があります。ご確認ください   |
+  | `no-subtask`        | 次の subtask が発行されていない  | review / merge / release の発行が止まっています。ご確認ください |
+  | `subtask-unclaimed` | subtask が claim されていない    | subtask を拾う worker が動いているかご確認ください        |
+  | `release-stalled`   | release が進んでいない           | release task が止まっています。ご確認ください             |
+
+  Under each group the rows are **the ordinary task card**, the same
+  component the status groups draw: product first, then the title, then
+  the status badge with who blocked it and the kind — the reason lives
+  on the caption, the `since` timestamp is not drawn, and nothing about
+  the row is a bare id. The row's product and title come from the task
+  list the page already holds (a stuck row names only its task); a task
+  the list does not carry is drawn from what the server said — its id as
+  the title, its status and kind — with no invented product. The
+  judgment is the server's (a clock and a threshold), never the
+  screen's: the readout states the rows, sorts nothing, holds no button,
+  and follows the same rule as `releasable` — issued by nobody, pressed
+  by nobody. It is absent from the DOM while `stuck` is empty.
 
   Reconciliation is also where the **cancelled blocked merge** surfaces.
   Cancelling a blocked merge frees the rest of that product's train, but
@@ -1055,15 +1095,17 @@ counterpart to carry, so it earns no token pair.
       against unchanged server state yields the same card order in
       every group, and moving a group's `blocked` merge to `cancelled`
       leaves the remaining cards in the order they already had.
-  28. Reconciliation is framed as the anomaly it is. With nothing
+  28. Reconciliation is framed as the standing state it is. With nothing
       stranded the block is absent from the DOM. With a `done` task
       holding no live review, or an `approved` task holding no live
-      merge, it renders once, computes danger text on a `danger-subtle`
-      background, carries `role="status"` and never `role="alert"`, and
-      holds one captioned line per non-empty set whose count pill equals
-      the cards under it; those cards compute the ordinary card recipe
-      (surface-raised background, 1px border, 8px radius) and appear in
-      no status group. Cancelling a `blocked` merge and reloading leaves
+      merge, it renders once, computes info text on an `info-subtle`
+      background and never the danger pair, carries `role="status"` and
+      never `role="alert"`, and holds one captioned line per non-empty
+      set whose count pill equals the cards under it; those cards are the
+      status-group card (product first, then title, then badges), compute
+      the ordinary card recipe (surface-raised background, 1px border,
+      8px radius) with no framed element inside them, and appear in no
+      status group. Cancelling a `blocked` merge and reloading leaves
       that merge out of every train and its target inside this block.
   29. A Task Card whose task carries `depends_on` renders a caption
       labelled `depends_on` whose link resolves to that task's card;
@@ -1123,11 +1165,16 @@ counterpart to carry, so it earns no token pair.
       leaves `document.documentElement.scrollWidth` within the
       viewport.
   34. Stuck work is stated, not handled. With `stuck` non-empty the
-      reconciliation block renders a readout captioned "動いていない task"
-      whose count pill equals its rows; each row is an ordinary card link
-      to `/tasks/<task_id>` carrying `data-reason` and two outline badges
-      (reason, status), and the block holds no `<button>`. With `stuck`
-      empty the readout is absent from the DOM.
+      reconciliation block renders a readout with one group per reason
+      (`data-reason`), in the server's order, each captioned with the
+      wording in the Stuck table, a count pill equal to its rows, and one
+      muted note line; each row is the ordinary task card link to
+      `/tasks/<task_id>` showing product, title and status (plus who
+      blocked it and the kind when present), no reason badge, no
+      timestamp, no bare id, and exactly one focusable element (itself);
+      the readout never carries a danger class or token, and the block
+      holds no `<button>`. With `stuck` empty the readout is absent from
+      the DOM.
   35. Who blocked it is worn. A `blocked` card in a status group and a
       `blocked` Task Card carry a second outline badge after the status:
       `保留` for `blocked_by: operator`, `worker` and `system` for the

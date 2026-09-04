@@ -265,7 +265,9 @@ describe("ControlPanel", () => {
     const stranded = block("reconciliation")!;
     expect(stranded.getAttribute("role")).toBe("status");
     expect(stranded.getAttribute("role")).not.toBe("alert");
-    expect(stranded.classList.contains("error-banner")).toBe(true);
+    expect(stranded.classList.contains("info-banner")).toBe(true);
+    expect(stranded.classList.contains("error-banner")).toBe(false);
+    expect(stranded.querySelector(".danger, .error-banner")).toBeNull();
 
     const sets = [...stranded.querySelectorAll<HTMLElement>("[data-readout]")];
     expect(sets.map((set) => set.dataset.readout)).toEqual([
@@ -282,6 +284,9 @@ describe("ControlPanel", () => {
       for (const card of cards) {
         expect(card.classList.contains("card")).toBe(true);
         expect(card.classList.contains("error-banner")).toBe(false);
+        // The ordinary list card: product first, then the title.
+        expect(card.querySelector(".product-first")).not.toBeNull();
+        expect(card.querySelector(".name")).not.toBeNull();
       }
     }
     // Stranded releases are counted per product, with the work each carries.
@@ -365,7 +370,7 @@ describe("ControlPanel", () => {
     ).toEqual(["reviews", "trains", "releases", "reconciliation"]);
   });
 
-  it("names stuck work with its reason, as a row linking to the task and no button", () => {
+  it("states stuck work per reason, in plain words, as ordinary task cards", () => {
     render(ControlPanel, {
       props: {
         fetchState: "ready",
@@ -379,6 +384,13 @@ describe("ControlPanel", () => {
               reason: "unclaimed",
             },
             {
+              task_id: "t-held",
+              kind: "normal",
+              status: "blocked",
+              since: "2026-09-03T08:00:00Z",
+              reason: "blocked",
+            },
+            {
               task_id: "release:t-9",
               kind: "instant:release",
               status: "wip",
@@ -387,22 +399,74 @@ describe("ControlPanel", () => {
             },
           ],
         }),
+        tasks: [
+          summary("t-old", "ready"),
+          { ...summary("t-held", "blocked"), blocked_by: "worker" },
+        ],
       },
     });
 
     const stranded = block("reconciliation")!;
     expect(stranded.getAttribute("role")).toBe("status");
     const set = stranded.querySelector<HTMLElement>('[data-readout="stuck"]')!;
-    expect(set.textContent).toContain("動いていない task");
+    expect(set.textContent).not.toContain("動いていない task");
+
+    // One caption per reason, in the server's order, each with its one-line
+    // note under it and its own count.
+    const groups = [...set.querySelectorAll<HTMLElement>("[data-reason]")];
+    expect(groups.map((group) => group.dataset.reason)).toEqual([
+      "unclaimed",
+      "blocked",
+      "release-stalled",
+    ]);
+    const caption = (group: HTMLElement) =>
+      group.querySelector(".caption")?.textContent?.trim();
+    const note = (group: HTMLElement) =>
+      group.querySelector(".note")?.textContent?.trim();
+    expect(caption(groups[0])).toBe("長時間 claim されていない");
+    expect(caption(groups[1])).toBe("長時間 blocked 状態");
+    expect(note(groups[1])).toBe("追加の議論が必要でしょうか。ご確認ください");
+    expect(caption(groups[2])).toBe("release が進んでいない");
+    for (const group of groups) {
+      expect(note(group)).toBeTruthy();
+      expect(group.querySelector("[data-count]")?.textContent?.trim()).toBe(
+        String(group.querySelectorAll('a[href^="/tasks/"]').length),
+      );
+    }
+
+    // The rows are the ordinary task card: product → title → status / kind,
+    // the whole card one link, nothing about the reason on it.
     const rows = set.querySelectorAll<HTMLAnchorElement>('a[href^="/tasks/"]');
-    expect(rows).toHaveLength(2);
-    expect(set.querySelector("[data-count]")?.textContent?.trim()).toBe("2");
-    expect(rows[0].getAttribute("href")).toBe("/tasks/t-old");
-    expect(rows[0].dataset.reason).toBe("unclaimed");
-    expect(rows[0].querySelector(".badge")?.textContent).toBe("unclaimed");
-    expect(rows[1].getAttribute("href")).toBe("/tasks/release:t-9");
-    expect(rows[1].dataset.reason).toBe("release-stalled");
+    expect(rows).toHaveLength(3);
+    const old = rows[0];
+    expect(old.getAttribute("href")).toBe("/tasks/t-old");
+    expect(old.classList.contains("card")).toBe(true);
+    expect(old.querySelector(".product-first")?.textContent).toBe(PRODUCT);
+    expect(old.querySelector(".name")?.textContent).toBe("task t-old");
+    expect(
+      [...old.querySelectorAll(".badge")].map((b) => b.textContent?.trim()),
+    ).toEqual(["ready"]);
+    expect(old.textContent).not.toContain("unclaimed");
+    expect(old.textContent).not.toContain("2026-09-03");
+    expect(
+      [...rows[1].querySelectorAll(".badge")].map((b) => b.textContent?.trim()),
+    ).toEqual(["blocked", "worker"]);
+    // A row the summaries do not know keeps its id as the title, its status
+    // and kind from the server, and no invented product.
+    const orphan = rows[2];
+    expect(orphan.getAttribute("href")).toBe("/tasks/release:t-9");
+    expect(orphan.querySelector(".name")?.textContent).toBe("release:t-9");
+    expect(orphan.querySelector(".product-first")?.textContent ?? "").toBe("");
+    expect(
+      [...orphan.querySelectorAll(".badge")].map((b) => b.textContent?.trim()),
+    ).toEqual(["wip", "instant:release"]);
+    for (const row of rows) {
+      expect(row.querySelectorAll("a, button, [tabindex]")).toHaveLength(0);
+      expect(row.querySelector(".card")).toBeNull();
+    }
+    expect(set.querySelector("[data-task]")).toBeNull();
     expect(stranded.querySelectorAll("button")).toHaveLength(0);
+    expect(stranded.querySelector(".danger")).toBeNull();
   });
 
   it("draws no stuck readout while the server reports none", () => {

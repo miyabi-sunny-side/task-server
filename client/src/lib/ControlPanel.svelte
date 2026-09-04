@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { ControlPlane } from "./api";
+  import type { ControlPlane, TaskSummary } from "./api";
   import MergeTrains from "./MergeTrains.svelte";
   import Readout from "./Readout.svelte";
   import Reconciliation from "./Reconciliation.svelte";
@@ -13,10 +13,13 @@
   let {
     fetchState,
     plane,
+    tasks = [],
     onretry,
   }: {
     fetchState: "loading" | "error" | "ready";
     plane?: ControlPlane;
+    // The page's task list, for the rows that name only a task id.
+    tasks?: TaskSummary[];
     onretry?: () => void;
   } = $props();
 
@@ -74,7 +77,7 @@
     {/if}
     <MergeTrains pending={pendingMerges} />
     <Releases pending={pendingReleases} />
-    <Reconciliation {unreviewed} {mergeable} {releasable} {stuck} />
+    <Reconciliation {unreviewed} {mergeable} {releasable} {stuck} {tasks} />
   {/if}
 </section>
 

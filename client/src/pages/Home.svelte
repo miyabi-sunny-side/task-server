@@ -99,6 +99,7 @@
   <ControlPanel
     fetchState={controlState}
     {plane}
+    tasks={items}
     onretry={() => void loadControl()}
   />
   <StatusTaskList
