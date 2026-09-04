@@ -24,8 +24,13 @@ pub struct TaskSummary {
     pub product_id: Option<String>,
     pub priority: i64,
     pub updated_at: String,
-    /// The task this one waits for, so a list can say why a draft is waiting.
+    /// The task this one waits for, so a list can say what a ready task is
+    /// waiting on.
     pub depends_on: Option<String>,
+    /// What that task is doing while it has not landed, so the list can say
+    /// the wait is still on. Absent once it has landed or without a dependency.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dependency_status: Option<TaskStatus>,
     /// Who put a `blocked` task there, so a list can tell parked from stuck.
     pub blocked_by: Option<BlockedBy>,
 }
@@ -41,6 +46,7 @@ impl From<Task> for TaskSummary {
             priority: task.priority,
             updated_at: task.updated_at,
             depends_on: task.depends_on,
+            dependency_status: None,
             blocked_by: task.blocked_by,
         }
     }
@@ -365,6 +371,20 @@ fn summaries(tasks: Vec<Task>) -> Vec<TaskSummary> {
     tasks.into_iter().map(TaskSummary::from).collect()
 }
 
+/// [`summaries`] that also say what each task's open dependency is doing —
+/// the one thing a status-group card needs that a row does not carry.
+fn summaries_with_dependencies(db: &Db, tasks: Vec<Task>) -> Result<Vec<TaskSummary>, Error> {
+    let statuses = task::dependency_statuses(db, &tasks)?;
+    Ok(tasks
+        .into_iter()
+        .zip(statuses)
+        .map(|(task, dependency_status)| TaskSummary {
+            dependency_status,
+            ..TaskSummary::from(task)
+        })
+        .collect())
+}
+
 pub async fn healthz() -> &'static str {
     "ok\n"
 }
@@ -394,7 +414,7 @@ pub async fn api_tasks(
         Some(raw) => task::list_by_status(&state.db, TaskStatus::parse(&raw)?)?,
         None => task::list_active(&state.db)?,
     };
-    Ok(Json(summaries(tasks)))
+    Ok(Json(summaries_with_dependencies(&state.db, tasks)?))
 }
 
 /// Completed `normal` work, most recently finished first (`GET /api/done`).

@@ -171,33 +171,44 @@ describe("TaskCard", () => {
     }
   });
 
-  it("names the dependency it waits for, with its status until it lands", () => {
-    render(TaskCard, {
-      props: {
-        task: { ...FIXTURE, depends_on: "beta", dependency_status: "wip" },
-      },
-    });
+  it("names the dependency it waits for, and says a ready task is waiting until it lands", () => {
+    const waiting = {
+      ...FIXTURE,
+      status: "ready",
+      depends_on: "beta",
+      dependency_status: "wip",
+    };
+    render(TaskCard, { props: { task: waiting } });
 
     const field = document.querySelector<HTMLElement>(
       '[data-field="depends_on"]',
     )!;
     expect(field.textContent).toContain("beta");
     expect(field.querySelector("a")?.getAttribute("href")).toBe("/tasks/beta");
-    expect(
-      field.querySelector("[data-dependency-status]")?.textContent?.trim(),
-    ).toBe("wip");
+    const line = document.querySelector<HTMLElement>('[data-field="waiting"]')!;
+    expect(line.textContent?.replace(/\s+/g, " ").trim()).toBe(
+      "waiting depends_on: beta",
+    );
+    expect(line.querySelector("a")?.getAttribute("href")).toBe("/tasks/beta");
+    expect(line.querySelector(".badge")).toBeNull();
 
+    // Landed: the caption stays, the line is gone.
     cleanup();
-    render(TaskCard, { props: { task: { ...FIXTURE, depends_on: "beta" } } });
-    expect(
-      document.querySelector(
-        '[data-field="depends_on"] [data-dependency-status]',
-      ),
-    ).toBeNull();
+    render(TaskCard, {
+      props: { task: { ...waiting, dependency_status: undefined } },
+    });
+    expect(document.querySelector('[data-field="depends_on"]')).not.toBeNull();
+    expect(document.querySelector('[data-field="waiting"]')).toBeNull();
+
+    // A draft is not waiting for a worker, whatever its dependency does.
+    cleanup();
+    render(TaskCard, { props: { task: { ...waiting, status: "draft" } } });
+    expect(document.querySelector('[data-field="waiting"]')).toBeNull();
 
     cleanup();
     render(TaskCard, { props: { task: FIXTURE } });
     expect(document.querySelector('[data-field="depends_on"]')).toBeNull();
+    expect(document.querySelector('[data-field="waiting"]')).toBeNull();
   });
 
   it("wears who blocked it beside the status when blocked", () => {

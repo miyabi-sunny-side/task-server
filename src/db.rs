@@ -271,9 +271,9 @@ PRAGMA user_version = 10;
 COMMIT;
 ";
 
-/// Version 11 lets a task wait for another: `depends_on` names the task whose
-/// landing promotes this one to `ready`. A column only — nothing a database
-/// already holds waits for anything.
+/// Version 11 lets a task wait for another: `depends_on` names the task that
+/// has to land before a claim hands this one out. A column only — nothing a
+/// database already holds waits for anything.
 const SCHEMA_V11: &str = "\
 BEGIN;
 ALTER TABLE tasks ADD COLUMN depends_on TEXT REFERENCES tasks(id);

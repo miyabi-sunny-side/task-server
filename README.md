@@ -272,8 +272,8 @@ it, both through `POST /api/tasks/{id}/status` and the MCP `task_set_status`:
 
 - **`ready → draft`**: a task nobody holds goes back to the drawer. A `wip` task
   does not come back this way (409) — handing a claim back is the worker's act.
-  A draft that was promoted by a landing and parked again stays `draft` until the
-  next landing that concerns it; nothing re-promotes it by itself.
+  Nothing re-promotes a parked task by itself: not an edit, and not the landing
+  of a task it depends on. `ready` is a person's word.
 - **`blocked` pressed by hand**: the task stands in the `blocked` group with
   `blocked_by: operator`. `blocked_by` says who stopped a task — `operator`,
   `worker` (a report that could not finish) or `system` (the control plane, e.g.
@@ -286,26 +286,28 @@ down.
 ## Dependencies (`depends_on`)
 
 A task may name one other task it waits for: `depends_on` on `POST /api/tasks`,
-`PATCH /api/tasks/{id}` and the MCP `task_create` / `task_update`. While the
-dependency has not landed (`merged` or `released`), the dependant cannot be
-pressed to `ready` — the status route and `task_set_status` answer 409
-`dependency_pending` — and its card carries the dependency's status as
-`dependency_status`. The landing promotes every `draft` that waited for it,
-through the same gate a pressed `ready` goes through; a draft the gate refuses
-(`product_not_catalogued`, `product_archived`, `product_required`) stays `draft`
-with the reason on `verification`.
+`PATCH /api/tasks/{id}` and the MCP `task_create` / `task_update`.
 
-**A draft pointed at work that has already landed is promoted at once.** Filing
-a task after its dependency shipped, or re-linking a chain onto a landed task,
-is ordinary; the landing that would have promoted it is in the past, so the
-server promotes on the spot — at `POST /api/tasks` or when `PATCH` sets
-`depends_on` — under the same gate and with the same `verification` note when
-refused. A task that is not `draft` is left where it is.
+**Status is a person's; `depends_on` decides only the order work is handed out
+in.** `draft` means unfinished, `ready` means approved for work, and the server
+moves neither on a dependency's account: a dependant is pressed `ready` like any
+other task, whether or not its dependency has landed, and no landing ever
+promotes a `draft`. What the dependency does is gate the claim. `POST
+/worker/claim` does not hand out a `ready` task while its dependency has not
+landed (`merged` or `released`) — the same kind of predicate that holds a
+product's merge train — so a task behind an open dependency is passed over even
+when its priority is higher, and the moment the dependency lands the next claim
+finds it, with no row touched. While the wait is on, the task's card and its
+list row carry the dependency's status as `dependency_status`; once it has
+landed the key is absent. A `ready` task waiting this way is not `unclaimed` in
+the `stuck` readout: waiting its turn is what it should be doing.
 
 A dependency that could never land is refused when set: the task itself, an
 unknown task, a `cancelled` or `dropped` task, or a chain that leads back. When
 a dependency is later called off, its `draft` and `ready` dependants are moved to
-`blocked` with the reason; work already under way is not touched. Clearing
+`blocked` (`blocked_by: system`) with the reason — the one status the server
+does move on a dependency's account, because a dependency that will never land
+is a real stall, not a wait; work already under way is not touched. Clearing
 `depends_on` (`null`) is the way to skip the order.
 
 ## The product catalogue
