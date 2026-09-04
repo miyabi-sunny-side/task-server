@@ -424,6 +424,18 @@ PRAGMA user_version = 19;
 COMMIT;
 ";
 
+/// Version 20 gives every run its product, so a reader never guesses it from
+/// the task id. Existing rows are filled from their task; a row whose task is
+/// gone (or that named none) stays without one — no guess.
+const SCHEMA_V20: &str = "\
+BEGIN;
+ALTER TABLE runs ADD COLUMN product_id TEXT;
+UPDATE runs SET product_id = (SELECT product_id FROM tasks WHERE tasks.id = runs.task_id)
+  WHERE task_id IS NOT NULL AND product_id IS NULL;
+PRAGMA user_version = 20;
+COMMIT;
+";
+
 /// How long a writer waits for a lock before giving up, in milliseconds.
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -638,6 +650,9 @@ fn migrate(conn: &Connection) -> Result<(), Error> {
     if version < 19 {
         conn.execute_batch(SCHEMA_V19)?;
     }
+    if version < 20 {
+        conn.execute_batch(SCHEMA_V20)?;
+    }
     Ok(())
 }
 
@@ -692,7 +707,7 @@ mod tests {
     use super::{
         Db, SCHEMA_V1, SCHEMA_V2, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
         SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16,
-        SCHEMA_V17, SCHEMA_V18,
+        SCHEMA_V17, SCHEMA_V18, SCHEMA_V19,
     };
 
     fn pragma_string(db: &Db, pragma: &str) -> String {
@@ -784,11 +799,11 @@ mod tests {
         let named = Db::open(":memory:").unwrap();
         assert_eq!(pragma_string(&named, "journal_mode"), "memory");
         assert_eq!(pragma_int(&named, "busy_timeout"), 5000);
-        assert_eq!(user_version(&named), 19);
+        assert_eq!(user_version(&named), 20);
 
         let private = Db::open_in_memory().unwrap();
         assert_eq!(pragma_int(&private, "busy_timeout"), 5000);
-        assert_eq!(user_version(&private), 19);
+        assert_eq!(user_version(&private), 20);
 
         // A URI spelling is not one of them. Only the exact `:memory:` is
         // exempt, so a URI is an ordinary filename: it lands on disk in WAL,
@@ -887,7 +902,7 @@ mod tests {
     #[test]
     fn migration_creates_the_current_schema() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
         let tables: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row(
@@ -919,7 +934,7 @@ mod tests {
         drop(db);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
         let products: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row("SELECT count(*) FROM products", [], |row| row.get(0))?)
@@ -954,7 +969,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
 
         let (title, status, priority, merge_target, checks): (
             String,
@@ -1050,7 +1065,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
 
         db.with_conn(|conn| {
             let rows_after = rebuilt_rows(conn, ["t-target", "merge:t-target", "t-plain"]);
@@ -1154,7 +1169,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
         let archived = |db: &Db| -> (usize, Option<String>) {
             db.with_conn(|conn| {
                 let columns = column_names(conn, "products");
@@ -1179,7 +1194,7 @@ mod tests {
         // column is not added twice and the row is not re-marked.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
         assert_eq!(archived(&db), (1, None), "a second open changes nothing");
         let tasks: i64 = db
             .with_conn(|conn| {
@@ -1382,7 +1397,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
         db.with_conn(|conn| {
             let columns = column_names(conn, "tasks");
             for added in ["review_target_task_id", "review_verdict"] {
@@ -1410,7 +1425,7 @@ mod tests {
         // Reopening runs the step again and must change nothing.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
         let tasks: i64 = db
             .with_conn(|conn| {
                 Ok(conn.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?)
@@ -1468,7 +1483,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
 
         let upgraded = Connection::open(&path).unwrap();
         assert!(
@@ -1499,7 +1514,7 @@ mod tests {
         // Reopening runs nothing again.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
     }
 
     /// The step on its own: a database that already reached version 6 loses the
@@ -1546,7 +1561,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
         let upgraded = Connection::open(&path).unwrap();
         assert!(
             !column_names(&upgraded, "tasks").contains(&"merge_sequence".to_owned()),
@@ -1609,7 +1624,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
         db.with_conn(|conn| {
             let husk = |id: &str| -> (String, Option<String>, String) {
                 conn.query_row(
@@ -1687,7 +1702,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
 
         let done_at = |db: &Db, id: &str| -> Option<String> {
             db.with_conn(|conn| {
@@ -1718,7 +1733,7 @@ mod tests {
         // Reopening runs the step again and must change nothing.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
         assert_eq!(done_at(&db, "t-done"), Some("later".to_owned()));
     }
 
@@ -1844,7 +1859,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
         db.with_conn(|conn| {
             let names = column_names(conn, "tasks");
             for column in LATER_COLUMNS {
@@ -1940,7 +1955,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
         db.with_conn(|conn| {
             conn.execute(
                 "UPDATE tasks SET status = 'released', release_tag = 'v1.0.0'
@@ -2024,7 +2039,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).expect("the upgrade must not collide on the review index");
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
         db.with_conn(|conn| {
             let released: i64 = conn
                 .query_row(
@@ -2089,7 +2104,7 @@ mod tests {
             .unwrap()
         };
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
         assert_eq!(blocked_by(&db, "t-jam"), Some("worker".to_owned()));
         assert_eq!(blocked_by(&db, "t-open"), None);
         drop(db);
@@ -2150,7 +2165,7 @@ mod tests {
         };
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
         assert_eq!(closed_at(&db, "t-off"), Some("later".to_owned()));
         assert_eq!(closed_at(&db, "merge:t-x"), Some("late".to_owned()));
         assert_eq!(
@@ -2163,9 +2178,60 @@ mod tests {
 
         // Reopening runs the step again and must change nothing.
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
         assert_eq!(closed_at(&db, "t-off"), Some("later".to_owned()));
         assert_eq!(closed_at(&db, "t-done"), None);
+    }
+
+    /// Version 20 gives every run its product: existing rows are backfilled
+    /// from their task, and a row whose task is gone stays without one.
+    #[test]
+    fn a_version_nineteen_database_backfills_run_products_from_their_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sqlite.db");
+
+        let legacy = Connection::open(&path).unwrap();
+        for batch in [SCHEMA_V1, SCHEMA_V2] {
+            legacy.execute_batch(batch).unwrap();
+        }
+        super::rebuild_tasks_without_the_product_key(&legacy).unwrap();
+        for batch in [
+            SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10,
+            SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16, SCHEMA_V17,
+            SCHEMA_V18, SCHEMA_V19,
+        ] {
+            legacy.execute_batch(batch).unwrap();
+        }
+        legacy
+            .execute_batch(
+                "INSERT INTO tasks (id, title, status, kind, product_id, created_at, updated_at)
+                 VALUES ('task-worker-x', 'x', 'done', 'normal', 'sunny-side/task-worker', 'e', 'e');
+                 INSERT INTO runs (at, source, task_id, note) VALUES ('t1', 'rescue', 'task-worker-x', 'a');
+                 INSERT INTO runs (at, source, task_id, note) VALUES ('t2', 'rescue', 'gone', 'b');
+                 INSERT INTO runs (at, source, note) VALUES ('t3', 'librarian', 'c');",
+            )
+            .unwrap();
+        let before: i64 = legacy
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, 19, "the fixture must start at version 19");
+        drop(legacy);
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(user_version(&db), 20);
+        db.with_conn(|conn| {
+            let products: Vec<Option<String>> = conn
+                .prepare("SELECT product_id FROM runs ORDER BY id")?
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            assert_eq!(
+                products,
+                [Some("sunny-side/task-worker".to_owned()), None, None],
+                "filled from the task; a gone task and no task stay empty"
+            );
+            Ok(())
+        })
+        .unwrap();
     }
 
     /// Version 19 adds `summary` and nothing else: every existing task comes
@@ -2201,7 +2267,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
         db.with_conn(|conn| {
             assert!(column_names(conn, "tasks").contains(&"summary".to_owned()));
             let summary: Option<String> =
@@ -2250,7 +2316,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
         db.with_conn(|conn| {
             let names = column_names(conn, "runs");
             assert!(names.contains(&"read_at".to_owned()));
@@ -2301,7 +2367,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
         db.with_conn(|conn| {
             let runs: i64 = conn.query_row("SELECT count(*) FROM runs", [], |row| row.get(0))?;
             assert_eq!(runs, 0, "the haystack starts empty");
@@ -2350,7 +2416,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
         db.with_conn(|conn| {
             let names = column_names(conn, "tasks");
             for column in ["rework_target_task_id", "rework_reason"] {
@@ -2405,7 +2471,7 @@ mod tests {
         drop(legacy);
 
         let db = Db::open(&path).unwrap();
-        assert_eq!(user_version(&db), 19);
+        assert_eq!(user_version(&db), 20);
         db.with_conn(|conn| {
             assert!(column_names(conn, "tasks").contains(&"depends_on".to_owned()));
             let depends_on: Option<String> = conn

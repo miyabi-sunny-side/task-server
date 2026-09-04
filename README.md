@@ -43,8 +43,8 @@ creates the database (and its parent directory) on first start.
 | GET | `/api/closed` | finished (`done`, `approved`, `merged`, `released`) and `cancelled` `normal` work in one list, most recently closed first; each row adds `closed_at` (the sort key) beside `done_at` |
 | POST | `/api/tasks/{id}/status` | move the task to `{"status": "..."}`; `approved`, `merged`, and `released` are refused |
 | POST | `/api/runs` | the rescue leaves a note on a task: `{task_id, note}`; the source is `rescue` whatever the body says. 201 with the row |
-| GET | `/api/runs?since=<id>&limit=<n>&task_id=<id>&unread=1` | the haystack from `id > since` upward, at most `limit` (default 100, max 500); `next` is the `since` of the following page while one exists; `unread=1` keeps only rows no reader has finished with |
-| GET | `/api/runs/next?source=<worker\|rescue\|librarian>` | the oldest unread row by `at` (identity, no CSRF); 204 once everything is read. Asking changes nothing |
+| GET | `/api/runs?since=<id>&limit=<n>&task_id=<id>&product_id=<org/repo>&unread=1` | the haystack from `id > since` upward, at most `limit` (default 100, max 500); `next` is the `since` of the following page while one exists; `unread=1` keeps only rows no reader has finished with; `product_id=` keeps one product's rows |
+| GET | `/api/runs/next?source=<worker\|rescue\|librarian>&product_id=<org/repo>` | the oldest unread row by `at` (identity, no CSRF); 204 once everything is read. Asking changes nothing |
 | POST | `/api/runs/{id}/read` | a reader is done with the row: `{note}` (optional, one line) lands on `read_note`, `read_at` is stamped (identity, no CSRF). 200 with the row; a row already read is returned unchanged |
 | GET | `/api/control` | `{ mergeable, pending_merges, pending_releases, pending_reviews, unreviewed, releasable, stuck }`; each `pending_merges` and `pending_releases` row adds `verification`, the reason a blocked one stopped, and a release row its `release_level`; `stuck` rows are `{task_id, kind, status, since, reason}` with `reason` one of `unclaimed`, `lease-expired`, `no-subtask`, `subtask-unclaimed`, `blocked`, `release-stalled` (thresholds: `APP_STUCK_*_SECS`), oldest first within each reason |
 | POST | `/api/reviews` | reconciliation: `{"task_id": "..."}` issues a review task by hand, returns 201 |
@@ -1093,9 +1093,9 @@ MIT. See [LICENSE](LICENSE).
 
 Every run of an agent, every rescue note and every librarian note is one row in
 `runs`, appended and never edited except for its reading receipt. A row is
-`{id, at, source, worker, task_id, kind, claim_id, attempt, profile, model, skill_sha,
-outcome, checks, commit_sha, diff_stat, agent_exit, agent_secs, stdout_tail, stderr_tail,
-note, truncated, read_at, read_note}`; `source` is `worker`, `rescue` or `librarian`, and
+`{id, at, source, worker, task_id, product_id, kind, claim_id, attempt, profile, model,
+skill_sha, outcome, checks, commit_sha, diff_stat, agent_exit, agent_secs, stdout_tail,
+stderr_tail, note, truncated, read_at, read_note}`; `source` is `worker`, `rescue` or `librarian`, and
 each source has its own required fields (`worker`: `task_id`, `claim_id`, `outcome`;
 `rescue`: `task_id`, `note`; `librarian`: `note`). The two tails and the note are cut
 at 8 KB and the row says so with `truncated: true`.
@@ -1105,6 +1105,14 @@ Workers append over `POST /worker/runs` (the worker boundary), the rescue over
 starts has passed `RUNS_RETENTION_DAYS`, the startup sweep blanks the two output
 tails and keeps the rest. There is no index to maintain and no review to pass: the
 haystack is the raw material, the summary lives in the knowledge repository.
+
+**The product is on the run; nobody guesses it from the task id.** A run carries
+`product_id`: given in the body it is kept, absent it is read off the task named
+by `task_id` at append time, and a run whose task is gone (or that names none)
+has `null` — a reader makes no product page for such a run rather than guessing
+one from the id's prefix. Rows that predate the column were filled the same way
+once, by the migration. `product_id=` narrows both `GET /api/runs` and
+`GET /api/runs/next`.
 
 **The reading cursor is the server's.** A reader (the librarian that writes
 `task-wiki`) does not keep a watermark of its own: `GET /api/runs/next` hands out
