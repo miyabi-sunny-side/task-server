@@ -43,7 +43,9 @@ creates the database (and its parent directory) on first start.
 | GET | `/api/closed` | finished (`done`, `approved`, `merged`, `released`) and `cancelled` `normal` work in one list, most recently closed first; each row adds `closed_at` (the sort key) beside `done_at` |
 | POST | `/api/tasks/{id}/status` | move the task to `{"status": "..."}`; `approved`, `merged`, and `released` are refused |
 | POST | `/api/runs` | the rescue leaves a note on a task: `{task_id, note}`; the source is `rescue` whatever the body says. 201 with the row |
-| GET | `/api/runs?since=<id>&limit=<n>&task_id=<id>` | the haystack from `id > since` upward, at most `limit` (default 100, max 500); `next` is the `since` of the following page while one exists |
+| GET | `/api/runs?since=<id>&limit=<n>&task_id=<id>&unread=1` | the haystack from `id > since` upward, at most `limit` (default 100, max 500); `next` is the `since` of the following page while one exists; `unread=1` keeps only rows no reader has finished with |
+| GET | `/api/runs/next?source=<worker\|rescue\|librarian>` | the oldest unread row by `at` (identity, no CSRF); 204 once everything is read. Asking changes nothing |
+| POST | `/api/runs/{id}/read` | a reader is done with the row: `{note}` (optional, one line) lands on `read_note`, `read_at` is stamped (identity, no CSRF). 200 with the row; a row already read is returned unchanged |
 | GET | `/api/control` | `{ mergeable, pending_merges, pending_releases, pending_reviews, unreviewed, releasable, stuck }`; each `pending_merges` and `pending_releases` row adds `verification`, the reason a blocked one stopped, and a release row its `release_level`; `stuck` rows are `{task_id, kind, status, since, reason}` with `reason` one of `unclaimed`, `lease-expired`, `no-subtask`, `subtask-unclaimed`, `blocked`, `release-stalled` (thresholds: `APP_STUCK_*_SECS`), oldest first within each reason |
 | POST | `/api/reviews` | reconciliation: `{"task_id": "..."}` issues a review task by hand, returns 201 |
 | POST | `/api/merges` | reconciliation: `{"task_id": "..."}` issues a merge task by hand, returns 201 |
@@ -1075,18 +1077,31 @@ MIT. See [LICENSE](LICENSE).
 
 ## The haystack (`runs`)
 
-Every run of an agent, every rescue note and every librarian watermark is one
-row in `runs`, appended and never edited. A row is
+Every run of an agent, every rescue note and every librarian note is one row in
+`runs`, appended and never edited except for its reading receipt. A row is
 `{id, at, source, worker, task_id, kind, claim_id, attempt, profile, model, skill_sha,
 outcome, checks, commit_sha, diff_stat, agent_exit, agent_secs, stdout_tail, stderr_tail,
-note, truncated}`; `source` is `worker`, `rescue` or `librarian`, and each source has its
-own required fields (`worker`: `task_id`, `claim_id`, `outcome`; `rescue`: `task_id`,
-`note`; `librarian`: `note`). The two tails and the note are cut at 8 KB and the row
-says so with `truncated: true`.
+note, truncated, read_at, read_note}`; `source` is `worker`, `rescue` or `librarian`, and
+each source has its own required fields (`worker`: `task_id`, `claim_id`, `outcome`;
+`rescue`: `task_id`, `note`; `librarian`: `note`). The two tails and the note are cut
+at 8 KB and the row says so with `truncated: true`.
 
 Workers append over `POST /worker/runs` (the worker boundary), the rescue over
-`POST /api/runs` (identity and CSRF), and a librarian reads forward from its
-watermark with `GET /api/runs?since=`. Nothing is deleted; once a day's worth of
+`POST /api/runs` (identity and CSRF). Nothing is deleted; once a day's worth of
 starts has passed `RUNS_RETENTION_DAYS`, the startup sweep blanks the two output
 tails and keeps the rest. There is no index to maintain and no review to pass: the
 haystack is the raw material, the summary lives in the knowledge repository.
+
+**The reading cursor is the server's.** A reader (the librarian that writes
+`task-wiki`) does not keep a watermark of its own: `GET /api/runs/next` hands out
+the oldest row nobody has finished with, by `at`, and keeps handing out the same
+row until the reader says it is done with `POST /api/runs/{id}/read`. The reader
+declares that only after its own work is safe — the wiki committed and pushed — so
+a reader that dies half-way leaves the row unread and is handed the same one next
+time. `source=` narrows the offer (the librarian reads `worker` and `rescue` and not
+its own `librarian` rows); the receipt is `read_at` plus an optional one-line
+`read_note` kept apart from the row's own `note`. A row already read answers the
+same 200 unchanged, so a resend is harmless. `GET /api/runs?since=` still reads
+everything in append order; `unread=1` keeps only what is left, and a Task Card
+carries `runs_unread` beside `runs_count`. Because the receipt lives on the row,
+a rebuilt reader loses nothing, and re-reading a range is the server's to grant.

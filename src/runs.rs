@@ -1,10 +1,12 @@
 //! The haystack: one appended row per run.
 //!
-//! A worker's agent run, a rescue's five lines, a librarian's watermark — each
-//! is one row in `runs`, appended and never edited. There is no index to
-//! maintain and no review to pass: a librarian reads forward from a watermark
-//! (`GET /api/runs?since=`) and summarises elsewhere. The only later write is
-//! the retention sweep, which blanks the two output tails of old rows and keeps
+//! A worker's agent run, a rescue's five lines, a librarian's note — each is
+//! one row in `runs`, appended and never edited except for its reading receipt.
+//! There is no index to maintain and no review to pass: a reader takes the
+//! oldest unread row (`GET /api/runs/next`), summarises elsewhere, and says it
+//! is done (`POST /api/runs/{id}/read`), which stamps `read_at`; the cursor is
+//! the server's, so a reader keeps no watermark. The other later write is the
+//! retention sweep, which blanks the two output tails of old rows and keeps
 //! every other field.
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -41,7 +43,11 @@ impl Source {
         }
     }
 
-    fn parse(raw: &str) -> Result<Self, Error> {
+    /// The source named on the wire.
+    ///
+    /// # Errors
+    /// `Error::Invalid` when `raw` names no source.
+    pub fn parse(raw: &str) -> Result<Self, Error> {
         match raw {
             "worker" => Ok(Self::Worker),
             "rescue" => Ok(Self::Rescue),
@@ -170,6 +176,12 @@ pub struct Run {
     pub stderr_tail: Option<String>,
     pub note: Option<String>,
     pub truncated: bool,
+    /// When a reader said it was done with this row; `None` while unread. The
+    /// cursor of the haystack is this column, not anything a reader keeps.
+    pub read_at: Option<String>,
+    /// What the reader did with it, one line, kept apart from the row's own
+    /// `note`.
+    pub read_note: Option<String>,
 }
 
 /// Cut `text` to [`TAIL_LIMIT_BYTES`] on a character boundary. Returns whether
@@ -274,7 +286,7 @@ pub fn append(db: &Db, new: &NewRun, now: OffsetDateTime) -> Result<(Run, bool),
 
 const COLUMNS: &str = "id, at, source, worker, task_id, kind, claim_id, attempt, profile, model,
                        skill_sha, outcome, checks, commit_sha, diff_stat, agent_exit, agent_secs,
-                       stdout_tail, stderr_tail, note, truncated";
+                       stdout_tail, stderr_tail, note, truncated, read_at, read_note";
 
 fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     let source: String = row.get(2)?;
@@ -304,6 +316,8 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         stderr_tail: row.get(18)?,
         note: row.get(19)?,
         truncated: row.get::<_, i64>(20)? != 0,
+        read_at: row.get(21)?,
+        read_note: row.get(22)?,
     })
 }
 
@@ -318,8 +332,9 @@ fn read(conn: &Connection, id: i64) -> Result<Run, Error> {
 }
 
 /// Rows with `id > since`, ascending, at most `limit` (clamped to
-/// `1..=MAX_PAGE`), optionally only one task's. `next` is set when the page is
-/// full, so a reader loops `since = next` until it is absent.
+/// `1..=MAX_PAGE`), optionally only one task's and, with `unread`, only those
+/// no reader has finished with. `next` is set when the page is full, so a
+/// reader loops `since = next` until it is absent.
 ///
 /// # Errors
 /// `Error::Db` when the query fails.
@@ -328,23 +343,101 @@ pub fn list(
     since: i64,
     limit: Option<usize>,
     task_id: Option<&str>,
+    unread: bool,
 ) -> Result<Page, Error> {
     let limit = limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
     db.with_conn(|conn| {
         let sql = format!(
             "SELECT {COLUMNS} FROM runs
              WHERE id > ?1 AND (?2 IS NULL OR task_id = ?2)
+               AND (?4 = 0 OR read_at IS NULL)
              ORDER BY id ASC LIMIT ?3"
         );
         let mut statement = conn.prepare(&sql)?;
         let limit_param = i64::try_from(limit).unwrap_or(i64::MAX);
         let runs = statement
-            .query_map(params![since, task_id, limit_param], row_to_run)?
+            .query_map(
+                params![since, task_id, limit_param, i64::from(unread)],
+                row_to_run,
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         let next = (runs.len() == limit)
             .then(|| runs.last().map(|run| run.id))
             .flatten();
         Ok(Page { runs, next })
+    })
+}
+
+/// The oldest row no reader has finished with, by `at` (id breaks a tie),
+/// optionally of one `source`. Asking moves nothing: the same row comes back
+/// until [`mark_read`] says it is done, so a reader that dies half-way is
+/// handed the same row again.
+///
+/// # Errors
+/// `Error::Db` when the query fails.
+pub fn next_unread(db: &Db, source: Option<Source>) -> Result<Option<Run>, Error> {
+    db.with_conn(|conn| {
+        Ok(conn
+            .query_row(
+                &format!(
+                    "SELECT {COLUMNS} FROM runs
+                     WHERE read_at IS NULL AND (?1 IS NULL OR source = ?1)
+                     ORDER BY at ASC, id ASC LIMIT 1"
+                ),
+                params![source.map(Source::as_str)],
+                row_to_run,
+            )
+            .optional()?)
+    })
+}
+
+/// A reader is done with row `id`: stamp `read_at = now` and keep its one-line
+/// `note` as `read_note`. Idempotent — a row already read comes back unchanged
+/// with `false`, so a resend after an uncertain answer is harmless.
+///
+/// # Errors
+/// `Error::NotFound` when no such row; `Error::Db` when the write fails.
+pub fn mark_read(
+    db: &Db,
+    id: i64,
+    note: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<(Run, bool), Error> {
+    db.with_tx(|tx| {
+        let before = read(tx, id)?;
+        if before.read_at.is_some() {
+            return Ok((before, false));
+        }
+        // The receipt's note is cut like the row's own note, and the row says
+        // so the same way.
+        let (note, cut) = match note {
+            Some(text) => {
+                let (kept, cut) = truncate_tail(text);
+                (Some(kept), cut)
+            }
+            None => (None, false),
+        };
+        tx.execute(
+            "UPDATE runs SET read_at = ?2, read_note = ?3, truncated = truncated OR ?4
+             WHERE id = ?1 AND read_at IS NULL",
+            params![id, format_z(now), note, i64::from(cut)],
+        )?;
+        Ok((read(tx, id)?, true))
+    })
+}
+
+/// How many rows naming `task_id` no reader has finished with. The Task Card
+/// carries it as `runs_unread`.
+///
+/// # Errors
+/// `Error::Db` when the query fails.
+pub fn count_unread_for_task(db: &Db, task_id: &str) -> Result<i64, Error> {
+    db.with_conn(|conn| {
+        Ok(conn.query_row(
+            "SELECT count(*) FROM runs WHERE task_id = ?1 AND read_at IS NULL",
+            params![task_id],
+            |row| row.get(0),
+        )?)
     })
 }
 
@@ -522,36 +615,140 @@ mod tests {
         other.task_id = Some("t-2".into());
         append(&db, &other, now()).unwrap();
 
-        let page = list(&db, 0, Some(2), None).unwrap();
+        let page = list(&db, 0, Some(2), None, false).unwrap();
         assert_eq!(
             page.runs.iter().map(|run| run.id).collect::<Vec<_>>(),
             [1, 2]
         );
         assert_eq!(page.next, Some(2));
-        let page = list(&db, 2, Some(2), None).unwrap();
+        let page = list(&db, 2, Some(2), None, false).unwrap();
         assert_eq!(
             page.runs.iter().map(|run| run.id).collect::<Vec<_>>(),
             [3, 4]
         );
         assert_eq!(page.next, Some(4));
-        let page = list(&db, 4, Some(2), None).unwrap();
+        let page = list(&db, 4, Some(2), None, false).unwrap();
         assert_eq!(
             page.runs.iter().map(|run| run.id).collect::<Vec<_>>(),
             [5, 6]
         );
         assert_eq!(page.next, Some(6), "a full page always offers a cursor");
-        let page = list(&db, 6, Some(2), None).unwrap();
+        let page = list(&db, 6, Some(2), None, false).unwrap();
         assert!(page.runs.is_empty());
         assert_eq!(page.next, None);
 
-        let only_t2 = list(&db, 0, None, Some("t-2")).unwrap();
+        let only_t2 = list(&db, 0, None, Some("t-2"), false).unwrap();
         assert_eq!(only_t2.runs.len(), 1);
         assert_eq!(only_t2.runs[0].task_id.as_deref(), Some("t-2"));
         assert_eq!(only_t2.next, None);
 
         // The limit is clamped, never trusted.
-        assert_eq!(list(&db, 0, Some(0), None).unwrap().runs.len(), 1);
-        assert_eq!(list(&db, 0, Some(10_000), None).unwrap().runs.len(), 6);
+        assert_eq!(list(&db, 0, Some(0), None, false).unwrap().runs.len(), 1);
+        assert_eq!(
+            list(&db, 0, Some(10_000), None, false).unwrap().runs.len(),
+            6
+        );
+    }
+
+    /// The reading cursor is the server's: `next_unread` hands out the oldest
+    /// unread row by `at` (id breaks a tie), reading it moves to the following
+    /// one, reading twice changes nothing, `source` narrows, and a fully read
+    /// haystack answers `None`.
+    #[test]
+    fn the_oldest_unread_run_is_handed_out_until_it_is_read() {
+        let db = Db::open_in_memory().unwrap();
+        // Appended out of time order: id 1 is the newest by `at`.
+        append(
+            &db,
+            &worker_run("c-late", 1),
+            now() + time::Duration::hours(2),
+        )
+        .unwrap();
+        append(&db, &worker_run("c-early", 1), now()).unwrap();
+        append(
+            &db,
+            &worker_run("c-mid", 1),
+            now() + time::Duration::hours(1),
+        )
+        .unwrap();
+        let mut rescue = NewRun {
+            source: Some(Source::Rescue),
+            task_id: Some("t-1".into()),
+            note: Some("looked".into()),
+            ..NewRun::default()
+        };
+        append(&db, &rescue, now()).unwrap();
+        rescue.note = Some("librarian".into());
+        rescue.source = Some(Source::Librarian);
+        append(&db, &rescue, now() - time::Duration::hours(1)).unwrap();
+
+        let first = next_unread(&db, None).unwrap().unwrap();
+        assert_eq!(first.id, 5, "the oldest by `at`, whatever its id");
+        assert_eq!(
+            next_unread(&db, None).unwrap().unwrap().id,
+            5,
+            "asking again changes nothing"
+        );
+        let workers_first = next_unread(&db, Some(Source::Worker)).unwrap().unwrap();
+        assert_eq!(
+            workers_first.id, 2,
+            "`source` narrows; ties on `at` go by id"
+        );
+        assert!(workers_first.read_at.is_none());
+
+        let (read_row, marked) = mark_read(&db, 5, Some("wrote no-commit"), now()).unwrap();
+        assert!(marked);
+        assert_eq!(read_row.read_at.as_deref(), Some("2026-09-03T12:00:00Z"));
+        assert_eq!(read_row.read_note.as_deref(), Some("wrote no-commit"));
+        assert_eq!(
+            read_row.note.as_deref(),
+            Some("librarian"),
+            "the run's own note stays"
+        );
+        let (again, marked) =
+            mark_read(&db, 5, Some("later"), now() + time::Duration::hours(9)).unwrap();
+        assert!(!marked, "reading twice is a no-op");
+        assert_eq!(again, read_row);
+        assert!(matches!(
+            mark_read(&db, 99, None, now()),
+            Err(Error::NotFound)
+        ));
+
+        // Ties on `at`: id 2 (worker) before id 4 (rescue).
+        assert_eq!(next_unread(&db, None).unwrap().unwrap().id, 2);
+        mark_read(&db, 2, None, now()).unwrap();
+        assert_eq!(next_unread(&db, None).unwrap().unwrap().id, 4);
+        assert_eq!(
+            next_unread(&db, Some(Source::Worker)).unwrap().unwrap().id,
+            3
+        );
+
+        let unread = list(&db, 0, None, None, true).unwrap();
+        assert_eq!(
+            unread.runs.iter().map(|run| run.id).collect::<Vec<_>>(),
+            [1, 3, 4],
+            "`unread` lists what is left, still in id order"
+        );
+        assert_eq!(list(&db, 0, None, None, false).unwrap().runs.len(), 5);
+
+        for id in [1, 3, 4] {
+            mark_read(&db, id, None, now()).unwrap();
+        }
+        assert!(next_unread(&db, None).unwrap().is_none());
+        assert!(next_unread(&db, Some(Source::Rescue)).unwrap().is_none());
+        assert_eq!(count_unread_for_task(&db, "t-1").unwrap(), 0);
+
+        // The receipt's note is cut like the row's own note, and flagged.
+        let long = "x".repeat(TAIL_LIMIT_BYTES + 10);
+        let (extra, _) = append(
+            &db,
+            &worker_run("c-extra", 1),
+            now() + time::Duration::days(1),
+        )
+        .unwrap();
+        let (cut, _) = mark_read(&db, extra.id, Some(&long), now()).unwrap();
+        assert_eq!(cut.read_note.map(|s| s.len()), Some(TAIL_LIMIT_BYTES));
+        assert!(cut.truncated, "a cut receipt note is said like a cut note");
     }
 
     /// The sweep blanks only the tails, only past retention, and keeps the rest.
@@ -567,7 +764,7 @@ mod tests {
         append(&db, &fresh, now() - time::Duration::days(89)).unwrap();
 
         assert_eq!(prune_tails(&db, now(), 90).unwrap(), 1);
-        let page = list(&db, 0, None, None).unwrap();
+        let page = list(&db, 0, None, None, false).unwrap();
         let old_row = &page.runs[0];
         assert_eq!(old_row.stdout_tail, None);
         assert_eq!(old_row.stderr_tail, None);
