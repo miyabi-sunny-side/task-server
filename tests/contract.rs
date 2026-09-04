@@ -3820,6 +3820,42 @@ async fn a_run_carries_its_product_and_the_haystack_narrows_by_it() {
     .await;
     assert_eq!(status, StatusCode::OK, "{next}");
     assert_eq!(next["id"], given["id"], "{next}");
+
+    // Filters compose: product with source on the cursor, product with since on
+    // the list.
+    let (status, none) = send(
+        &state,
+        read(&format!(
+            "/api/runs/next?source=worker&product_id={PRODUCT}"
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{none}");
+    let (_, by_source) = send(
+        &state,
+        read("/api/runs/next?source=worker&product_id=sunny-side/task-worker"),
+    )
+    .await;
+    assert_eq!(by_source["id"], filled["id"], "{by_source}");
+    let (_, later) = send(
+        &state,
+        read(&format!(
+            "/api/runs?since={}&product_id=sunny-side/task-worker",
+            filled["id"]
+        )),
+    )
+    .await;
+    assert_eq!(
+        ids_of_runs(&later),
+        Vec::<i64>::new(),
+        "since excludes the only match"
+    );
+    let (_, rest) = send(
+        &state,
+        read(&format!("/api/runs?since=0&product_id={PRODUCT}")),
+    )
+    .await;
+    assert_eq!(ids_of_runs(&rest), [given["id"].as_i64().unwrap()]);
 }
 
 /// The reading cursor over HTTP: `GET /api/runs/next` hands the oldest unread
