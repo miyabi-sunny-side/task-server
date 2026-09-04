@@ -199,4 +199,16 @@ describe("TaskCard", () => {
     render(TaskCard, { props: { task: FIXTURE } });
     expect(document.querySelector('[data-field="depends_on"]')).toBeNull();
   });
+
+  it("wears who blocked it beside the status when blocked", () => {
+    render(TaskCard, {
+      props: {
+        task: { ...FIXTURE, status: "blocked", blocked_by: "operator" },
+      },
+    });
+    const badges = [...document.querySelectorAll<HTMLElement>(".badge")].map(
+      (badge) => badge.textContent?.trim(),
+    );
+    expect(badges.slice(0, 2)).toEqual(["blocked", "保留"]);
+  });
 });

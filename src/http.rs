@@ -10,8 +10,8 @@ use crate::product::{self, Product};
 use crate::runs::{self, NewRun};
 use crate::state::AppState;
 use crate::task::{
-    self, Check, NewTask, Releasable, ReleaseLevel, ReportOutcome, ReviewOutcome, ReviewVerdict,
-    Stuck, Task, TaskKind, TaskPatch, TaskStatus,
+    self, BlockedBy, Check, NewTask, Releasable, ReleaseLevel, ReportOutcome, ReviewOutcome,
+    ReviewVerdict, Stuck, Task, TaskKind, TaskPatch, TaskStatus,
 };
 
 /// A row in the task list: enough to render a card in a list, no body.
@@ -26,6 +26,8 @@ pub struct TaskSummary {
     pub updated_at: String,
     /// The task this one waits for, so a list can say why a draft is waiting.
     pub depends_on: Option<String>,
+    /// Who put a `blocked` task there, so a list can tell parked from stuck.
+    pub blocked_by: Option<BlockedBy>,
 }
 
 impl From<Task> for TaskSummary {
@@ -39,6 +41,7 @@ impl From<Task> for TaskSummary {
             priority: task.priority,
             updated_at: task.updated_at,
             depends_on: task.depends_on,
+            blocked_by: task.blocked_by,
         }
     }
 }

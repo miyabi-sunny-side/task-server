@@ -248,8 +248,8 @@ deployment's catalogue authority.
   machines promptly without making long tasks race their deadline.
 - **There is no nack.** `outcome: "blocked"` is not one: it records a stop, with
   the reason in `verification` and the evidence in `checks`. On the `normal`
-  task above it leaves the task in `blocked` for a person to press back to
-  `ready`. A blocked `instant:merge` does not come back that way — `ready` is
+  task above it leaves the task in `blocked` (`blocked_by: worker`) for a person
+  to press back to `ready`. A blocked `instant:merge` does not come back that way — `ready` is
   refused on it, and the attempt is called off and reissued instead; see
   [Reviewing, merging and releasing](#reviewing-merging-and-releasing). Either
   way, a worker that only wants to put the work back down has nothing but the
@@ -264,6 +264,24 @@ deployment's catalogue authority.
   choices are to obtain the checkout or report `outcome: "blocked"` with the
   reason. Returning a server path would not help: the clone is missing from the
   worker's machine either way.
+
+## Parking work
+
+Holding a task back on purpose is ordinary, and it is not a jam. Two presses do
+it, both through `POST /api/tasks/{id}/status` and the MCP `task_set_status`:
+
+- **`ready → draft`**: a task nobody holds goes back to the drawer. A `wip` task
+  does not come back this way (409) — handing a claim back is the worker's act.
+  A draft that was promoted by a landing and parked again stays `draft` until the
+  next landing that concerns it; nothing re-promotes it by itself.
+- **`blocked` pressed by hand**: the task stands in the `blocked` group with
+  `blocked_by: operator`. `blocked_by` says who stopped a task — `operator`,
+  `worker` (a report that could not finish) or `system` (the control plane, e.g.
+  a dependency called off) — and the `stuck` readout on `GET /api/control`
+  counts only the last two. The mark clears when the task leaves `blocked`.
+
+Neither is stuck: `stuck` names work the automation lost, not work a person put
+down.
 
 ## Dependencies (`depends_on`)
 
