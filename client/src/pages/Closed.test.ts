@@ -43,6 +43,14 @@ function stubFetch(handler: () => Response | Promise<Response>) {
   return fetchMock;
 }
 
+function setVisibility(state: DocumentVisibilityState) {
+  Object.defineProperty(document, "visibilityState", {
+    configurable: true,
+    value: state,
+  });
+  document.dispatchEvent(new Event("visibilitychange"));
+}
+
 function region(): HTMLElement {
   const found = document.querySelector<HTMLElement>(
     '[data-region="closed"][data-state]',
@@ -199,5 +207,82 @@ describe("Closed", () => {
 
     await waitFor(() => expect(region().dataset.state).toBe("success"));
     expect(cards()).toHaveLength(4);
+  });
+
+  it("reloads when the tab becomes visible again and on the interval, and stops after unmount", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = stubFetch(() => jsonResponse([task({ id: "t-1" })]));
+      const { unmount } = render(Closed);
+      await vi.waitFor(() => expect(region().dataset.state).toBe("success"));
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      setVisibility("hidden");
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      setVisibility("visible");
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+
+      unmount();
+      await vi.advanceTimersByTimeAsync(60_000);
+      setVisibility("hidden");
+      setVisibility("visible");
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+      setVisibility("visible");
+    }
+  });
+
+  it("keeps the drawn rows while a background reload is in flight or fails", async () => {
+    let mode: "ok" | "slow" | "fail" = "ok";
+    let release: (() => void) | undefined;
+    const fetchMock = stubFetch(() => {
+      if (mode === "fail") return Promise.reject(new Error("offline"));
+      if (mode === "slow") {
+        return new Promise<Response>((resolve) => {
+          release = () => resolve(jsonResponse([task({ id: "t-2" })]));
+        });
+      }
+      return jsonResponse([task({ id: "t-1" })]);
+    });
+
+    render(Closed);
+    await waitFor(() => expect(region().dataset.state).toBe("success"));
+    expect(cards().map((card) => card.getAttribute("href"))).toEqual([
+      "/tasks/t-1",
+    ]);
+
+    // In flight: the rows stay, no spinner takes their place.
+    mode = "slow";
+    setVisibility("hidden");
+    setVisibility("visible");
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(region().dataset.state).toBe("success");
+    expect(cards().map((card) => card.getAttribute("href"))).toEqual([
+      "/tasks/t-1",
+    ]);
+    release!();
+    await waitFor(() =>
+      expect(cards().map((card) => card.getAttribute("href"))).toEqual([
+        "/tasks/t-2",
+      ]),
+    );
+
+    // Failed: the rows stay and the state never turns to error.
+    mode = "fail";
+    setVisibility("hidden");
+    setVisibility("visible");
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(region().dataset.state).toBe("success");
+    expect(cards().map((card) => card.getAttribute("href"))).toEqual([
+      "/tasks/t-2",
+    ]);
+    expect(screen.queryByRole("button", { name: "再試行" })).toBeNull();
   });
 });
