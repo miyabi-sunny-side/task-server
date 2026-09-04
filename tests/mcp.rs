@@ -807,8 +807,8 @@ async fn task_create_files_the_release_level_and_defaults_it_to_patch() {
     );
 }
 
-/// `depends_on` is filed and cleared over MCP the same way HTTP does it, and
-/// `task_get` says what the dependency is doing.
+/// `depends_on` is filed and cleared over MCP the same way HTTP does it, it
+/// never refuses `ready`, and `task_get` says what the dependency is doing.
 #[tokio::test]
 async fn task_create_and_update_carry_depends_on_and_task_get_reports_its_status() {
     let (_dir, state) = file_backed_state();
@@ -838,14 +838,17 @@ async fn task_create_and_update_carry_depends_on_and_task_get_reports_its_status
     assert_eq!(second["structuredContent"]["task"]["depends_on"], "t-first");
     assert_eq!(second["structuredContent"]["dependency_status"], "draft");
 
-    let refused = admin
+    // `ready` is a person's word: the open dependency does not refuse it, it
+    // only holds the claim, and task_get says what the wait is on.
+    let ready = admin
         .call(
             "task_set_status",
             json!({ "id": "t-second", "status": "ready" }),
         )
         .await;
-    assert_eq!(refused["isError"], json!(true), "{refused}");
-    assert_eq!(refused["structuredContent"]["code"], "dependency_pending");
+    assert_eq!(ready["isError"], json!(false), "{ready}");
+    assert_eq!(ready["structuredContent"]["task"]["status"], "ready");
+    assert_eq!(ready["structuredContent"]["dependency_status"], "draft");
 
     let cycle = admin
         .call(
@@ -869,15 +872,9 @@ async fn task_create_and_update_carry_depends_on_and_task_get_reports_its_status
     );
     let seen = admin.call("task_get", json!({ "id": "t-second" })).await;
     assert_eq!(seen["structuredContent"]["dependency_status"], Value::Null);
-    let ready = admin
-        .call(
-            "task_set_status",
-            json!({ "id": "t-second", "status": "ready" }),
-        )
-        .await;
     assert_eq!(
-        ready["structuredContent"]["task"]["status"], "ready",
-        "{ready}"
+        seen["structuredContent"]["task"]["status"], "ready",
+        "still ready: {seen}"
     );
 }
 

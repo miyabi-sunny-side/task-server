@@ -3233,11 +3233,12 @@ async fn a_claim_takes_only_the_kinds_the_worker_asks_for() {
     assert_eq!(anything["id"], "t-any");
 }
 
-/// A task that waits for another is promoted by that task's landing, never by a
-/// hand: `ready` is refused with `dependency_pending` while the dependency is
-/// open, and the card says what the dependency is doing.
+/// A task that waits for another is `ready` when a person says so and is handed
+/// out when the claim finds its dependency landed: the status route accepts
+/// `ready`, the claim passes the task over, the card and the list say what the
+/// dependency is doing, and the landing itself moves nothing.
 #[tokio::test]
-async fn a_dependant_is_promoted_by_the_landing_and_refuses_a_pressed_ready() {
+async fn a_ready_dependant_waits_for_the_claim_not_for_its_status() {
     let (_dir, state) = file_backed_state();
     put_product(&state, PRODUCT, true).await;
     create_task(
@@ -3257,16 +3258,90 @@ async fn a_dependant_is_promoted_by_the_landing_and_refuses_a_pressed_ready() {
     .await;
     assert_eq!(second["depends_on"], "t-first", "{second}");
     assert_eq!(second["dependency_status"], "draft", "{second}");
+    assert_eq!(second["status"], "draft", "{second}");
 
-    let (status, refused) = post_status(&state, "t-second", "ready").await;
-    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
-    assert_eq!(refused["code"], "dependency_pending");
+    let (status, ready) = post_status(&state, "t-second", "ready").await;
+    assert_eq!(status, StatusCode::OK, "{ready}");
+    assert_eq!(ready["status"], "ready", "{ready}");
+
+    // Ready, yet passed over: the only ready task is waiting its turn.
+    let (status, nothing) = send(&state, worker("/worker/claim", &json!({"worker": "grok"}))).await;
+    assert_eq!(status, StatusCode::OK, "{nothing}");
+    assert_eq!(nothing, json!({"status": "no-work"}), "{nothing}");
+    let (_, listing) = send(&state, read("/api/tasks")).await;
+    let row = |listing: &Value, id: &str| {
+        listing
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == id)
+            .cloned()
+            .expect("summary")
+    };
+    let waiting = row(&listing, "t-second");
+    assert_eq!(waiting["depends_on"], "t-first", "{waiting}");
+    assert_eq!(
+        waiting["dependency_status"], "draft",
+        "the list says the wait is on: {waiting}"
+    );
     assert!(
-        refused["error"].as_str().unwrap().contains("t-first")
-            && refused["error"].as_str().unwrap().contains("draft"),
-        "the refusal names the dependency and its status: {refused}"
+        row(&listing, "t-first").get("dependency_status").is_none(),
+        "no dependency, no status"
     );
 
+    // Not stuck for waiting either.
+    let (_, control) = send(&state, read("/api/control")).await;
+    assert!(
+        !control["stuck"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["task_id"] == "t-second"),
+        "{control}"
+    );
+
+    // t-first already exists, so it is driven by hand rather than through
+    // drive_to_merged, which would file it again.
+    set_status(&state, "t-first", "ready").await;
+    work_to_done(&state, "t-first", "aaa1111").await;
+    approve_task(&state, "t-first", "aaa1111").await;
+    let merge = issued_merge(&state, "t-first").await;
+    land_merge(&state, merge["id"].as_str().unwrap(), "aaa1111").await;
+    let (_, after) = get_task(&state, "t-second").await;
+    assert_eq!(
+        after["status"], "ready",
+        "the landing moved nothing: {after}"
+    );
+    assert_eq!(after["updated_at"], ready["updated_at"], "{after}");
+    assert!(after.get("dependency_status").is_none(), "{after}");
+    let (_, listing) = send(&state, read("/api/tasks")).await;
+    assert!(
+        row(&listing, "t-second").get("dependency_status").is_none(),
+        "the list stops saying it"
+    );
+
+    // The landing also issued a release; ask for ordinary work only.
+    let (status, leased) = send(
+        &state,
+        worker(
+            "/worker/claim",
+            &json!({"worker": "grok", "kinds": ["normal"]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{leased}");
+    assert_eq!(
+        leased["id"], "t-second",
+        "the next claim finds it: {leased}"
+    );
+}
+
+/// A dependency that could never land is refused at the door, and a cleared
+/// dependency is a PATCH with an explicit null.
+#[tokio::test]
+async fn a_dependency_is_refused_when_impossible_and_cleared_with_an_explicit_null() {
+    let (_dir, state) = file_backed_state();
+    put_product(&state, PRODUCT, true).await;
     for (id, depends_on) in [("t-self", "t-self"), ("t-ghost", "nope")] {
         let (status, refused) = send(
             &state,
@@ -3280,34 +3355,11 @@ async fn a_dependant_is_promoted_by_the_landing_and_refuses_a_pressed_ready() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{id}: {refused}");
     }
 
-    // t-first already exists, so it is driven by hand rather than through
-    // drive_to_merged, which would file it again.
-    set_status(&state, "t-first", "ready").await;
-    work_to_done(&state, "t-first", "aaa1111").await;
-    approve_task(&state, "t-first", "aaa1111").await;
-    let merge = issued_merge(&state, "t-first").await;
-    land_merge(&state, merge["id"].as_str().unwrap(), "aaa1111").await;
-    let (_, promoted) = get_task(&state, "t-second").await;
-    assert_eq!(
-        promoted["status"], "ready",
-        "the landing promoted it: {promoted}"
-    );
-    assert!(promoted.get("dependency_status").is_none(), "{promoted}");
-
-    let (status, listing) = send(&state, read("/api/tasks")).await;
-    assert_eq!(status, StatusCode::OK);
-    let row = listing
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|item| item["id"] == "t-second")
-        .expect("summary");
-    assert_eq!(
-        row["depends_on"], "t-first",
-        "the list carries the dependency: {row}"
-    );
-
-    // A cleared dependency is a PATCH with an explicit null.
+    create_task(
+        &state,
+        &json!({"id": "t-second", "title": "x", "product_id": PRODUCT}),
+    )
+    .await;
     create_task(
         &state,
         &json!({"id": "t-third", "title": "x", "product_id": PRODUCT, "depends_on": "t-second"}),
@@ -3886,10 +3938,11 @@ fn clone_fixture(root: &std::path::Path, id: &str) {
     std::fs::write(dir.join("README.md"), format!("# {id}\n")).expect("README");
 }
 
-/// Over HTTP: a draft created with, or patched to, a dependency that already
-/// landed is `ready` in the answer; an open dependency leaves it `draft`.
+/// Over HTTP: a task created with, or patched to, a dependency that already
+/// landed keeps the status it has — a draft stays `draft` and carries no
+/// `dependency_status` — and a `released` dependency counts as landed too.
 #[tokio::test]
-async fn a_dependency_that_already_landed_promotes_over_http() {
+async fn a_dependency_that_already_landed_changes_no_status_over_http() {
     let state = AppState::for_test();
     put_product(&state, "sunny-side/keeper", true).await;
     drive_to_merged(&state, "t-first", "sunny-side/keeper", "abc1234").await;
@@ -3900,8 +3953,9 @@ async fn a_dependency_that_already_landed_promotes_over_http() {
                 "depends_on": "t-first"}),
     )
     .await;
-    assert_eq!(created["status"], "ready", "{created}");
+    assert_eq!(created["status"], "draft", "{created}");
     assert_eq!(created["depends_on"], "t-first");
+    assert!(created.get("dependency_status").is_none(), "{created}");
 
     create_task(
         &state,
@@ -3913,6 +3967,7 @@ async fn a_dependency_that_already_landed_promotes_over_http() {
         &json!({"id": "t-patched", "title": "patched", "product_id": "sunny-side/keeper"}),
     )
     .await;
+    set_status(&state, "t-patched", "ready").await;
     let (status, waiting) = send(
         &state,
         human(
@@ -3923,8 +3978,9 @@ async fn a_dependency_that_already_landed_promotes_over_http() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{waiting}");
-    assert_eq!(waiting["status"], "draft");
-    let (status, promoted) = send(
+    assert_eq!(waiting["status"], "ready");
+    assert_eq!(waiting["dependency_status"], "draft", "{waiting}");
+    let (status, freed) = send(
         &state,
         human(
             "PATCH",
@@ -3933,8 +3989,9 @@ async fn a_dependency_that_already_landed_promotes_over_http() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{promoted}");
-    assert_eq!(promoted["status"], "ready", "{promoted}");
+    assert_eq!(status, StatusCode::OK, "{freed}");
+    assert_eq!(freed["status"], "ready", "{freed}");
+    assert!(freed.get("dependency_status").is_none(), "{freed}");
 
     // `released` counts as landed too: a non-releasing product ends its work
     // there straight from the merge. A fresh server, so the release the keeper's
@@ -3950,7 +4007,11 @@ async fn a_dependency_that_already_landed_promotes_over_http() {
                 "product_id": "sunny-side/library", "depends_on": "t-lib"}),
     )
     .await;
-    assert_eq!(after_release["status"], "ready", "{after_release}");
+    assert_eq!(after_release["status"], "draft", "{after_release}");
+    set_status(&state, "t-after-release", "ready").await;
+    let (status, leased) = send(&state, worker("/worker/claim", &json!({"worker": "grok"}))).await;
+    assert_eq!(status, StatusCode::OK, "{leased}");
+    assert_eq!(leased["id"], "t-after-release", "{leased}");
 }
 
 /// Parking over HTTP: a `ready` task with no claim goes back to `draft` and the

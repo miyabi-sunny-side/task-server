@@ -51,19 +51,24 @@
   <span class="caption-label">verification</span>
   {task.verification ?? ""}
 </p>
-<!-- A task that waits for another says so beside the other captions, and
-     while the dependency has not landed, what it is doing — that is the
-     whole reason a draft is still a draft (DESIGN.md, Dependency). -->
+<!-- A task that waits for another says so beside the other captions; a
+     ready one whose dependency has not landed says, in one more muted line,
+     that this is why no worker has it yet (DESIGN.md, Dependency). -->
 {#if task.depends_on}
   <p class="caption" data-field="depends_on">
     <span class="caption-label">depends_on</span>
     <a class="dependency" href={`/tasks/${task.depends_on}`}
       >{task.depends_on}</a
     >
-    {#if task.dependency_status}
-      <span class="badge" data-dependency-status>{task.dependency_status}</span>
-    {/if}
   </p>
+  {#if task.status === "ready" && task.dependency_status}
+    <p class="caption" data-field="waiting">
+      waiting depends_on:
+      <a class="dependency" href={`/tasks/${task.depends_on}`}
+        >{task.depends_on}</a
+      >
+    </p>
+  {/if}
 {/if}
 <!-- Above the body: a worker who was sent back to `ready` has to read the
      correction before the instruction it corrects (DESIGN.md, Review block).

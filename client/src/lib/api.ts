@@ -19,8 +19,11 @@ export interface TaskSummary {
   product_id: string;
   priority: number;
   updated_at: string;
-  // The task this one waits for, so a list can say why a draft is waiting.
+  // The task this one waits for, and what it is doing while it has not
+  // landed, so a list can say a ready task is waiting its turn. The status is
+  // absent once the dependency landed, or without a dependency.
   depends_on?: string | null;
+  dependency_status?: string;
   // Who put a `blocked` task there: a person parking it ("operator"), a
   // worker's report ("worker"), or the control plane ("system").
   blocked_by?: BlockedBy | null;
@@ -71,7 +74,7 @@ export interface TaskCard {
   // field existed still type-check; the server always sends it.
   release_level?: "patch" | "minor" | "major";
   release_task_id?: string | null;
-  // The task this one waits for; the landing of that task promotes this one.
+  // The task this one waits for; no claim hands this one out before it lands.
   depends_on?: string | null;
   // What that task is doing while it has not landed. Absent once it has, or
   // when there is no dependency at all.

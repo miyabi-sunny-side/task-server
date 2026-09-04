@@ -93,15 +93,17 @@
               <a class="card stack" href={`/tasks/${item.id}`}>
                 <span class="head">
                   <span class="product product-first">{item.product_id}</span>
-                  {#if item.depends_on}
-                    <!-- Why a draft is still a draft, read off the list
-                         (DESIGN.md, Dependency): beside the product, muted. -->
-                    <span class="product" data-depends-on={item.depends_on}
-                      >← {item.depends_on}</span
-                    >
-                  {/if}
                 </span>
                 <span class="name">{item.title}</span>
+                {#if item.status === "ready" && item.depends_on && item.dependency_status}
+                  <!-- Why a ready task is not being worked on, read off the
+                       list (DESIGN.md, Dependency): one muted line, gone once
+                       the dependency lands. Plain text — the card is the link,
+                       and a link inside a link is not one. -->
+                  <span class="waiting" data-waiting-on={item.depends_on}
+                    >waiting depends_on: {item.depends_on}</span
+                  >
+                {/if}
                 <span class="tail">
                   <span class="badge">{item.status}</span>
                   {#if item.status === "blocked" && item.blocked_by}
@@ -163,6 +165,13 @@
     font-size: var(--fs-sm)
     line-height: 1.4
     color: var(--c-on-surface)
+
+  // The wait is a fact about the task, said in the caption voice: muted,
+  // small, one line under the title.
+  .waiting
+    font-size: var(--fs-xs)
+    line-height: 1.4
+    color: var(--c-muted)
 
   .tail
     display: flex

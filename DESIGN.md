@@ -737,19 +737,21 @@ counterpart to carry, so it earns no token pair.
   also a status this screen never *produces*: a review report alone
   enters it, so no control anywhere in this UI is labelled `approved`.
 
-  **Dependency.** A task that waits for another (`depends_on`) carries
-  one more muted caption in the caption row, labelled `depends_on`, whose
-  value is a link to that task; while the dependency has not landed the
-  caption adds the dependency's status as an outline badge, and once it
-  has landed (or when there is no dependency) the badge — and, with no
-  dependency, the whole caption — is absent. That is the whole reason a
-  draft is still a draft, so it is said where the other facts about the
-  task are said, in the same voice: no color, no icon, no instruction.
-  On the top page a status-group card of a waiting task shows the
-  dependency's id as a second muted caption beside the product id,
-  marked `←`; nothing else on the list changes, and no control is added
-  anywhere for it — the landing promotes the task, and a person who
-  wants to skip the order clears the dependency.
+  **Dependency.** `draft` is unfinished and `ready` is approved; a
+  dependency (`depends_on`) moves neither — it only decides when the
+  claim hands a ready task out. So the UI adds no status for waiting. A
+  task that waits for another carries one more muted caption in the
+  caption row, labelled `depends_on`, whose value is a link to that task.
+  A `ready` task whose dependency has not landed (the card payload
+  carries `dependency_status`) says why no worker has it yet in one more
+  muted line in the caption voice, reading `waiting depends_on: <id>`
+  with the id a link to that task — a line of text, not a badge, and
+  gone the moment the dependency lands or the task is anything but
+  `ready`. On the top page the status-group card of such a task carries
+  the same line under its title, as plain text because the card is
+  itself the link; a card whose dependency has landed, or that is not
+  `ready`, carries none. No control is added anywhere for it: a person
+  who wants to skip the order clears the dependency.
 
   **Review block.** A task the card payload carries a review outcome
   for (`review_verdict` and `review_findings`, however the server
@@ -1064,14 +1066,17 @@ counterpart to carry, so it earns no token pair.
       no status group. Cancelling a `blocked` merge and reloading leaves
       that merge out of every train and its target inside this block.
   29. A Task Card whose task carries `depends_on` renders a caption
-      labelled `depends_on` whose link resolves to that task's card, and
-      while the card payload carries `dependency_status` the caption holds
-      an outline badge with that status; without `dependency_status` no
-      badge exists, and without `depends_on` no such caption exists. On
-      the top page a waiting task's status-group card carries the
-      dependency id as a muted caption beside the product id, and a task
-      without a dependency carries none. No button anywhere is added for
-      dependencies.
+      labelled `depends_on` whose link resolves to that task's card;
+      without `depends_on` no such caption exists. When that task is
+      `ready` and the card payload carries `dependency_status`, one more
+      caption-toned line reads `waiting depends_on: <id>` with the id a
+      link to that task's card and no badge inside it; without
+      `dependency_status`, or on any status but `ready`, no such line
+      exists. On the top page the status-group card of a `ready` task
+      with `dependency_status` carries the same line as plain text under
+      its title with no anchor inside the card, and a card without
+      `dependency_status`, or not `ready`, carries none. No button
+      anywhere is added for dependencies.
   30. Header closed link states, computed. Off `/closed`, the closed
       link's computed `background-color` is transparent and it carries no
       `aria-current` attribute. On `/closed`, it carries

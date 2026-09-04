@@ -61,9 +61,9 @@ pub struct TaskCreateArgs {
     /// it forces existing users or their data through a migration.
     #[serde(default)]
     pub release_level: Option<String>,
-    /// The task this one waits for. It stays `draft` until that task is
-    /// merged, and the landing promotes it to `ready`. One id; chain tasks
-    /// (A → B → C) to wait for several.
+    /// The task this one waits for. A claim does not hand this task out until
+    /// that one has landed (merged or released); its status is yours to set.
+    /// One id; chain tasks (A → B → C) to wait for several.
     #[serde(default)]
     pub depends_on: Option<String>,
 }
@@ -384,9 +384,10 @@ impl Admin {
     }
 
     #[tool(
-        description = "Move a task to another status. A task that depends on another one \
-                       (`depends_on`) cannot be promoted to `ready` by hand while that task has \
-                       not landed (code `dependency_pending`): the landing promotes it, or clear \
+        description = "Move a task to another status. `draft` is unfinished, `ready` is \
+                       approved for work; a task that depends on another one (`depends_on`) is \
+                       set `ready` like any other and is simply not handed to a worker until that \
+                       task has landed — its card says so as `dependency_status`. Clear \
                        depends_on to skip the order. A task cannot be promoted to `ready` while \
                        its product is not in the product catalogue: that refusal comes back with \
                        code `product_not_catalogued` (or `product_required` when the task names \

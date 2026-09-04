@@ -219,13 +219,23 @@ describe("StatusTaskList", () => {
     expect(focusableIn(ready)).toHaveLength(cardsOf(ready).length);
   });
 
-  it("says on a card which task it waits for", () => {
+  it("says on a ready card which task it is waiting for, until that one lands", () => {
     render(StatusTaskList, {
       props: {
         fetchState: "ready",
         items: [
-          { ...summary("t-wait", "draft"), depends_on: "t-first" },
-          summary("t-first", "ready"),
+          {
+            ...summary("t-wait", "ready"),
+            depends_on: "t-first",
+            dependency_status: "wip",
+          },
+          { ...summary("t-landed", "ready"), depends_on: "t-old" },
+          {
+            ...summary("t-draft", "draft"),
+            depends_on: "t-first",
+            dependency_status: "wip",
+          },
+          summary("t-first", "wip"),
         ],
       },
     });
@@ -233,15 +243,18 @@ describe("StatusTaskList", () => {
     const waiting = document.querySelector<HTMLElement>(
       'a[href="/tasks/t-wait"]',
     )!;
-    expect(
-      waiting.querySelector<HTMLElement>("[data-depends-on]")?.dataset
-        .dependsOn,
-    ).toBe("t-first");
-    expect(waiting.textContent).toContain("t-first");
-    const first = document.querySelector<HTMLElement>(
-      'a[href="/tasks/t-first"]',
-    )!;
-    expect(first.querySelector("[data-depends-on]")).toBeNull();
+    const line = waiting.querySelector<HTMLElement>("[data-waiting-on]")!;
+    expect(line.dataset.waitingOn).toBe("t-first");
+    expect(line.textContent?.replace(/\s+/g, " ").trim()).toBe(
+      "waiting depends_on: t-first",
+    );
+    expect(waiting.querySelectorAll("a")).toHaveLength(0);
+    for (const id of ["t-landed", "t-draft", "t-first"]) {
+      const card = document.querySelector<HTMLElement>(
+        `a[href="/tasks/${id}"]`,
+      )!;
+      expect(card.querySelector("[data-waiting-on]"), id).toBeNull();
+    }
   });
 
   it("says who blocked a blocked card, and calls a parked one 保留", () => {
