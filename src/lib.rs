@@ -51,6 +51,8 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/tasks/{id}/status", post(http::api_set_status))
         .route("/runs", get(http::api_runs).post(http::api_runs_post))
+        .route("/runs/next", get(http::api_runs_next))
+        .route("/runs/{id}/read", post(http::api_run_read))
         .route("/control", get(http::api_control))
         .route("/merges", post(http::api_issue_merge))
         .route("/reviews", post(http::api_issue_review))

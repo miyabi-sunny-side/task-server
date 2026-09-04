@@ -3683,6 +3683,109 @@ async fn people_append_rescue_notes_and_read_the_haystack_forward() {
     assert_eq!(ids_of_runs(&nobody_page), Vec::<i64>::new());
 }
 
+/// The reading cursor over HTTP: `GET /api/runs/next` hands the oldest unread
+/// row out (identity, no CSRF) and keeps handing it out until
+/// `POST /api/runs/{id}/read` (identity, no CSRF) marks it; reading twice is a
+/// 200 that changes nothing; `source=` narrows; a read haystack answers 204;
+/// `unread=1` lists what is left; the card counts the unread rows.
+#[tokio::test]
+async fn the_haystack_hands_out_the_oldest_unread_run_until_it_is_read() {
+    let state = AppState::for_test();
+    put_product(&state, PRODUCT, true).await;
+    ready_task(&state, "t-hay", 0).await;
+    for attempt in 1..=2 {
+        let (status, _) = send(&state, worker("/worker/runs", &worker_run("c-1", attempt))).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+    let note = json!({"task_id": "t-hay", "note": "looked"});
+    let (status, _) = send(&state, human("POST", "/api/runs", &note)).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, _) = send(
+        &state,
+        request("GET", "/api/runs/next")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "identity is required");
+
+    let (status, first) = send(&state, read("/api/runs/next")).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["id"], 1, "{first}");
+    assert_eq!(first["read_at"], Value::Null);
+    let (_, again) = send(&state, read("/api/runs/next")).await;
+    assert_eq!(again["id"], 1, "asking again changes nothing");
+    let (status, rescue_only) = send(&state, read("/api/runs/next?source=rescue")).await;
+    assert_eq!(status, StatusCode::OK, "{rescue_only}");
+    assert_eq!(rescue_only["id"], 3, "{rescue_only}");
+    let (status, bad) = send(&state, read("/api/runs/next?source=nobody")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+
+    // Reading is identity-only: no CSRF token, like the worker's own doors.
+    let (status, marked) = send(
+        &state,
+        request("POST", "/api/runs/1/read")
+            .header("x-auth-user", USER)
+            .body(Body::from(r#"{"note": "wrote no-commit"}"#))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{marked}");
+    assert_eq!(marked["read_note"], "wrote no-commit", "{marked}");
+    assert!(marked["read_at"].is_string(), "{marked}");
+    let (status, twice) = send(
+        &state,
+        request("POST", "/api/runs/1/read")
+            .header("x-auth-user", USER)
+            .body(Body::from(r#"{"note": "later"}"#))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{twice}");
+    assert_eq!(
+        twice["read_note"], "wrote no-commit",
+        "reading twice changes nothing"
+    );
+    assert_eq!(twice["read_at"], marked["read_at"]);
+    let (status, missing) = send(
+        &state,
+        request("POST", "/api/runs/99/read")
+            .header("x-auth-user", USER)
+            .body(Body::from("{}"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+
+    let (_, second) = send(&state, read("/api/runs/next")).await;
+    assert_eq!(second["id"], 2, "read moves on to the next one");
+    let (_, unread) = send(&state, read("/api/runs?unread=1")).await;
+    assert_eq!(ids_of_runs(&unread), [2, 3]);
+    let (_, everything) = send(&state, read("/api/runs")).await;
+    assert_eq!(
+        ids_of_runs(&everything),
+        [1, 2, 3],
+        "`since` reads everything as before"
+    );
+    let (_, card) = get_task(&state, "t-hay").await;
+    assert_eq!(card["runs_count"], 3, "{card}");
+    assert_eq!(card["runs_unread"], 2, "{card}");
+
+    for id in [2, 3] {
+        send(
+            &state,
+            request("POST", &format!("/api/runs/{id}/read"))
+                .header("x-auth-user", USER)
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+    }
+    let (status, _) = send(&state, read("/api/runs/next")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "nothing left to read");
+}
+
 fn ids_of_runs(page: &Value) -> Vec<i64> {
     page["runs"]
         .as_array()
@@ -3704,7 +3807,7 @@ async fn the_haystack_persists_across_reopen_and_the_sweep_keeps_the_rows() {
     assert_eq!(status, StatusCode::CREATED);
 
     let state = reopen(&dir, state);
-    assert_eq!(state.db.schema_version().expect("version"), 17);
+    assert_eq!(state.db.schema_version().expect("version"), 18);
     let now = task_server::clock::Clock::now(&clock);
     let blanked = task_server::runs::prune_tails(&state.db, now, 90).expect("sweep");
     assert_eq!(blanked, 1);

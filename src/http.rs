@@ -184,6 +184,8 @@ pub struct TaskCard {
     pub dependency_status: Option<TaskStatus>,
     /// How many haystack rows name this task (`GET /api/runs?task_id=`).
     pub runs_count: i64,
+    /// How many of those no reader has finished with yet.
+    pub runs_unread: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -358,12 +360,14 @@ fn card(db: &Db, task: Task) -> Result<TaskCard, Error> {
     };
     let dependency_status = task::dependency_status(db, &task)?;
     let runs_count = runs::count_for_task(db, &task.id)?;
+    let runs_unread = runs::count_unread_for_task(db, &task.id)?;
     Ok(TaskCard {
         task,
         available_transitions,
         latest_review,
         dependency_status,
         runs_count,
+        runs_unread,
     })
 }
 
@@ -791,6 +795,9 @@ pub struct RunsQuery {
     pub limit: Option<usize>,
     #[serde(default)]
     pub task_id: Option<String>,
+    /// `unread=1` (or `true`): only rows no reader has finished with.
+    #[serde(default)]
+    pub unread: Option<String>,
 }
 
 /// Read the haystack forward from a watermark: `{ runs, next }`, `next` being
@@ -801,12 +808,63 @@ pub async fn api_runs(
     Query(query): Query<RunsQuery>,
 ) -> Result<Json<runs::Page>, Error> {
     require_identity(&headers, &state)?;
+    let unread = matches!(query.unread.as_deref(), Some("1" | "true"));
     Ok(Json(runs::list(
         &state.db,
         query.since,
         query.limit,
         query.task_id.as_deref(),
+        unread,
     )?))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NextRunQuery {
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// The reading cursor, kept by the server: the oldest unread row, or 204 when
+/// every row has been read. Asking changes nothing; `POST /api/runs/{id}/read`
+/// is what moves it. Identity only — a reader is not a person pressing a button.
+pub async fn api_runs_next(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<NextRunQuery>,
+) -> Result<Response, Error> {
+    require_identity(&headers, &state)?;
+    let source = query
+        .source
+        .as_deref()
+        .map(runs::Source::parse)
+        .transpose()?;
+    Ok(match runs::next_unread(&state.db, source)? {
+        Some(run) => Json(run).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    })
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ReadRunBody {
+    /// One line on what the reader did with the row. Optional.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// A reader is done with a row. Identity, no CSRF: the claim comes from a
+/// process on the trusted network, and the worst a forged one does is mark a
+/// row read. 200 with the row either way — a row already read is left as it
+/// was, so a resend is harmless. The body may be absent.
+pub async fn api_run_read(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    body: Option<Json<ReadRunBody>>,
+) -> Result<Json<runs::Run>, Error> {
+    require_identity(&headers, &state)?;
+    let note = body.and_then(|Json(body)| body.note);
+    let (run, _) = runs::mark_read(&state.db, id, note.as_deref(), state.clock.now())?;
+    Ok(Json(run))
 }
 
 /// The review's own completion route.
