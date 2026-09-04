@@ -1,5 +1,6 @@
 <script lang="ts">
   import { fetchClosed, type ClosedTask } from "../lib/api";
+  import { startAutoReload } from "../lib/auto-reload";
 
   type FetchState = "loading" | "error" | "ready";
 
@@ -19,7 +20,13 @@
       fetchState = "ready";
       loaded = true;
     } catch (error) {
-      if (!(error instanceof DOMException && error.name === "AbortError")) {
+      // A background reload that fails leaves the drawn rows exactly as they
+      // are (DESIGN.md, Do's and Don'ts); only the first load has nothing
+      // to keep and says so.
+      if (
+        !loaded &&
+        !(error instanceof DOMException && error.name === "AbortError")
+      ) {
         fetchState = "error";
       }
     }
@@ -43,9 +50,15 @@
     return verification.split("\n").slice(0, 2).join("\n");
   }
 
+  // The same rhythm as the top page and the detail: reload while visible,
+  // reload at once on coming back to the tab, stop when the page unmounts.
   $effect(() => {
     void load();
-    return () => controller?.abort();
+    const stopAutoReload = startAutoReload(() => void load());
+    return () => {
+      stopAutoReload();
+      controller?.abort();
+    };
   });
 </script>
 

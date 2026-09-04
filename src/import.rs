@@ -511,7 +511,7 @@ fn write_all(
 fn insert(tx: &Connection, task: &Parsed, stamp: &str) -> Result<(), Error> {
     // A row imported already past `done` earned that status before this
     // database existed, so `stamp` — the import's own timestamp — is the same
-    // best-effort estimate [`SCHEMA_V9`] backfills for a pre-existing row. A
+    // best-effort estimate [`SCHEMA_V13`] backfills for a pre-existing row. A
     // row imported short of `done` gets no `done_at`, for the same reason the
     // migration gives none: guessing one would assert a completion that never
     // happened.
