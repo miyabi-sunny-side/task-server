@@ -464,7 +464,7 @@ pub enum BlockedBy {
     /// A worker reported it could not finish.
     #[serde(rename = "worker")]
     Worker,
-    /// The control plane did it: a dependency was called off, a rework failed.
+    /// The control plane did it: a dependency was called off.
     #[serde(rename = "system")]
     System,
 }
@@ -2198,7 +2198,7 @@ fn finish_rework(
     };
     tx.execute(
         "UPDATE tasks SET status = ?2, commit_sha = ?3, updated_at = ?4,
-                done_at = COALESCE(done_at, ?4)
+                done_at = COALESCE(done_at, ?4), blocked_by = NULL
          WHERE id = ?1",
         rusqlite::params![target_id, returns_to.as_str(), commit_sha, stamp],
     )?;
@@ -8052,6 +8052,11 @@ mod tests {
         let target = get(&db, "t-1").unwrap();
         assert_eq!(target.status, TaskStatus::Blocked);
         assert_eq!(
+            target.blocked_by,
+            Some(BlockedBy::Worker),
+            "a rework that could not finish is the worker's stop"
+        );
+        assert_eq!(
             target.verification.as_deref(),
             Some("needs a decision on the schema")
         );
@@ -8463,6 +8468,28 @@ mod tests {
         let parked = set_status_by_operator(&db, "t-1", TaskStatus::Draft, later()).unwrap();
         assert_eq!(parked.status, TaskStatus::Draft);
         assert!(parked.verification.is_none());
+        // Parked after a landing promoted it: it stays parked until the next
+        // promotion event, and an unrelated edit is not one.
+        let landed = merge_waiting_for(&db, "t-landed", "a/b");
+        merge_into(&db, &landed.id, TaskStatus::Done);
+        let promoted = dependent(&db, "t-dep", "t-landed");
+        assert_eq!(promoted.status, TaskStatus::Ready);
+        set_status_by_operator(&db, "t-dep", TaskStatus::Draft, later()).unwrap();
+        let edited = update(
+            &db,
+            "t-dep",
+            &TaskPatch {
+                title: Some("renamed".into()),
+                ..TaskPatch::default()
+            },
+            even_later(),
+        )
+        .unwrap();
+        assert_eq!(
+            edited.status,
+            TaskStatus::Draft,
+            "no re-promotion without an event"
+        );
 
         set_status(&db, "t-1", TaskStatus::Ready, later()).unwrap();
         let leased = claim(&db, "worker", &[TaskKind::Normal], later(), 60)

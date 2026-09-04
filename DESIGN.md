@@ -1117,6 +1117,12 @@ counterpart to carry, so it earns no token pair.
       verification excerpt holds a 40-character unbroken token still
       leaves `document.documentElement.scrollWidth` within the
       viewport.
+  34. Stuck work is stated, not handled. With `stuck` non-empty the
+      reconciliation block renders a readout captioned "動いていない task"
+      whose count pill equals its rows; each row is an ordinary card link
+      to `/tasks/<task_id>` carrying `data-reason` and two outline badges
+      (reason, status), and the block holds no `<button>`. With `stuck`
+      empty the readout is absent from the DOM.
   35. Who blocked it is worn. A `blocked` card in a status group and a
       `blocked` Task Card carry a second outline badge after the status:
       `保留` for `blocked_by: operator`, `worker` and `system` for the
@@ -1126,12 +1132,6 @@ counterpart to carry, so it earns no token pair.
       danger pair. A task blocked by the operator appears in the
       `blocked` group and never in the reconciliation block's stuck
       readout.
-  34. Stuck work is stated, not handled. With `stuck` non-empty the
-      reconciliation block renders a readout captioned "動いていない task"
-      whose count pill equals its rows; each row is an ordinary card link
-      to `/tasks/<task_id>` carrying `data-reason` and two outline badges
-      (reason, status), and the block holds no `<button>`. With `stuck`
-      empty the readout is absent from the DOM.
 
 ## Do's and Don'ts
 
