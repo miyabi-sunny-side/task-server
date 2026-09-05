@@ -63,6 +63,26 @@ class DataTests(unittest.TestCase):
         with closing(sqlite3.connect(source)) as db, db:
             self.assertEqual(db.execute('SELECT * FROM tasks WHERE id=?',(row[0],)).fetchone(), row)
 
+    def test_product_import_preserves_unknown_policy_and_archive(self):
+        for index, with_policy in enumerate((True, False)):
+            source = self.root / f'products-{index}.db'
+            with closing(sqlite3.connect(source)) as db, db:
+                db.execute('CREATE TABLE products (id TEXT, archived INTEGER' + (', releases INTEGER' if with_policy else '') + ')')
+                if with_policy:
+                    db.executemany('INSERT INTO products VALUES (?, ?, ?)', [('org/unknown', 1, None), ('org/private', 0, 0), ('org/public', 0, 1)])
+                else:
+                    db.execute("INSERT INTO products VALUES ('org/unknown', 1)")
+            destination = self.root / f'ledger-{index}'
+            self.data.migrate(source, destination)
+            unknown = self.data.read_generated(destination/'products'/self.data.filename('org/unknown'))
+            self.assertIsNone(unknown['releases'])
+            self.assertIs(unknown['archived'], True)
+            self.assertEqual(unknown['legacy']['archived'], 1)
+            if with_policy:
+                for name, policy in [('private', False), ('public', True)]:
+                    product = self.data.read_generated(destination/'products'/self.data.filename('org/' + name))
+                    self.assertIs(product['releases'], policy)
+
     def test_failed_import_does_not_publish_partial_ledger(self):
         source=self.root/'bad.db'
         with closing(sqlite3.connect(source)) as db, db:

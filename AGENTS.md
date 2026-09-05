@@ -19,6 +19,10 @@ One Axum process serves a Markdown task ledger, JSON API, MCP and the Svelte UI.
   persistence or a second authoritative cache.
 - Reads load files again, so hand edits are visible. Coordinate hand edits with
   running writers; stop the service before bulk edits or restoring a snapshot.
+- `product` owns explicit registration, partial metadata updates and archive. IDs
+  stay stable; repository, optional absolute local_path and nullable releases are
+  independent. No startup scan or repository configuration is authoritative.
+  Existing product Markdown needs no rewrite; absent policy/placement is unknown.
 - `task` owns current status, claims and milestones. `runs` owns the haystack and
   reading receipts. HTTP and MCP call the same domain functions.
 - The server does not launch agents or create review/merge/release subtasks.

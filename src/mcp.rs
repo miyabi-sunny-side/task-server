@@ -63,6 +63,49 @@ pub struct CheckpointUpdate {
     #[serde(flatten)]
     pub patch: crate::checkpoint::Patch,
 }
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProductId {
+    pub id: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProductFields {
+    pub id: String,
+    #[serde(default, deserialize_with = "present")]
+    #[schemars(with = "Option<String>")]
+    pub repository: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    #[schemars(with = "Option<String>")]
+    pub description: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    #[schemars(with = "Option<String>")]
+    pub local_path: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    #[schemars(with = "Option<bool>")]
+    pub releases: Option<Value>,
+}
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
+}
+impl ProductFields {
+    fn fields(self) -> Value {
+        let mut fields = serde_json::Map::new();
+        for (key, value) in [
+            ("repository", self.repository),
+            ("description", self.description),
+            ("local_path", self.local_path),
+            ("releases", self.releases),
+        ] {
+            if let Some(value) = value {
+                fields.insert(key.into(), value);
+            }
+        }
+        Value::Object(fields)
+    }
+}
+
 #[derive(Clone)]
 struct Admin {
     state: AppState,
@@ -163,18 +206,30 @@ impl Admin {
         )
     }
     #[tool(
-        description = "Register a product: id is org/repo with repository, description and releases"
+        description = "Read explicitly registered product metadata by stable id, including release policy and optional local_path"
     )]
-    fn product_register(&self, Parameters(a): Parameters<Args>) -> CallToolResult {
-        answer(product::put(
-            &self.state,
-            a.id.as_deref().unwrap_or(""),
-            a.fields(),
-        ))
+    fn product_get(&self, Parameters(a): Parameters<ProductId>) -> CallToolResult {
+        answer(self.state.store.get("products", &a.id))
     }
-    #[tool(description = "Rescan the configured projects directory")]
-    fn product_rescan(&self) -> CallToolResult {
-        answer(product::rescan(&self.state))
+    #[tool(
+        description = "Register a NEW stable org/repo id with canonical repository, optional description, local_path (absolute path or null), releases (true/false/null unknown). Existing IDs conflict; no filesystem discovery."
+    )]
+    fn product_register(&self, Parameters(a): Parameters<ProductFields>) -> CallToolResult {
+        let id = a.id.clone();
+        answer(product::put(&self.state, &id, a.fields()))
+    }
+    #[tool(
+        description = "Patch existing product metadata. Omitted fields stay unchanged; local_path:null clears placement, releases:null means unknown, false forbids release. ID and archive history are immutable. Product policy is separate from authorization for a particular execution."
+    )]
+    fn product_update(&self, Parameters(a): Parameters<ProductFields>) -> CallToolResult {
+        let id = a.id.clone();
+        answer(product::update(&self.state, &id, a.fields()))
+    }
+    #[tool(
+        description = "Archive a registered product explicitly, preserving its metadata and existing task history. Repeated calls are idempotent; registration never revives archived IDs."
+    )]
+    fn product_archive(&self, Parameters(a): Parameters<ProductId>) -> CallToolResult {
+        answer(product::archive(&self.state, &a.id))
     }
 }
 #[tool_handler(router=self.tool_router)]

@@ -23,6 +23,7 @@ class LoopTests(unittest.TestCase):
         for args in [('init', '-b', 'main'), ('-c', 'user.name=Test', '-c', 'user.email=t@x', 'commit', '--allow-empty', '-m', 'initial')]:
             subprocess.run(['git', '-C', str(self.repo), *args], check=True, capture_output=True)
         self.calls = []
+        self.product = {'id': 'org/repo', 'repository': 'https://example/canonical/project', 'local_path': str(self.repo), 'releases': False, 'archived': False}
         self.fail_report = False
         self.refuse_report = False
         self.claim_id = 'claim-one'
@@ -34,7 +35,8 @@ class LoopTests(unittest.TestCase):
                 case.calls.append((self.path, None))
                 self.send_response(200)
                 self.end_headers()
-                self.wfile.write(json.dumps({'task_id': case.task['id'], 'active_claim_id': case.claim_id, 'checkpoints': case.task.get('execution_checkpoints', [])}).encode())
+                result = case.product if self.path.startswith('/worker/products/') else {'task_id': case.task['id'], 'active_claim_id': case.claim_id, 'checkpoints': case.task.get('execution_checkpoints', [])}
+                self.wfile.write(json.dumps(result).encode())
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
                 case.calls.append((self.path, body))
@@ -74,7 +76,7 @@ class LoopTests(unittest.TestCase):
         self.agent.chmod(0o755)
 
     def loop_command(self, *extra):
-        return [str(SCRIPT), '--once', '--url', f'http://127.0.0.1:{self.server.server_port}', '--projects-root', str(self.root/'projects'), '--state-dir', str(self.root/'state'), '--agent-command', str(self.agent), '--heartbeat-seconds', '.05', *extra]
+        return [str(SCRIPT), '--once', '--url', f'http://127.0.0.1:{self.server.server_port}', '--state-dir', str(self.root/'state'), '--agent-command', str(self.agent), '--heartbeat-seconds', '.05', *extra]
 
     def run_loop(self, *extra):
         return subprocess.run(self.loop_command(*extra), capture_output=True, text=True, timeout=8)
@@ -94,6 +96,28 @@ class LoopTests(unittest.TestCase):
         self.assertNotIn('evidence', report['milestones'][0])
         self.assertEqual(report['run']['agent_exit'], 0)
         self.assertFalse(any(p == '/worker/runs' for p,b in self.calls))
+
+    def test_product_metadata_drives_workspace_and_fresh_prompt(self):
+        moved = self.root / 'unrelated-layout'
+        self.repo.rename(moved)
+        self.repo = moved
+        self.product['local_path'] = str(moved)
+        result = self.run_loop()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.reports()[0]['outcome'], 'done')
+        context = json.loads(next((self.root/'state').glob('claims/*/prompt.txt')).read_text().split('\n', 1)[1])
+        self.assertEqual(context['product'], self.product)
+
+    def test_missing_placement_and_archived_product_do_not_launch(self):
+        for index, patch in enumerate(({'local_path': None}, {'archived': True})):
+            with self.subTest(patch=patch):
+                self.calls.clear()
+                self.product.update(local_path=str(self.repo), archived=False)
+                self.product.update(patch)
+                result = self.run_loop('--state-dir', str(self.root / f'state-{index}'))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.reports()[0]['outcome'], 'blocked')
+                self.assertFalse(list((self.root/f'state-{index}').glob('claims/*/prompt.txt')))
 
     def test_checkpoint_is_persisted_and_fresh_state_resumes_saved_dirty_workspace(self):
         self.assertEqual(self.run_loop().returncode, 0)

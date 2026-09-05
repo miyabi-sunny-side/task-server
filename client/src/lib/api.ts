@@ -215,6 +215,20 @@ export function fetchClosed(signal?: AbortSignal): Promise<ClosedTask[]> {
   return requestJson("/api/closed", { signal });
 }
 
+export interface Product {
+  id: string;
+  repository: string;
+  description: string;
+  local_path: string | null;
+  releases: boolean | null;
+  archived: boolean;
+  archived_at: string | null;
+}
+
+export function fetchProducts(signal?: AbortSignal): Promise<Product[]> {
+  return requestJson("/api/products", { signal });
+}
+
 export function fetchTask(id: string, signal?: AbortSignal): Promise<TaskCard> {
   return requestJson(`/api/tasks/${encodeURIComponent(id)}`, { signal });
 }

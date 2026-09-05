@@ -69,6 +69,12 @@
         <button class="menu-item" type="button" onclick={openTheme}>
           テーマ設定
         </button>
+        <a
+          class="menu-item"
+          href="/products"
+          aria-current={router.index === 3 ? "page" : undefined}
+          onclick={closeMenu}>プロダクト一覧</a
+        >
       </nav>
     {/if}
   </div>
@@ -159,6 +165,7 @@
     font-size: var(--fs-md)
     font-weight: 500
     text-align: left
+    text-decoration: none
     cursor: pointer
 
     &:hover

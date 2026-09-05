@@ -13,7 +13,6 @@ pub struct AppState {
     pub csrf_token: String,
     pub dev_identity: Option<String>,
     pub claim_ttl_secs: u64,
-    pub projects_dir: Option<PathBuf>,
     pub clock: Arc<dyn Clock>,
 }
 impl AppState {
@@ -24,7 +23,6 @@ impl AppState {
             csrf_token: "test-csrf".into(),
             dev_identity: None,
             claim_ttl_secs: 3600,
-            projects_dir: None,
             clock: Arc::new(SystemClock),
         }
     }
@@ -66,7 +64,6 @@ impl AppState {
         s.static_dir = get("APP_STATIC_DIR")
             .unwrap_or_else(|| "client/dist".into())
             .into();
-        s.projects_dir = get("APP_PROJECTS_DIR").map(Into::into);
         s.dev_identity =
             (!production).then(|| get("APP_DEV_IDENTITY").unwrap_or_else(|| "miyabi".into()));
         Ok(s)

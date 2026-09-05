@@ -622,6 +622,36 @@ counterpart to carry, so it earns no token pair.
   points; with neither, omit the summary element. No full logs on a
   list. The same four list states apply; empty text remains
   閉じたタスクがありません and error offers 再試行.
+- **Products page — read-only registry.** `/products` is reached by the
+  dropdown's プロダクト一覧 link after テーマ設定; the header keeps its
+  existing three controls. Activation closes the menu and navigates
+  without a full reload; direct loading restores this page. Keep the
+  existing content column, with a label-type プロダクト一覧 heading and
+  a flat list of every registered product in server order, including
+  archived records. No sub-header, detail route or mutation controls.
+
+  Each non-interactive card reuses the surface-raised, 1px border,
+  8px radius, 10px padding and 8px list-gap recipe. Product `id` is its
+  wrapping label-type heading. Below it, labelled definition-list
+  entries show `repository` (リポジトリ), `description` (説明),
+  `local_path` (ローカルパス), `releases` (リリース), `archived`
+  (アーカイブ), and `archived_at` (アーカイブ日時). Labels are muted
+  caption, values body-sm; preserve description newlines. Repository
+  and path are readable text. Empty description reads 説明なし;
+  nullable path/time read 未設定. Releases maps strictly to 公開 (true),
+  公開しない (false), 未設定 (null); archived maps to アーカイブ済み
+  (true) or 有効 (false). Show supplied archive time even if archived
+  is false. No color alone communicates these values. Long values
+  wrap with `overflow-wrap: anywhere`; no truncation or sideways table.
+
+  The list exposes `data-state="loading|empty|error|success"` and uses
+  the existing spinner and state recipes. Empty reads
+  登録済みのプロダクトがありません; failure shows a danger message and
+  default 再試行 button. Existing recurring and tab-visible reloads
+  apply: keep drawn cards while fetching, replace only on success,
+  and preserve them unchanged on failure. Refresh
+  neither changes focus nor resets menu/theme state.
+
 - **Buttons:** default = surface-raised bg, 1px hairline, label type,
   sm radius, 8×14px padding, hover fills `--c-hover-1`. Primary =
   accent bg, `surface-raised`-token text — **at most one per primary
@@ -799,6 +829,19 @@ counterpart to carry, so it earns no token pair.
       that re-fires the request on click. At 375px, a row whose
       summary line holds a 40-character unbroken token still leaves
       `document.documentElement.scrollWidth` within the viewport.
+
+  25. Products at 320px, 375px and 900px in Sumi and Kinari: menu
+      item 1 remains テーマ設定 and the product link reaches `/products`
+      by click or Enter. Esc closes the menu and returns hamburger
+      focus; every reached control keeps the shared 2px focus outline.
+      Every product, including archived records, shows all registry
+      fields and the three distinct release values. Cards have no
+      focus stop. Long ids, descriptions, repositories and paths never
+      make the document wider than the viewport. At 900px the column
+      is 720px and its children 696px, with existing card geometry.
+      Loading, empty, error/retry and success are observable; retry
+      recovers, and a failed background refresh leaves drawn values
+      visible until a successful refresh replaces them.
 
 ## Do's and Don'ts
 

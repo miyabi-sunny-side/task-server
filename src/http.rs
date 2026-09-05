@@ -160,12 +160,20 @@ pub async fn api_put_product(
     mutation(&h, &s)?;
     Ok(Json(product::put(&s, &id, v)?))
 }
-pub async fn api_rescan_products(
+pub async fn api_patch_product(
     State(s): State<AppState>,
     h: HeaderMap,
+    Path(id): Path<String>,
+    Json(v): Json<Value>,
 ) -> Result<Json<Value>, Error> {
     mutation(&h, &s)?;
-    Ok(Json(product::rescan(&s)?))
+    Ok(Json(product::update(&s, &id, v)?))
+}
+pub async fn worker_product(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, Error> {
+    Ok(Json(s.store.get("products", &id)?))
 }
 pub async fn retired() -> Error {
     Error::Gone

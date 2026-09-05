@@ -118,7 +118,8 @@ def migrate(source, destination):
                     if name == 'tasks': value = projected_task(raw)
                     elif name == 'products':
                         value['legacy'] = raw
-                        value['releases'] = bool(raw.get('releases', 1))
+                        value['releases'] = None if raw.get('releases') is None else bool(raw['releases'])
+                        if 'archived' in raw: value['archived'] = bool(raw['archived'])
                     elif name == 'runs':
                         value['legacy'] = raw
                         for key in ('checks','diff_stat'):

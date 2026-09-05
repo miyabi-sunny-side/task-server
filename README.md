@@ -20,7 +20,6 @@ shows stopping reasons and milestone evidence, and resumes blocked work.
 | `APP_DATA_DIR` | `data/ledger`, Markdown records |
 | `APP_BIND_ADDR` | `127.0.0.1:3000` |
 | `APP_STATIC_DIR` | `client/dist` |
-| `APP_PROJECTS_DIR` | Optional `<org>/<repo>` catalogue scan root |
 | `TASK_SERVER_ENV` | Set `production` behind trusted ingress |
 | `APP_CSRF_TOKEN` | Required in production for browser mutation |
 | `CLAIM_TTL_SECS` | Claim lifetime; the loop sends heartbeats |
@@ -56,6 +55,54 @@ Reads reflect hand edits. Coordinate concurrent editing with execution, and stop
 writers for bulk changes. Only one server opens a ledger directory at a time.
 Individual record replacement is atomic; there is no general multi-file transaction.
 
+## Explicit product metadata
+
+The product Markdown record is the sole owner of operational product metadata.
+The server never discovers repositories, reads repository configuration, or scans
+local directories. `APP_PROJECTS_DIR` is ignored; `product_rescan` is removed and
+`POST /api/products/rescan` returns 410. Directory changes and restarts cannot add,
+archive, revive, or change products. The browser menu's product list shows all
+registered products, including archived entries and unknown release policies.
+
+| Field | Meaning |
+|---|---|
+| `id` | Stable `org/repo` key used by existing tasks; never renamed by a metadata update |
+| `repository` | Required canonical repository URL/address, independent of ID and local placement |
+| `description` | Human description, default empty |
+| `local_path` | Optional absolute checkout or bare repository path on the executing machine; `null` means unconfigured |
+| `releases` | `true`: releases supported; `false`: do not publish; `null` or missing: policy unknown |
+| `archived`, `archived_at` | Explicit archive state and timestamp; registration/update cannot revive it |
+
+MCP tools use flat arguments:
+
+- `product_register(id, repository, description?, local_path?, releases?)` creates
+  a new ID only; existing IDs conflict, including archived IDs.
+- `product_get(id)` reads the full record; `product_list()` returns all registered
+  products. These reads do not touch the filesystem outside the ledger.
+- `product_update(id, repository?, description?, local_path?, releases?)` patches
+  only supplied fields. Explicit `local_path:null` clears placement and
+  `releases:null` clears the policy; omitted fields remain unchanged.
+- `product_archive(id)` is idempotent and retains existing tasks, record body,
+  unknown frontmatter, and archive history. It prevents new runnable work.
+
+Human HTTP has `GET /api/products`, `GET /api/products/{org}/{repo}`, create-only
+`PUT /api/products/{org}/{repo}`, and partial `PATCH` at the same path. Mutations
+retain ingress identity and CSRF checks. The trusted worker read is
+`GET /worker/products/{org}/{repo}`. Product policy does not authorize a particular
+execution: its user's permission or restriction still applies. Unknown policy
+must be resolved before publication, and `false` must not be treated as unknown.
+
+Existing Markdown ledgers require no rewrite: keep the same `APP_DATA_DIR`.
+Stop the old service, snapshot/back up the ledger, remove the obsolete projects
+mount/configuration, and start the new version. Existing IDs, metadata, tasks,
+archive history and unknown fields remain unchanged. Missing `local_path` and
+`releases` remain unknown rather than being inferred from repository contents.
+Explicitly set each active product's placement and release policy through MCP
+before execution, checking that the chosen checkout belongs to its canonical
+repository. This is an operator-owned migration of already registered records,
+not a recurring discovery or registration process. SQLite imports still use
+`bin/task-data import-sqlite` and retain original columns in `legacy`.
+
 ## Execution
 
 `bin/task-loop --help` describes the standalone Python loop. It claims one ready task,
@@ -63,6 +110,12 @@ resolves a task worktree, starts a fresh `codex exec`, renews the lease, records
 result and appends a haystack note. The agent uses the installed development skills;
 review and fixes are part of that delivery, not additional server-generated tasks.
 Use `--once` for a single attempt and `--loop` for continuous execution.
+The loop fetches fresh product metadata using its task's stable ID and selects
+`local_path` as the Git repository. No `--projects-root` or ID-to-path convention
+is used. An archived product, an unset placement or a missing local directory
+becomes blocked with an explicit reason; the loop does not clone or register a
+replacement. It saves `product.json` beside `task.json` and includes the product
+metadata and three-state release policy in the fresh agent prompt.
 
 Agent failure, malformed output and timeout become blocked work with saved logs.
 An expired lease is visible as interrupted work. Resuming a task retains its known

@@ -37,6 +37,40 @@ describe("App", () => {
     window.history.replaceState(null, "", "/");
   });
 
+  it("restores the products URL and reaches it from the menu", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn<typeof fetch>()
+        .mockImplementation(
+          async (input) =>
+            new Response(
+              JSON.stringify(
+                String(input) === "/api/session"
+                  ? { user: "test", csrf_token: "test" }
+                  : [],
+              ),
+            ),
+        ),
+    );
+    window.history.replaceState(null, "", "/products");
+    render(App);
+    await screen.findByText("登録済みのプロダクトがありません");
+    await fireEvent.click(screen.getByRole("link", { name: "Task Server" }));
+    expect(window.location.pathname).toBe("/");
+    await fireEvent.click(screen.getByRole("button", { name: "メニュー" }));
+    await fireEvent.click(screen.getByRole("link", { name: "プロダクト一覧" }));
+    expect(window.location.pathname).toBe("/products");
+    expect(screen.queryByRole("navigation")).toBeNull();
+    await screen.findByText("登録済みのプロダクトがありません");
+    await fireEvent.click(screen.getByRole("button", { name: "メニュー" }));
+    expect(
+      screen
+        .getByRole("link", { name: "プロダクト一覧" })
+        .getAttribute("aria-current"),
+    ).toBe("page");
+  });
+
   it("keeps the invariant header and restores a deep detail URL", async () => {
     vi.stubGlobal(
       "fetch",

@@ -84,15 +84,18 @@ def git(path, *args):
     return subprocess.run(['git', '-C', str(path), *args], check=True, capture_output=True, text=True).stdout.strip()
 
 
-def workspace(args, task):
+def workspace(args, task, metadata):
     product = task.get('product_id') or ''
-    parts = product.split('/')
-    if len(parts) != 2 or any(p in ('', '.', '..') or '\\' in p for p in parts):
-        raise ValueError('task requires product_id org/repo')
-    root = args.projects_root.resolve()
-    repo = (root / product).resolve()
-    if not repo.is_relative_to(root) or not repo.is_dir():
-        raise ValueError('project is absent or outside projects-root')
+    if metadata.get('id') != product:
+        raise ValueError('product metadata does not match task product_id')
+    if metadata.get('archived') or metadata.get('archived_at'):
+        raise ValueError('product is archived')
+    placement = metadata.get('local_path')
+    if not isinstance(placement, str) or not Path(placement).is_absolute():
+        raise ValueError('product local_path is not configured; update product metadata explicitly')
+    repo = Path(placement).resolve()
+    if not repo.is_dir():
+        raise ValueError('registered product local_path is absent on this machine')
     key = hashlib.sha256((product + '\0' + task['id']).encode()).hexdigest()
     ownership = args.state_dir / 'workspaces' / (key + '.json')
     entries = []
@@ -117,7 +120,7 @@ def workspace(args, task):
     if ownership.exists():
         previous = load(ownership)
         path = Path(previous['path'])
-        if path.is_dir() and git(path, 'rev-parse', '--show-toplevel') == str(path):
+        if any(entry['worktree'] == str(path) for entry in entries) and path.is_dir() and git(path, 'rev-parse', '--show-toplevel') == str(path):
             return path  # Our saved task workspace may contain interrupted work.
     branch = task.get('branch')
     for entry in entries:
@@ -275,7 +278,9 @@ def execute(args, claim, folder):
         handoff = request(args, endpoint)
         task['execution_checkpoints'] = handoff['checkpoints']
         save(folder / 'task.json', task)
-        path = workspace(args, task)
+        metadata = request(args, '/worker/products/' + quote(task.get('product_id') or '', safe=''))
+        save(folder / 'product.json', metadata)
+        path = workspace(args, task, metadata)
         current = next((c for c in handoff['checkpoints'] if c['execution_id'] == claim['claim_id']), None)
         request(args, endpoint, {'claim_id': claim['claim_id'], 'expected_revision': current['revision'] if current else 0,
                                 'set': {'worktree': str(path), 'branch': git(path, 'branch', '--show-current'),
@@ -287,6 +292,8 @@ def execute(args, claim, folder):
                   'deliver を入口として spike/polish で実装・検証・レビューを完遂する。'
                   'レビューは delivery 内で行い、別のレビュータスクを発行しない。'
                   'タスク本文に既に授権された merge/release 等の後続成果まで続ける。'
+                  'productは明示登録された製品情報。repositoryが正準、local_pathは任意のローカル配置でIDから推測しない。'
+                  'releases:falseなら公開しない。null/未設定は不明なので公開前に方針を確認する。trueも個々の実行の許可・制限を上書きしない。'
                   '既存 milestones の証拠を確認し、完了した工程を重ねない。結果のmilestonesには今回新たに達成した工程だけを返す。'
                   '記録する成果はタスクで依頼された範囲に限る。既存milestonesを結果へコピーしない。'
                   '途中の変更を保全し、不足情報や実行障害で完了できなければ blocked とする。'
@@ -296,7 +303,7 @@ def execute(args, claim, folder):
                   'パスやagent handleは実在・稼働を確認し、認証トークンを保存しない。正式状態やclaim/reportは変更しない。'
                   '最後に指定schemaの結果を返す。報告本文はreport_markdownに自由なMarkdownとして一度だけ書く。'
                   'milestonesには工程名・日時・commitだけを返し、本文や証拠を重複させない。checks は実行した検証のname/exit_code。\n'
-                  + json.dumps({'task': context, 'full_task_path': str(folder / 'task.json'), 'workspace': str(path), 'claim_id': claim['claim_id'], 'checkpoint_url': args.url.rstrip('/') + endpoint, 'knowledge_repo': os.environ.get('KNOWLEDGE_REPO')}, ensure_ascii=False))
+                  + json.dumps({'task': context, 'product': metadata, 'full_task_path': str(folder / 'task.json'), 'workspace': str(path), 'claim_id': claim['claim_id'], 'checkpoint_url': args.url.rstrip('/') + endpoint, 'knowledge_repo': os.environ.get('KNOWLEDGE_REPO')}, ensure_ascii=False))
         save(folder / 'prompt.txt', prompt)
         save(folder / 'schema.json', SCHEMA)
         command = shlex.split(args.agent_command) + ['--output-schema', str(folder / 'schema.json'), '-o', str(folder / 'result.json'), '-']
@@ -430,7 +437,6 @@ def main():
     mode.add_argument('--loop', action='store_true', help='keep claiming, sleeping when idle')
     parser.add_argument('--url', default='http://127.0.0.1:5004')
     parser.add_argument('--worker', default='task-loop')
-    parser.add_argument('--projects-root', type=Path, default=Path.home() / 'projects')
     parser.add_argument('--state-dir', type=Path, default=Path.home() / '.local/state/task-loop')
     parser.add_argument('--agent-command', default='codex exec', help='Codex-compatible command argv, parsed without a shell')
     parser.add_argument('--idle-seconds', type=float, default=10)

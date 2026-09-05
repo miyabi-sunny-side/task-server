@@ -12,6 +12,7 @@ export const routes: RouteDef[] = [
   { pattern: /^\/$/, params: [] },
   { pattern: /^\/tasks\/([^/]+)$/, params: ["id"] },
   { pattern: /^\/closed$/, params: [] },
+  { pattern: /^\/products$/, params: [] },
 ];
 
 // The done page moved to /closed; the old address still reaches it (rewritten

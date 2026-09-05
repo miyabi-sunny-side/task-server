@@ -11,9 +11,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("use bin/task-data for migration and backup".into());
     }
     let state = AppState::from_env()?;
-    if state.projects_dir.is_some() {
-        task_server::product::rescan(&state)?;
-    }
     task_server::task::sweep(&state)?;
     let address = env::var("APP_BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.into());
     let listener = tokio::net::TcpListener::bind(&address).await?;

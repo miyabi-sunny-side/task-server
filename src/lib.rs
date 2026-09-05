@@ -17,7 +17,6 @@ pub mod mcp;
 pub mod product;
 pub mod report;
 pub mod runs;
-pub mod scan;
 pub mod state;
 pub mod task;
 pub use clock::{Clock, SharedClock, SystemClock, format_z};
@@ -44,10 +43,12 @@ pub fn app(state: AppState) -> Router {
         .route("/runs/{id}", get(http::api_run))
         .route("/runs/{id}/read", post(http::api_run_read))
         .route("/products", get(http::api_products))
-        .route("/products/rescan", post(http::api_rescan_products))
+        .route("/products/rescan", post(http::retired))
         .route(
             "/products/{*id}",
-            get(http::api_product).put(http::api_put_product),
+            get(http::api_product)
+                .put(http::api_put_product)
+                .patch(http::api_patch_product),
         )
         .route("/merges", post(http::retired))
         .route("/reviews", post(http::retired))
@@ -56,6 +57,7 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(http::healthz))
         .nest("/api", api)
+        .route("/worker/products/{*id}", get(http::worker_product))
         .route("/worker/claim", post(http::worker_claim))
         .route("/worker/heartbeat", post(http::worker_heartbeat))
         .route(

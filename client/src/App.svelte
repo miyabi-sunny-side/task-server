@@ -5,6 +5,7 @@
   import Detail from "./pages/Detail.svelte";
   import Closed from "./pages/Closed.svelte";
   import Home from "./pages/Home.svelte";
+  import Products from "./pages/Products.svelte";
 
   $effect(() => {
     void loadSession();
@@ -23,6 +24,8 @@
     <Detail id={router.params.id} />
   {:else if router.index === 2}
     <Closed />
+  {:else if router.index === 3}
+    <Products />
   {:else}
     <Home />
   {/if}

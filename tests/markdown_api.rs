@@ -284,32 +284,40 @@ async fn mcp_flat_crud_contract_over_json_rpc() {
 }
 
 #[test]
-fn rescan_preserves_migrated_product_documents_and_revives_archive() {
+fn legacy_product_documents_survive_restart_and_directory_changes() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
-    let checkout = root.path().join("org/repo");
-    gix::init(&checkout).unwrap();
-    std::fs::write(
-        checkout.join(".git/config"),
-        "[core]\n bare = false\n[remote \"origin\"]\n url = https://example.com/org/repo\n",
-    )
-    .unwrap();
-    let mut s = AppState::new(Store::open(data.path()).unwrap());
-    s.projects_dir = Some(root.path().into());
     let original = json!({"id":"org/repo","repository":"old","description":"old","releases":true,"archived":true,"archived_at":"2025-01-01","created_at":"created","updated_at":"updated","body":"migration body","legacy":{"sqlite_columns":{"extra":"preserve"}},"custom":{"nested":[1,2]}});
-    s.store
-        .put("products", "org/repo", original.clone())
+    {
+        let store = Store::open(data.path()).unwrap();
+        store.put("products", "org/repo", original.clone()).unwrap();
+        store.put("tasks", "historic", json!({"id":"historic","product_id":"org/repo","archived":true,"status":"done","body":"history"})).unwrap();
+    }
+    let expected_bytes = std::fs::read(data.path().join("products/org%2Frepo.md")).unwrap();
+    for present in [true, false, true] {
+        let checkout = root.path().join("org/repo");
+        if present {
+            std::fs::create_dir_all(&checkout).unwrap();
+        } else {
+            std::fs::remove_dir_all(&checkout).unwrap();
+        }
+        let s = AppState::from_vars(|key| match key {
+            "APP_DATA_DIR" => Some(data.path().to_string_lossy().into_owned()),
+            "APP_PROJECTS_DIR" => Some(root.path().to_string_lossy().into_owned()),
+            _ => None,
+        })
         .unwrap();
-    for _ in 0..2 {
-        task_server::product::rescan(&s).unwrap();
+        assert_eq!(s.store.get("products", "org/repo").unwrap(), original);
+        assert_eq!(s.store.list("products").unwrap().len(), 1);
+        assert_eq!(
+            s.store.get("tasks", "historic").unwrap()["product_id"],
+            "org/repo"
+        );
+        assert_eq!(
+            std::fs::read(data.path().join("products/org%2Frepo.md")).unwrap(),
+            expected_bytes
+        );
     }
-    let p = s.store.get("products", "org/repo").unwrap();
-    for key in ["legacy", "custom", "created_at", "updated_at", "body"] {
-        assert_eq!(p[key], original[key], "{key}");
-    }
-    assert_eq!(p["archived"], false);
-    assert!(p["archived_at"].is_null());
-    assert_eq!(p["releases"], true);
 }
 
 #[test]
@@ -488,4 +496,100 @@ async fn mcp_checkpoint_round_trip_new_session_and_expired_execution_lookup() {
     assert_eq!(rejected["result"]["isError"], true);
     let (_, _, missing) = rpc(app, Some(session), json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"task_checkpoint_get","arguments":{"id":"t","execution_id":"unknown"}}})).await;
     assert_eq!(missing["result"]["isError"], true);
+}
+
+#[tokio::test]
+async fn explicit_product_mcp_updates_reach_http_and_worker_without_rescan() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(Store::open(dir.path()).unwrap());
+    let app = task_server::app(state.clone());
+    let (_, headers, _) = rpc(app.clone(), None, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"products-test","version":"1"}}})).await;
+    let session = headers.get("mcp-session-id").unwrap().to_str().unwrap();
+    rpc(
+        app.clone(),
+        Some(session),
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    )
+    .await;
+    let (_, _, listed) = rpc(
+        app.clone(),
+        Some(session),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+    )
+    .await;
+    let names = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(!names.contains(&"product_rescan"));
+    for name in [
+        "product_register",
+        "product_get",
+        "product_list",
+        "product_update",
+        "product_archive",
+    ] {
+        assert!(names.contains(&name));
+    }
+    for (name, args, expected) in [
+        (
+            "product_register",
+            json!({"id":"stable/id","repository":"https://example/canonical/repo"}),
+            json!({"releases":null}),
+        ),
+        (
+            "product_update",
+            json!({"id":"stable/id","releases":false,"local_path":"/different/checkout"}),
+            json!({"releases":false,"local_path":"/different/checkout"}),
+        ),
+        (
+            "product_update",
+            json!({"id":"stable/id","description":"公開しない製品"}),
+            json!({"releases":false,"local_path":"/different/checkout","description":"公開しない製品"}),
+        ),
+        (
+            "product_archive",
+            json!({"id":"stable/id"}),
+            json!({"archived":true}),
+        ),
+        (
+            "product_update",
+            json!({"id":"stable/id","releases":null,"local_path":null}),
+            json!({"releases":null,"local_path":null,"archived":true}),
+        ),
+    ] {
+        let (_, _, result) = rpc(app.clone(), Some(session), json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":name,"arguments":args}})).await;
+        assert_ne!(result["result"]["isError"], true, "{result}");
+        for (key, value) in expected.as_object().unwrap() {
+            assert_eq!(
+                &result["result"]["structuredContent"][key], value,
+                "{name}: {key}"
+            );
+        }
+    }
+    let (_, _, got) = rpc(app.clone(), Some(session), json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"product_get","arguments":{"id":"stable/id"}}})).await;
+    let expected = &got["result"]["structuredContent"];
+    for (path, auth) in [
+        ("/api/products/stable/id", true),
+        ("/worker/products/stable%2Fid", false),
+    ] {
+        let (status, actual) = request(app.clone(), "GET", path, json!(null), auth, false).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&actual, expected);
+    }
+    let (_, list) = request(
+        app.clone(),
+        "GET",
+        "/api/products",
+        json!(null),
+        true,
+        false,
+    )
+    .await;
+    assert_eq!(list[0]["archived"], true);
+    assert_eq!(list[0]["repository"], "https://example/canonical/repo");
+    let (status, _) = request(app, "POST", "/api/products/rescan", json!({}), true, true).await;
+    assert_eq!(status, StatusCode::GONE);
 }
