@@ -28,6 +28,31 @@ const FIXTURE: Task = {
 describe("TaskCard", () => {
   afterEach(cleanup);
 
+  it.each([
+    {
+      checks: ["TLS verified", "mobile navigation passed", "TLS verified"],
+      expected: ["TLS verified", "mobile navigation passed", "TLS verified"],
+    },
+    {
+      checks: [
+        { name: "cargo test", exit_code: 1 },
+        { name: "cargo test", exit_code: 0 },
+      ],
+      expected: ["cargo test: exit 1", "cargo test: exit 0"],
+    },
+  ])(
+    "preserves every reported check in order: $expected",
+    ({ checks, expected }) => {
+      render(TaskCard, { task: { ...FIXTURE, checks } });
+      expect(
+        [...document.querySelectorAll('[data-field="checks"] li')].map((item) =>
+          item.textContent?.trim(),
+        ),
+      ).toEqual(expected);
+      expect(screen.getByText(FIXTURE.body)).toBeTruthy();
+    },
+  );
+
   it("puts the summary first and folds the log, the checks and the findings into closed details", () => {
     render(TaskCard, {
       props: {

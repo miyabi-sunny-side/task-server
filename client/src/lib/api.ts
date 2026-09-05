@@ -56,6 +56,15 @@ export interface ReviewOutcome {
   reported_at: string;
 }
 
+// Ledger reports retain both textual evidence and structured command results.
+export type Check = string | { name: string; exit_code: number };
+
+export function checkLabel(check: Check): string {
+  return typeof check === "string"
+    ? check
+    : `${check.name}: exit ${check.exit_code}`;
+}
+
 export interface TaskCard {
   archived?: boolean;
   milestones?: Milestone[];
@@ -85,7 +94,7 @@ export interface TaskCard {
   // One or two sentences a person reads first; the log lives in verification.
   summary?: string | null;
   // The checks the worker ran, as reported.
-  checks?: { name: string; exit_code: number }[];
+  checks?: Check[];
   // How far shipping this work steps the version; on a release task, the
   // largest level it ships. Optional here only so fixtures written before the
   // field existed still type-check; the server always sends it.
@@ -260,7 +269,7 @@ export interface Run {
   note?: string | null;
   stdout_tail?: string | null;
   stderr_tail?: string | null;
-  checks?: { name: string; exit_code: number }[];
+  checks?: Check[];
   read_at?: string | null;
 }
 

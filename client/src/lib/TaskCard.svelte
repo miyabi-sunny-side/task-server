@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { TaskCard as Task } from "./api";
-  import { blockedByLabel } from "./api";
+  import { blockedByLabel, checkLabel } from "./api";
 
   let {
     task,
@@ -104,8 +104,8 @@
   <details class="record" data-field="checks">
     <summary class="caption record-head">確認結果</summary>
     <ul class="checks">
-      {#each task.checks as check (check.name)}
-        <li class="record-text">{check.name}: exit {check.exit_code}</li>
+      {#each task.checks as check}
+        <li class="record-text">{checkLabel(check)}</li>
       {/each}
     </ul>
   </details>

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { fetchRuns, type Run } from "./api";
+  import { checkLabel, fetchRuns, type Run } from "./api";
   let { taskId }: { taskId: string } = $props();
   let runs = $state<Run[]>([]);
   let next = $state<number | null>(null);
@@ -47,7 +47,7 @@
       </p>
       {#if run.commit_sha}<p class="caption">{run.commit_sha}</p>{/if}
       {#each run.checks ?? [] as check}<p>
-          {check.name}: exit {check.exit_code}
+          {checkLabel(check)}
         </p>{/each}
       {#if run.stdout_tail}<pre>{run.stdout_tail}</pre>{/if}
       {#if run.stderr_tail}<pre>{run.stderr_tail}</pre>{/if}

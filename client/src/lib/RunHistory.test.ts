@@ -11,6 +11,38 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
 });
+it("preserves textual checks and repeated structured checks in a run", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          runs: [
+            {
+              id: 1,
+              at: "2026-09-05",
+              source: "worker",
+              checks: [
+                "TLS verified",
+                { name: "cargo test", exit_code: 1 },
+                { name: "cargo test", exit_code: 0 },
+                "TLS verified",
+              ],
+            },
+          ],
+          next: null,
+        }),
+      ),
+    ),
+  );
+  render(RunHistory, { taskId: "one" });
+  const details = document.querySelector("details")!;
+  details.open = true;
+  await fireEvent(details, new Event("toggle"));
+  await screen.findByText("cargo test: exit 0");
+  expect(screen.getAllByText("TLS verified")).toHaveLength(2);
+  expect(screen.getByText("cargo test: exit 1")).toBeTruthy();
+});
 it("loads only when opened, retries errors, and pages without marking read", async () => {
   const fetchMock = vi
     .fn<typeof fetch>()
