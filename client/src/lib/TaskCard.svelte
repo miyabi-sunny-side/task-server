@@ -100,6 +100,39 @@
     <p class="caption">到達実績はありません</p>
   {/each}
 </section>
+{#if task.execution_checkpoints?.some((checkpoint) => Object.keys(checkpoint.values).length)}
+  <details class="record" data-field="execution-checkpoints">
+    <summary class="caption record-head">引き継ぎ情報</summary>
+    <p class="caption">
+      保存したパスや担当の稼働状況は、再開時に確認してください。
+    </p>
+    {#each [...task.execution_checkpoints].reverse() as checkpoint (checkpoint.execution_id)}
+      <section class="milestone" data-execution-id={checkpoint.execution_id}>
+        <h2 class="caption">
+          {checkpoint.execution_id === task.claim_id
+            ? "現在の実行"
+            : "以前の実行"}
+        </h2>
+        <p class="caption">
+          {checkpoint.execution_id} · 更新 <time>{checkpoint.updated_at}</time>
+          · revision {checkpoint.revision}
+        </p>
+        <dl class="checkpoint-values">
+          {#each Object.entries(checkpoint.values) as [key, value] (key)}
+            <dt class="caption">{key}</dt>
+            <dd class="record-text">
+              {typeof value === "string"
+                ? value
+                : JSON.stringify(value, null, 2)}
+            </dd>
+          {:else}
+            <dd class="record-text">引き継ぎ内容はありません</dd>
+          {/each}
+        </dl>
+      </section>
+    {/each}
+  </details>
+{/if}
 {#if task.legacy_completion?.length}
   <details class="record" data-field="legacy-completion">
     <summary class="caption record-head">以前の作業記録</summary>
@@ -265,6 +298,15 @@
     color: var(--c-on-surface)
     white-space: pre-line
     overflow-wrap: anywhere
+
+  .checkpoint-values
+    margin: var(--sp-2) 0
+
+    dt
+      margin: var(--sp-2) 0 0
+
+    dd
+      margin-left: 0
 
   .checks
     margin: var(--sp-1) 0 0

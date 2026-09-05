@@ -7,6 +7,7 @@ use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
+pub mod checkpoint;
 pub mod clock;
 pub mod error;
 pub mod frontmatter;
@@ -57,6 +58,10 @@ pub fn app(state: AppState) -> Router {
         .nest("/api", api)
         .route("/worker/claim", post(http::worker_claim))
         .route("/worker/heartbeat", post(http::worker_heartbeat))
+        .route(
+            "/worker/tasks/{id}/checkpoint",
+            get(http::worker_checkpoint).post(http::worker_checkpoint_update),
+        )
         .route("/worker/report", post(http::worker_report))
         .route("/worker/runs", post(http::worker_runs))
         .route("/worker/snapshot", get(http::worker_snapshot))

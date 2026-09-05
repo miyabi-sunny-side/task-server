@@ -426,3 +426,66 @@ async fn list_shapes_summary_projection_and_haystack_cursor_contract() {
     assert_eq!(unread["runs"].as_array().unwrap().len(), 1);
     assert_eq!(unread["runs"][0]["id"], 2);
 }
+
+#[tokio::test]
+async fn mcp_checkpoint_round_trip_new_session_and_expired_execution_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = SharedClock::at(datetime!(2026-09-05 00:00 UTC));
+    let state = AppState::new(Store::open(dir.path()).unwrap())
+        .with_clock(Arc::new(clock.clone()))
+        .with_ttl(10);
+    state
+        .store
+        .put("products", "a/b", json!({"id":"a/b"}))
+        .unwrap();
+    task::create(&state, json!({"id":"t","title":"test","product_id":"a/b"})).unwrap();
+    task::set_status(&state, "t", "ready").unwrap();
+    let claim = task::claim(&state, "worker").unwrap().unwrap()["claim_id"].clone();
+    let app = task_server::app(state.clone());
+    let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"checkpoint-test","version":"1"}}});
+    let (_, headers, _) = rpc(app.clone(), None, init.clone()).await;
+    let session = headers["mcp-session-id"].to_str().unwrap();
+    let (_, _, tools) = rpc(
+        app.clone(),
+        Some(session),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+    )
+    .await;
+    let schema = &tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "task_checkpoint_update")
+        .unwrap()["inputSchema"];
+    assert!(schema["properties"]["claim_id"].is_object());
+    assert!(schema["properties"]["expected_revision"].is_object());
+    for (revision, set, delete) in [
+        (
+            0,
+            json!({"ci_url":"https://example.test/runs/1","next_step":"wait_ci","temp":true}),
+            json!([]),
+        ),
+        (1, json!({"next_step":"merge"}), json!(["temp"])),
+    ] {
+        let (_, _, result) = rpc(app.clone(), Some(session), json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"task_checkpoint_update","arguments":{"id":"t","claim_id":claim,"expected_revision":revision,"set":set,"delete_keys":delete}}})).await;
+        assert_ne!(result["result"]["isError"], true, "{result}");
+        assert_eq!(
+            result["result"]["structuredContent"]["revision"],
+            revision + 1
+        );
+    }
+    clock.advance_secs(11);
+    let (_, headers, _) = rpc(app.clone(), None, init).await;
+    let session = headers["mcp-session-id"].to_str().unwrap();
+    let (_, _, result) = rpc(app.clone(), Some(session), json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"task_checkpoint_get","arguments":{"id":"t","execution_id":claim}}})).await;
+    let saved = &result["result"]["structuredContent"];
+    assert!(saved["active_claim_id"].is_null());
+    assert_eq!(
+        saved["checkpoints"][0]["values"],
+        json!({"ci_url":"https://example.test/runs/1","next_step":"merge"})
+    );
+    let (_, _, rejected) = rpc(app.clone(), Some(session), json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"task_checkpoint_update","arguments":{"id":"t","claim_id":claim,"expected_revision":2,"set":{"next_step":"wrong"}}}})).await;
+    assert_eq!(rejected["result"]["isError"], true);
+    let (_, _, missing) = rpc(app, Some(session), json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"task_checkpoint_get","arguments":{"id":"t","execution_id":"unknown"}}})).await;
+    assert_eq!(missing["result"]["isError"], true);
+}

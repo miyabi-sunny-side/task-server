@@ -66,7 +66,15 @@ export function checkLabel(check: Check): string {
     : `${check.name}: exit ${check.exit_code}`;
 }
 
+export interface ExecutionCheckpoint {
+  execution_id: string;
+  revision: number;
+  updated_at: string;
+  values: Record<string, unknown>;
+}
+
 export interface TaskCard {
+  execution_checkpoints?: ExecutionCheckpoint[];
   report_id?: number;
   report_ids?: number[];
   legacy_completion?: {

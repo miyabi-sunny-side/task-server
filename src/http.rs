@@ -303,3 +303,27 @@ pub async fn api_run(
     identity(&h, &s)?;
     Ok(Json(crate::report::get(&s, &id)?))
 }
+
+#[derive(serde::Deserialize)]
+pub struct CheckpointQuery {
+    pub execution_id: Option<String>,
+}
+pub async fn worker_checkpoint(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<CheckpointQuery>,
+) -> Result<Json<Value>, Error> {
+    Ok(Json(crate::checkpoint::get(
+        &s,
+        &id,
+        query.execution_id.as_deref(),
+    )?))
+}
+pub async fn worker_checkpoint_update(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(v): Json<Value>,
+) -> Result<Json<Value>, Error> {
+    let patch = serde_json::from_value(v).map_err(|e| Error::Invalid(e.to_string()))?;
+    Ok(Json(crate::checkpoint::update(&s, &id, patch)?))
+}

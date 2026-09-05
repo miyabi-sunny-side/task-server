@@ -339,3 +339,46 @@ it("renders archived task content read-only even if stale transitions are suppli
   expect(screen.queryByRole("button")).toBeNull();
   cleanup();
 });
+
+it("shows checkpoint values under their execution and keeps arbitrary text inert", () => {
+  const { container } = render(TaskCard, {
+    task: {
+      ...FIXTURE,
+      execution_checkpoints: [
+        {
+          execution_id: "old-claim",
+          revision: 3,
+          updated_at: "2026-09-05T00:00:00Z",
+          values: {
+            next_step: "wait_ci",
+            ci_url: "https://example.test/runs/1",
+          },
+        },
+        {
+          execution_id: "claim-1",
+          revision: 1,
+          updated_at: "2026-09-06T00::00:00Z",
+          values: {
+            next_step: "merge",
+            markup: "<script>bad()</script>",
+            nullable: null,
+          },
+        },
+      ],
+    },
+  });
+  const panel = container.querySelector<HTMLDetailsElement>(
+    '[data-field="execution-checkpoints"]',
+  );
+  expect(panel).toBeTruthy();
+  expect(panel?.open).toBe(false);
+  expect(panel?.textContent).toContain("引き継ぎ情報");
+  expect(panel?.textContent).toContain("現在の実行");
+  expect(panel?.textContent).toContain("以前の実行");
+  expect(panel?.textContent).toContain("old-claim");
+  expect(panel?.textContent).toContain("wait_ci");
+  expect(panel?.textContent).toContain("merge");
+  expect(panel?.textContent).toContain("<script>bad()</script>");
+  expect(panel?.querySelector("script")).toBeNull();
+  cleanup();
+});

@@ -10,7 +10,9 @@ One Axum process serves a Markdown task ledger, JSON API, MCP and the Svelte UI.
   survives updates. Filenames percent-encode UTF-8 IDs; products remain `org/repo`.
 - `ledger::Store` owns reading, validation, one-process exclusion and atomic file
   replacement. `transaction` serializes operations; it is not multi-file rollback.
-  Task state and its milestones belong to the same file.
+  Task state, milestones and execution-scoped handoff checkpoints belong to the
+  same file. Checkpoint updates require the live claim and matching revision;
+  they do not change lifecycle, leases or official evidence.
   New completion reports live once in a run Markdown body; task/milestone
   report IDs reference it. The accepted run intent is replayed before task
   mutations/lease expiry after an interrupted task write. Do not introduce SQLite

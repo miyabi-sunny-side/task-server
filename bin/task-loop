@@ -10,11 +10,13 @@ import os
 from pathlib import Path
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from urllib.parse import quote
 
 
 def object_schema(properties):
@@ -72,8 +74,8 @@ def validate(value, schema=SCHEMA):
         raise ValueError('invalid outcome')
 
 
-def request(args, path, body, timeout=None):
-    req = Request(args.url.rstrip('/') + path, data=json.dumps(body).encode(), headers={'Content-Type': 'application/json'})
+def request(args, path, body=None, timeout=None):
+    req = Request(args.url.rstrip('/') + path, data=None if body is None else json.dumps(body).encode(), headers={'Content-Type': 'application/json'})
     with urlopen(req, timeout=timeout or args.http_timeout) as response:
         return None if response.status == 204 else json.load(response)
 
@@ -93,16 +95,30 @@ def workspace(args, task):
         raise ValueError('project is absent or outside projects-root')
     key = hashlib.sha256((product + '\0' + task['id']).encode()).hexdigest()
     ownership = args.state_dir / 'workspaces' / (key + '.json')
-    if ownership.exists():
-        previous = load(ownership)
-        path = Path(previous['path'])
-        if path.is_dir() and git(path, 'rev-parse', '--show-toplevel') == str(path):
-            return path  # Our saved task workspace may contain interrupted work.
     entries = []
     for record in git(repo, 'worktree', 'list', '--porcelain').split('\n\n'):
         fields = dict(line.split(' ', 1) for line in record.splitlines() if ' ' in line)
         if 'worktree' in fields and 'bare' not in record.splitlines():
             entries.append(fields)
+    # The ledger can recover a workspace even when this loop's local state is new.
+    # A path/branch is a hint: confirm machine and membership in this repository.
+    previous_values = [c.get('values', {}) for c in reversed(task.get('execution_checkpoints', []))]
+    for values in previous_values:
+        saved_path, saved_branch = values.get('worktree'), values.get('branch')
+        if values.get('machine') != socket.gethostname() or not isinstance(saved_path, str) or not isinstance(saved_branch, str):
+            continue
+        for entry in entries:
+            if entry['worktree'] == saved_path and entry.get('branch') == 'refs/heads/' + saved_branch:
+                path = Path(saved_path)
+                if path.is_dir() and git(path, 'rev-parse', '--show-toplevel') == str(path):
+                    save(ownership, {'path': str(path), 'task_id': task['id']})
+                    return path
+    # Compatibility fallback for executions that predate ledger checkpoints.
+    if ownership.exists():
+        previous = load(ownership)
+        path = Path(previous['path'])
+        if path.is_dir() and git(path, 'rev-parse', '--show-toplevel') == str(path):
+            return path  # Our saved task workspace may contain interrupted work.
     branch = task.get('branch')
     for entry in entries:
         if branch and entry.get('branch') == 'refs/heads/' + branch:
@@ -255,8 +271,16 @@ def execute(args, claim, folder):
     exit_code = None
     lost = False
     try:
+        endpoint = '/worker/tasks/' + quote(task['id'], safe='') + '/checkpoint'
+        handoff = request(args, endpoint)
+        task['execution_checkpoints'] = handoff['checkpoints']
+        save(folder / 'task.json', task)
         path = workspace(args, task)
-        context = {key: task.get(key) for key in ('id', 'title', 'body', 'product_id', 'branch', 'commit_sha', 'milestones', 'summary', 'verification', 'report_id')}
+        current = next((c for c in handoff['checkpoints'] if c['execution_id'] == claim['claim_id']), None)
+        request(args, endpoint, {'claim_id': claim['claim_id'], 'expected_revision': current['revision'] if current else 0,
+                                'set': {'worktree': str(path), 'branch': git(path, 'branch', '--show-current'),
+                                        'machine': socket.gethostname(), 'logs_path': str(folder), 'next_step': 'execute_agent'}})
+        context = {key: task.get(key) for key in ('id', 'title', 'body', 'product_id', 'branch', 'commit_sha', 'milestones', 'summary', 'verification', 'report_id', 'execution_checkpoints')}
         if isinstance(context['verification'], str):
             context['verification'] = context['verification'].encode()[-8192:].decode('utf-8', errors='ignore')
         prompt = ('このタスクだけを新しい文脈で実行する。AGENTS.md と knowledge-read を読み、'
@@ -267,9 +291,12 @@ def execute(args, claim, folder):
                   '記録する成果はタスクで依頼された範囲に限る。既存milestonesを結果へコピーしない。'
                   '途中の変更を保全し、不足情報や実行障害で完了できなければ blocked とする。'
                   'この実行のclaim/reportは外側のloopが所有する。新規taskをclaimしない。'
+                  '引き継ぎはtask_checkpoint_getで読み、task_checkpoint_update(id,claim_id,expected_revision,set,delete_keys)で工程境界に必要キーだけ保存する。'
+                  'revision競合は再読して意図したキーだけ再適用する。古い実行の値は別実行の証拠として照合し、今回に必要なキーだけ明示的に引き写す。'
+                  'パスやagent handleは実在・稼働を確認し、認証トークンを保存しない。正式状態やclaim/reportは変更しない。'
                   '最後に指定schemaの結果を返す。報告本文はreport_markdownに自由なMarkdownとして一度だけ書く。'
                   'milestonesには工程名・日時・commitだけを返し、本文や証拠を重複させない。checks は実行した検証のname/exit_code。\n'
-                  + json.dumps({'task': context, 'full_task_path': str(folder / 'task.json'), 'workspace': str(path), 'knowledge_repo': os.environ.get('KNOWLEDGE_REPO')}, ensure_ascii=False))
+                  + json.dumps({'task': context, 'full_task_path': str(folder / 'task.json'), 'workspace': str(path), 'claim_id': claim['claim_id'], 'checkpoint_url': args.url.rstrip('/') + endpoint, 'knowledge_repo': os.environ.get('KNOWLEDGE_REPO')}, ensure_ascii=False))
         save(folder / 'prompt.txt', prompt)
         save(folder / 'schema.json', SCHEMA)
         command = shlex.split(args.agent_command) + ['--output-schema', str(folder / 'schema.json'), '-o', str(folder / 'result.json'), '-']

@@ -332,6 +332,7 @@ pub fn claim(s: &AppState, worker: &str) -> Result<Option<Value>, Error> {
             }
             t["status"] = json!("wip");
             t["claim_id"] = json!(uuid::Uuid::new_v4().to_string());
+            crate::checkpoint::begin(&mut t, &now)?;
             t["claimed_by"] = json!(worker);
             t["claimed_at"] = json!(now);
             t["updated_at"] = json!(now);

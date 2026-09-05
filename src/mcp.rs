@@ -51,6 +51,18 @@ impl Args {
         v
     }
 }
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointRead {
+    pub id: String,
+    pub execution_id: Option<String>,
+}
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct CheckpointUpdate {
+    pub id: String,
+    #[serde(flatten)]
+    pub patch: crate::checkpoint::Patch,
+}
 #[derive(Clone)]
 struct Admin {
     state: AppState,
@@ -117,6 +129,25 @@ impl Admin {
             &self.state,
             a.id.as_deref().unwrap_or(""),
         ))
+    }
+    #[tool(
+        description = "Read handoff values by task id, optionally one execution_id; expired executions remain readable"
+    )]
+    fn task_checkpoint_get(&self, Parameters(a): Parameters<CheckpointRead>) -> CallToolResult {
+        answer(crate::checkpoint::get(
+            &self.state,
+            &a.id,
+            a.execution_id.as_deref(),
+        ))
+    }
+    #[tool(
+        description = "Patch handoff values using live claim_id and expected_revision; set merges keys, delete_keys removes. JSON values max 32KiB/64 keys. No secrets; verify saved paths/agents before reuse. Does not change task state or lease."
+    )]
+    fn task_checkpoint_update(
+        &self,
+        Parameters(a): Parameters<CheckpointUpdate>,
+    ) -> CallToolResult {
+        answer(crate::checkpoint::update(&self.state, &a.id, a.patch))
     }
     #[tool(description = "Delete a closed task; session haystack remains")]
     fn task_delete(&self, Parameters(a): Parameters<Args>) -> CallToolResult {

@@ -2,6 +2,7 @@
 import json
 import os
 import signal
+import socket
 import time
 from pathlib import Path
 import subprocess
@@ -26,9 +27,14 @@ class LoopTests(unittest.TestCase):
         self.refuse_report = False
         self.claim_id = 'claim-one'
         self.lose_claim = False
-        self.task = {'id': 'task-one', 'title': 'Small task', 'body': 'Do the requested work', 'product_id': 'org/repo', 'branch': None, 'milestones': []}
+        self.task = {'id': 'task-one', 'title': 'Small task', 'body': 'Do the requested work', 'product_id': 'org/repo', 'branch': None, 'milestones': [], 'execution_checkpoints': []}
         case = self
         class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                case.calls.append((self.path, None))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(json.dumps({'task_id': case.task['id'], 'active_claim_id': case.claim_id, 'checkpoints': case.task.get('execution_checkpoints', [])}).encode())
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
                 case.calls.append((self.path, body))
@@ -36,6 +42,8 @@ class LoopTests(unittest.TestCase):
                 if self.path == '/worker/claim':
                     status = 200 if case.task else 204
                     result = {'claim_id': case.claim_id, 'lease_expires_at': '2099-01-01T00:00:00Z', 'task': case.task}
+                elif self.path == '/worker/tasks/task-one/checkpoint':
+                    result = {'execution_id': case.claim_id, 'revision': body['expected_revision'] + 1, 'updated_at': '2026-09-06T00:00:00Z', 'values': body['set']}
                 elif self.path == '/worker/report':
                     status = 503 if case.fail_report else 409 if case.refuse_report else 200
                     result = {**case.task, 'report_id': 17}
@@ -86,6 +94,44 @@ class LoopTests(unittest.TestCase):
         self.assertNotIn('evidence', report['milestones'][0])
         self.assertEqual(report['run']['agent_exit'], 0)
         self.assertFalse(any(p == '/worker/runs' for p,b in self.calls))
+
+    def test_checkpoint_is_persisted_and_fresh_state_resumes_saved_dirty_workspace(self):
+        self.assertEqual(self.run_loop().returncode, 0)
+        writes = [body for path, body in self.calls if path.endswith('/checkpoint') and body]
+        self.assertEqual(len(writes), 1)
+        saved = writes[0]['set']
+        path = Path(saved['worktree'])
+        self.assertEqual(saved['machine'], socket.gethostname())
+        self.assertEqual(saved['next_step'], 'execute_agent')
+        (path / 'unfinished.txt').write_text('keep interrupted changes')
+        self.task['execution_checkpoints'] = [{'execution_id': 'claim-one', 'revision': 1, 'values': {**saved, 'next_step': 'wait_ci', 'ci_url': 'https://example.test/runs/1'}}]
+        self.claim_id = 'claim-two'
+        self.calls.clear()
+        result = self.run_loop('--state-dir', str(self.root / 'fresh-state'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        fresh = [body for url, body in self.calls if url.endswith('/checkpoint') and body][0]
+        self.assertEqual(fresh['claim_id'], 'claim-two')
+        self.assertEqual(fresh['set']['worktree'], str(path))
+        self.assertEqual((path / 'unfinished.txt').read_text(), 'keep interrupted changes')
+        prompt = next((self.root / 'fresh-state').glob('claims/*/prompt.txt')).read_text()
+        self.assertIn('https://example.test/runs/1', prompt)
+        self.assertIn('task_checkpoint_update', prompt)
+        self.assertIn('claim-two', prompt)
+
+    def test_latest_checkpoint_workspace_precedes_old_local_ownership(self):
+        self.assertEqual(self.run_loop().returncode, 0)
+        saved = next(body['set'] for path, body in self.calls if path.endswith('/checkpoint') and body)
+        moved = self.root / 'moved-workspace'
+        subprocess.run(['git', '-C', str(self.repo), 'worktree', 'add', '-b', 'task/moved', str(moved)], check=True, capture_output=True)
+        (moved / 'unfinished.txt').write_text('latest work')
+        self.task['execution_checkpoints'] = [{'execution_id': 'claim-one', 'revision': 2, 'values': {**saved, 'worktree': str(moved), 'branch': 'task/moved'}}]
+        self.claim_id = 'claim-two'
+        self.calls.clear()
+        self.assertEqual(self.run_loop().returncode, 0)
+        actual = next(body['set'] for path, body in self.calls if path.endswith('/checkpoint') and body)
+        self.assertEqual(actual['worktree'], str(moved))
+        self.assertEqual(actual['branch'], 'task/moved')
+        self.assertEqual((moved / 'unfinished.txt').read_text(), 'latest work')
 
     def test_no_work_does_not_launch(self):
         self.task = None

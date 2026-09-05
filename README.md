@@ -73,6 +73,58 @@ The loop does not grant release or deployment authority. Put the intended outcom
 and relevant authorization in the task. It must report incomplete work as blocked,
 even when an earlier implementation step succeeded.
 
+## Execution handoff
+
+MCP `task_checkpoint_get` takes `id` and optional `execution_id`. It returns
+`task_id`, `active_claim_id`, and `checkpoints` in oldest-first order. Each
+checkpoint contains `execution_id` (the claim UUID), `revision`, `updated_at`,
+and a free-form JSON object `values`. Without `execution_id`, all executions are
+returned, including expired ones; a task never claimed has an empty array.
+A new claim starts with empty values at revision 0 and keeps older executions.
+An existing lease from an older server is exposed at revision 0 without rewriting
+its file on read; its first update persists the checkpoint.
+
+MCP `task_checkpoint_update` takes:
+
+```json
+{
+  "id": "task-id",
+  "claim_id": "current-claim-uuid",
+  "expected_revision": 0,
+  "set": {"next_step": "wait_ci", "ci_url": "https://example.org/runs/123"},
+  "delete_keys": ["obsolete_key"]
+}
+```
+
+The result is the updated checkpoint. `set` replaces only the specified top-level
+keys (a nested object is one value); `null` is a value, not deletion. `delete_keys`
+removes keys, including absent ones. Setting and deleting the same key is invalid.
+Values are limited to 64 keys and 32768 bytes of serialized JSON per execution;
+keys must be nonblank and at most 128 UTF-8 bytes. All values are JSON, and no
+predefined handoff keys are required. Use references for large logs.
+
+Updates require the live claim for that task and the exact current revision.
+An expired/foreign claim or stale revision conflicts. Re-read after a conflict or
+lost response and reapply only intended keys against the returned revision.
+Each accepted patch increments revision and records its own update time. The
+atomic task-file write leaves status, lease, commit, milestones and completion
+reports unchanged. Checkpoint values are hints, never execution authority.
+
+The equivalent trusted-network HTTP endpoint is `GET` or `POST`
+`/worker/tasks/{id}/checkpoint`; GET accepts `?execution_id=...`, and POST has the
+same arguments except `id` comes from the path. The browser task detail displays
+values under **引き継ぎ情報**, labeled by current/previous execution and update time.
+
+Do not store credentials or authentication tokens. Paths and agent handles can be
+invalid on another machine or session: verify existence, repository/branch and
+agent activity before reuse. On a new claim, inspect prior execution values and
+copy only still-relevant keys explicitly. The loop reads this handoff before
+starting its fresh agent, records machine/worktree/branch/log references, and
+asks the agent to save its next step and evidence references at stage boundaries.
+It reuses a saved dirty worktree only after matching the local machine and the
+repository's registered worktree and branch. Its local journal still owns process
+supervision and unsent report recovery; it is not the handoff source of truth.
+
 ## Migration from SQLite
 
 Take an SQLite backup first (SQLite backup API includes committed WAL data). Keep the
