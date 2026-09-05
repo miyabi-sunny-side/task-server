@@ -174,222 +174,56 @@ describe("Home", () => {
     vi.unstubAllGlobals();
   });
 
-  it("the two regions load and fail independently", async () => {
-    // The list request fails; the control panel must still draw.
-    stubFetch({
-      control: () =>
-        jsonResponse(
-          plane({
-            pending_releases: [
-              {
-                ...pendingMerge("release:t-1", "ready", null),
-                kind: "instant:release",
-                release_level: "patch",
-              },
-            ],
-          }),
-        ),
-      tasks: () => Promise.reject(new Error("offline")),
-    });
-
-    render(Home);
-    expect(region("control").dataset.state).toBe("loading");
-    expect(region("tasks").dataset.state).toBe("loading");
-
-    await waitFor(() =>
-      expect(region("control").dataset.state).toBe("success"),
-    );
-    await waitFor(() => expect(region("tasks").dataset.state).toBe("error"));
-    expect(
-      region("control").querySelector('a[href="/tasks/release:t-1"]'),
-    ).not.toBeNull();
-
-    cleanup();
-    vi.unstubAllGlobals();
-
-    // Now the other way round: the control request fails, the list renders.
-    stubFetch({
-      control: () => Promise.reject(new Error("offline")),
-      tasks: () => jsonResponse(TASKS),
-    });
-
-    render(Home);
-    await waitFor(() => expect(region("tasks").dataset.state).toBe("success"));
-    await waitFor(() => expect(region("control").dataset.state).toBe("error"));
-
-    const list = region("tasks");
-    const groups = [...list.querySelectorAll<HTMLElement>("[data-status]")];
-    expect(groups.map((group) => group.dataset.status)).toEqual([
-      "draft",
-      "ready",
-      "wip",
-      "done",
-      "merged",
-      "blocked",
-    ]);
-    for (const group of groups) {
-      const pill = group.querySelector<HTMLElement>("[data-count]");
-      const cards = group.querySelectorAll('a[href^="/tasks/"]');
-      expect(pill?.textContent?.trim()).toBe(String(cards.length));
-    }
-    expect(list.querySelector('a[href="/tasks/m-1"]')).toBeNull();
-    expect(list.querySelector('a[href="/tasks/t-released"]')).toBeNull();
-    expect(
-      screen.getByRole("link", { name: /テーマ切替/ }).getAttribute("href"),
-    ).toBe("/tasks/t-ready-1");
-  });
-
-  it("sends nothing but GETs and holds no primary button, however much is carried", async () => {
+  it("only reads on load and keeps creation available with legacy queues", async () => {
     const fetchMock = stubFetch({
       control: () =>
         jsonResponse(
           plane({
-            mergeable: [summary("t-a", "approved"), summary("t-b", "approved")],
             pending_merges: [pendingMerge("m-1")],
             pending_reviews: [summary("r-1", "ready", "review")],
-            releasable: [{ product_id: PRODUCT, task_count: 1 }],
           }),
         ),
     });
-
     render(Home);
-    await waitFor(() =>
-      expect(region("control").dataset.state).toBe("success"),
-    );
-
-    // Stranded work is drawn, and there is nothing on the page that would
-    // act on it: no button at all, and so no primary one.
-    expect(screen.queryAllByRole("button")).toHaveLength(0);
-    expect(document.querySelector(".primary")).toBeNull();
-    expect(screen.queryByRole("dialog")).toBeNull();
-    expect(writes(fetchMock)).toHaveLength(0);
-  });
-
-  it("leaves the tasks the panel draws out of the status groups", async () => {
-    stubFetch({
-      control: () =>
-        jsonResponse(
-          plane({
-            pending_reviews: [
-              summary("r-1", "ready", "review", "レビュー: t-done"),
-            ],
-            unreviewed: [summary("t-done", "done")],
-            mergeable: [summary("t-approved", "approved")],
-          }),
-        ),
-      tasks: () =>
-        jsonResponse([
-          ...TASKS,
-          summary("r-1", "ready", "review", "レビュー: t-done"),
-          summary("t-approved", "approved"),
-        ]),
-    });
-
-    render(Home);
-    await waitFor(() =>
-      expect(region("control").dataset.state).toBe("success"),
-    );
     await waitFor(() => expect(region("tasks").dataset.state).toBe("success"));
-
-    const list = region("tasks");
-    for (const id of ["r-1", "t-done", "t-approved", "m-1"]) {
-      expect(list.querySelector(`a[href="/tasks/${id}"]`)).toBeNull();
-    }
-    // Each of them has exactly one home, and it is on the panel.
-    const panel = region("control");
-    for (const id of ["r-1", "t-done", "t-approved"]) {
-      expect(panel.querySelectorAll(`a[href="/tasks/${id}"]`)).toHaveLength(1);
-    }
-    // Untouched work still stands in its group.
-    expect(list.querySelector('a[href="/tasks/t-ready-2"]')).not.toBeNull();
+    expect(screen.getByRole("button", { name: "新規タスク" })).toBeTruthy();
+    expect(region("control").dataset.state).toBe("empty");
+    expect(writes(fetchMock)).toHaveLength(0);
+    expect(
+      [...region("tasks").querySelectorAll<HTMLElement>("[data-status]")].map(
+        (g) => g.dataset.status,
+      ),
+    ).toEqual(["draft", "ready", "wip", "blocked"]);
   });
 
-  it("leaves a stuck normal task out of the status groups too", async () => {
+  it("shows a stopped task once in the execution readout", async () => {
     stubFetch({
       control: () =>
         jsonResponse(
           plane({
             stuck: [
               {
-                task_id: "t-ready-1",
+                task_id: "t-blocked",
+                status: "blocked",
                 kind: "normal",
-                status: "ready",
-                since: "2026-08-15T10:00:00Z",
-                reason: "unclaimed",
+                since: "2026-09-05",
+                reason: "blocked",
               },
             ],
           }),
         ),
     });
-
     render(Home);
     await waitFor(() =>
       expect(region("control").dataset.state).toBe("success"),
     );
     await waitFor(() => expect(region("tasks").dataset.state).toBe("success"));
-
-    // One home: the stuck readout on the panel, not the `ready` group.
     expect(
-      region("tasks").querySelector('a[href="/tasks/t-ready-1"]'),
-    ).toBeNull();
-    expect(
-      region("control").querySelectorAll('a[href="/tasks/t-ready-1"]'),
+      document.querySelectorAll('a[href="/tasks/t-blocked"]'),
     ).toHaveLength(1);
     expect(
-      region("tasks").querySelector('a[href="/tasks/t-ready-2"]'),
-    ).not.toBeNull();
-  });
-
-  it("shows a stopped merge's cause off the control payload, asking nothing else", async () => {
-    let jammed = true;
-    const fetchMock = stubFetch({
-      control: () =>
-        jsonResponse(
-          plane({
-            pending_merges: [
-              jammed
-                ? pendingMerge(
-                    "m-1",
-                    "blocked",
-                    "rebase conflict:\n  src/task.rs",
-                  )
-                : pendingMerge("m-1"),
-              pendingMerge("m-2"),
-              pendingMerge("m-9", "ready", null, "sunny-side/other"),
-            ],
-          }),
-        ),
-    });
-
-    render(Home);
-    await waitFor(() =>
-      expect(region("control").dataset.state).toBe("success"),
-    );
-
-    const reason = document.querySelector("[data-reason]");
-    expect(reason?.textContent).toContain("src/task.rs");
-    expect(region("control").textContent).toContain("他 1 件が待機中");
-    // The reason rides along with the queue, so nothing is fetched per card:
-    // there is no second request to fail on its own, and none to land out of
-    // order over a newer one.
-    for (const id of ["m-1", "m-2", "m-9"]) {
-      expect(callsTo(fetchMock, `/api/tasks/${id}`)).toHaveLength(0);
-    }
-    expect(callsTo(fetchMock, "/api/control")).toHaveLength(1);
-    expect(writes(fetchMock)).toHaveLength(0);
-
-    // A jam that clears takes its reason with it: the panel holds no cause of
-    // its own that a later payload would have to remember to overwrite.
-    jammed = false;
-    setVisibility("hidden");
-    setVisibility("visible");
-    await waitFor(() =>
-      expect(callsTo(fetchMock, "/api/control")).toHaveLength(2),
-    );
-    await waitFor(() =>
-      expect(document.querySelector("[data-reason]")).toBeNull(),
-    );
-    expect(region("control").textContent).not.toContain("src/task.rs");
+      region("tasks").querySelector('a[href="/tasks/t-blocked"]'),
+    ).toBeNull();
   });
 
   it("shows the empty state for an empty list", async () => {
@@ -477,7 +311,17 @@ describe("Home", () => {
         fail
           ? Promise.reject(new Error("offline"))
           : jsonResponse(
-              plane({ releasable: [{ product_id: PRODUCT, task_count: 1 }] }),
+              plane({
+                stuck: [
+                  {
+                    task_id: "t-blocked",
+                    status: "blocked",
+                    kind: "normal",
+                    since: "2026-09-05",
+                    reason: "blocked",
+                  },
+                ],
+              }),
             ),
       tasks: () =>
         fail ? Promise.reject(new Error("offline")) : jsonResponse(TASKS),

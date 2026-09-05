@@ -94,6 +94,7 @@
               <span class="tail">
                 <span class="done-at">{item.closed_at}</span>
                 <span class="badge">{item.status}</span>
+                {#if item.archived}<span class="badge">履歴</span>{/if}
                 {#if item.release_tag}
                   <span class="badge">{item.release_tag}</span>
                 {/if}

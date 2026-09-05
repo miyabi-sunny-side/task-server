@@ -3,7 +3,7 @@ version: alpha
 name: Task Server / Sumi
 description: >
   Self-contained design contract for Task Server — household task
-  control plane (Task Card + worker claim/report) in the Sumi family.
+  ledger (Task Card + fresh-agent claim/report) in the Sumi family.
   Dark theme is Sumi (the CSS default), light theme is Kinari; Washi
   is deliberately not adopted. Accent is teal #2f6f7e; storage-key
   prefix is task-server. Bootstrapped from the Sumi family starter
@@ -29,7 +29,7 @@ colors:
   danger: "#9c2b1d"
   danger-subtle: "#f9e9e4"
   # Information, not alarm: the tint of a standing state the operator
-  # should notice and think about (reconciliation). Blue, because green
+  # should notice and think about (execution waiting). Blue, because green
   # would say "fine" and yellow or orange would say "careful".
   info: "#1d5d8a"
   info-subtle: "#e6eff6"
@@ -164,21 +164,20 @@ components:
     padding: 4px
 ---
 
-# Task Server — Sumi Family Control Plane
+# Task Server — Sumi Family Task Ledger
 
 ## Overview
 
-Task Server is the household **task control plane**. It ships the Sumi
-app shell — header, menu, theme system, an operator top page and a Task
-Card detail page — so a human can read a card (body, verification,
-commit) and press an action, while workers claim and report over HTTP.
-The top page shows the stretch of pipeline the server carries by itself —
-review, then merge, then release — and the open work grouped by status.
-Review, merge and release are all issued automatically (a release is issued
-the moment work lands, at the level the work was filed with), so **the top
-page asks a human for no decision and holds no primary button**. The one
-decision this UI still asks — promoting a draft to `ready` — lives on the
-Task Card.
+Task Server is a Markdown task ledger with a browser list and Task Card
+view. A small runner starts a fresh agent for claimed work. The screen
+shows the current execution state separately from recorded achievements;
+it does not promise automatic review, merge, release or rework subtasks.
+The operator creates and edits task instructions, reads outcomes and
+history, and moves a prepared or blocked task to `ready` when it can run.
+
+This interaction contract was reconciled on 2026-09-05 for the ledger
+redesign. The existing Sumi/Kinari visual identity, layout, navigation,
+card recipes and accessibility remain the design authority below.
 
 The personality is **calm, quiet, and tool-like**: content first, chrome
 recedes into neutral ink tones, color only where it means something. The
@@ -232,8 +231,8 @@ implemented in `client/src/global.sass`.
   means a request failed or something is broken — never "please look at
   this".
 - **Info (#1d5d8a / #7fb8e6)** with `info-subtle` tints (#e6eff6 /
-  #16232e) for the one standing-state banner, reconciliation: the
-  pipeline is holding work and a person should think about it. Blue, not
+  #16232e) for an execution-waiting readout: work is blocked or its lease
+  has expired and a person should think about it. Blue, not
   red (nothing is broken), not green (nothing is fine), not yellow or
   orange (nothing is dangerous).
 - **Scrim (rgba(58,47,40,.4) / rgba(0,0,0,.6)):** modal backdrop.
@@ -311,9 +310,8 @@ The shell stacks three rows:
 
 **Screen-level controls are content, not chrome.** A screen that offers
 actions on the whole screen's subject places them as the **first block
-inside the content column** (the top page's panel sits there even though
-it now holds readouts and no control). It is never a third band, never
-sticky, and never full-width: the two bands above stay the only bands, and
+inside the content column** (the new-task action on the top page sits
+there). It is never a third band, never sticky, and never full-width: the two bands above stay the only bands, and
 main content stays the only scrolling region, so the controls scroll away
 with the work they act on.
 
@@ -454,7 +452,7 @@ launchers.
 
 - **`name` is `Task Server`** — the same string as `<title>`.
 - **`short_name` is `Task`**, the launcher label. `task` is the noun this
-  Japanese UI already uses untranslated ("review が発行されていない task"),
+  Japanese UI already uses untranslated,
   so the label speaks the UI's register without inventing a katakana
   translation, and four characters never truncate or wrap where
   `Task Server` sits at the 12-character ceiling. The full name still
@@ -491,7 +489,7 @@ counterpart to carry, so it earns no token pair.
   the hamburger). Default state matches the title — on-surface ink,
   transparent background, hover fills `--c-hover-1`. On `/closed` it
   carries `aria-current="page"` plus the **selected-radio treatment
-  already used in the release modal** (`--c-accent-subtle` background,
+  used for selected controls** (`--c-accent-subtle` background,
   `--radius-sm`) and switches its text to `--c-accent` ink — the tint
   this document already names "the selected-state tint" in Colors,
   never a solid accent fill, because the header is chrome present on
@@ -520,359 +518,110 @@ counterpart to carry, so it earns no token pair.
   storage) and **does not close the modal** — the user watches the
   theme change live. Close via ×, Esc, or scrim; focus returns to the
   hamburger.
-- **Top page — control panel over the task list.** The operator's
-  screen: one panel over the open work grouped by status. It reads two
-  sources — the control plane and the task list — and **each region
-  carries its own `data-state`**, so a failure or an emptiness on one
-  side never masks the other.
+- **Top page — active task ledger.** The first content block offers
+  新規タスク, the page's one primary action. The task list follows,
+  grouped in `draft`, `ready`, `wip`, `blocked` order. Empty groups are
+  absent, including their heading and count. `done`, `cancelled` and
+  `dropped` belong to the closed page; `archived: true` records belong
+  to history regardless of their retained status or legacy kind.
 
-  **What the panel is.** Review, merge and release are all issued by the
-  server, so the panel is not "the screen's controls" and holds none. It
-  is **the automated stretch of the pipeline**: what the machine is
-  carrying — reviews waiting, the merge trains, the releases — and
-  anything the automation failed to carry. The task list below it is the
-  work still waiting for a human or a worker to pick up.
+  A group heading uses label type and a count pill. Rows reuse the card
+  recipe (surface-raised, 1px border, 8px radius, 10px padding, 8px gaps).
+  Each row is one link to `/tasks/<id>` with exactly one focus stop:
+  product id (body-sm, on-surface), wrapping title (label), then neutral
+  outline status badge. Optional legacy kind and blocked-by metadata
+  use the same badge recipe. No milestone is used as a current status.
 
-  The panel is the first block of the content column, built from the card
-  recipe (surface-raised, 1px hairline, md radius, 10px padding), `--sp-3`
-  between its blocks, and it is read top-down in pipeline order.
+  **Execution waiting.** An optional read-only panel can show server
+  `stuck` entries for `blocked` and `lease-expired`. It is independent of
+  the list's fetch state and uses info-banner `role="status"`, ordinary
+  card links, a caption and count per non-empty reason. It names the
+  fact (`実行が止まっています` / `実行の期限が切れています`), with no
+  pipeline procedure or missing-subtask alarm. If a task is drawn there,
+  omit it from the status groups so it appears once on the page. With
+  no entries, the readout is absent; no empty pipeline panel remains.
+  Old review queues, merge trains, release queues and reconciliation
+  sets are retired even if legacy API fields remain for compatibility.
 
-  **The top page has no primary button.** The earlier rule — the page's
-  one accent marks the human decision point — has nothing left to mark:
-  the release button died the way the merge button did, when the server
-  took the decision over. A release is issued at the landing, at the
-  `release_level` the work was filed with, and a worker cuts the tag. So
-  no `<button>` on the top page is accent-filled, and no control on it is
-  named for release or merge. Where a human decision still exists — the
-  `ready` transition on a Task Card — the accent stays with it. A move
-  the machine makes never takes the accent.
+  **List states.** The container exposes
+  `data-state="loading|empty|error|success"`. Loading shows the centered
+  accent spinner; empty shows one muted body-sm message; error shows a
+  danger body-sm message and default 再試行 button; success shows rows.
+  New-task access remains available in empty and error states.
 
-  **There is no toast, no timer, and no auto-dismissing message anywhere
-  in this product.** The panel reports no action either, because it makes
-  none; the reloaded readouts are the receipt for whatever the server did.
+- **Create and edit.** 新規タスク opens the existing centered modal
+  recipe with labelled product, title and body fields. A new task starts
+  as `draft`. Editing from a Task Card uses the same field arrangement,
+  prefilled with its current values. Body is a multiline textarea;
+  Markdown source remains readable without adding a rich-text editor.
+  Save is the modal's one primary action. Blank required fields leave
+  it focusable with `aria-disabled` and a visible associated reason;
+  during a request controls disable to prevent duplicate submission.
+  Failure stays in the form with entered content preserved. Success
+  closes the modal and refreshes the relevant task/list. Esc or explicit
+  close cancels; keyboard focus returns to the opener. Background
+  refresh never resets an open form or steals focus.
 
-  **Readouts, and when they exist.** The panel draws what the server is
-  carrying, in pipeline order: the review queue, the merge trains, the
-  releases, then reconciliation. Each is a muted caption with its count
-  pill beside it over the ordinary card list, exactly like a status-group
-  heading, and **a readout holding nothing is not rendered at all**,
-  caption included — the status-group rule, for the same reason. When
-  every readout is empty the panel says so in one muted line instead: a
-  quiet pipeline is a state worth naming, not an empty box.
+- **Detail page — Task Card.** Keep the title-only sub-header. The
+  content starts with product id, then a neutral current-status badge
+  under the label 現在の状態. The vocabulary is `draft`, `ready`, `wip`,
+  `blocked`, `done`, `cancelled`, `dropped`. Optional blocked-by and
+  legacy-kind badges stay neutral. An archived record carries 履歴 and
+  exposes no edit or execution controls. Legacy review outcomes and
+  dependencies may remain as read-only context; they do not imply that
+  a pipeline is running or that another subtask must appear.
 
-  A readout has no status heading over it, so **its cards wear the
-  neutral outline status badge** — and they are the same card a status
-  group draws (one component: product first, title, then status / who
-  blocked it / kind), so a task reads the same wherever it sits.
+  Summary, if present, is body text below the head. A blocked task
+  shows its execution reason visibly before the work instructions,
+  using `verification` when present, otherwise `summary`; it never
+  hides the only explanation inside folded logs. Use body-sm,
+  on-surface, `white-space: pre-line` and `overflow-wrap: anywhere`,
+  with the label 停止理由. Blocking is an ordinary state, not a failed
+  HTTP request, so it does not use danger colors.
 
-  **Review queue.** The pending `review` tasks, under the caption "review
-  待ち". This is normal running: in a healthy pipeline the queue is
-  usually non-empty and it means nothing is wrong. It is drawn here
-  because a review waiting for a reviewer is the machine's stretch of the
-  pipeline, not the operator's work.
+  **Reached milestones.** A distinct section labelled 到達実績 displays
+  recorded `implemented`, `verified`, `reviewed`, `merged`, `released`
+  entries. Each entry shows its name, recorded time, and optional
+  `commit_sha` and evidence. Names use neutral outline badges; times
+  and commit ids use caption; evidence is body-sm with preserved
+  newlines and wrapping. Entries use the server's order and are facts,
+  not steps waiting to be completed: no empty future milestones,
+  percentage bar or implied automatic next step. With no entries the
+  section says 到達実績はありません. A task can be `blocked` while
+  retaining `implemented` and `verified` records. Moving its status
+  must not erase or relabel those facts.
 
-  **Merge trains.** The outstanding merge tasks, **grouped by product**,
-  because the train is per product — one product's jam never holds
-  another's, and a single flat list would say the opposite. Each group is
-  captioned by its product id with its count pill. **The panel writes no
-  caption that duplicates a status** — every card wears its status badge
-  like every other readout card — so the old "merge 進行中" caption is
-  gone. It was true only while nothing was blocked.
+  `commit_sha` remains a muted caption. Verification and checks keep
+  their native `<details>` sections, 作業記録 and 確認結果, initially
+  closed. Body uses body typography with pre-line and long-token
+  wrapping. Read-only execution history may be exposed as 実行履歴,
+  using native details and caption/body-sm records for available run
+  outcome, timing, summary and evidence. Long logs stay folded; a
+  history fetch failure must not hide the task or its milestones.
 
-  **Position says state, not sequence.** The server no longer promises
-  which of a product's outstanding merges is handed out next: any merge
-  that is `ready` may be the one a claim takes, and the decision is not
-  made until a worker asks. So a group is drawn **the merges that are
-  holding it up first — the ones that are `wip` or `blocked` — then the
-  rest**. What is left is a **set, not a line**: its order is stable, so
-  the list does not shuffle under the eye between reloads, and that
-  stability is a property of the drawing, never a claim about
-  distribution. Nothing in a train may say otherwise: **no ordinals, no
-  "次", no arrow, no card marked as coming first**. The old head — "the
-  first card is the merge that is or will be claimed" — is retired with
-  the ordering it read off, and the word "head" with it. A screen that
-  keeps a promise the server dropped is worse than one that never made
-  it.
+  編集 is a default button. Available status transitions come from the
+  server; `ready` is the page's only primary transition and resumes a
+  blocked task through the same mechanism as starting a draft. Other
+  transitions use default buttons. Successful mutations reload the
+  card. Request errors remain in place; no toast or disappearing
+  notice. Deletion remains an API operation; no new delete dialog is
+  required for this ledger surface.
 
-  **The holder** is the merge that is stopping the group: at most one per
-  product, `wip` while it runs, `blocked` when it stopped and is waiting
-  for a human. A holder in `wip` is an ordinary running train and says
-  nothing extra — the badge already says it. **A holder in `blocked` is
-  the one thing that must not read as mere slowness.** Its card carries,
-  under the title, **the reason as body-sm text** with `white-space:
-  pre-line` — on that card, wherever the card sits, because the reason
-  belongs to the merge that has it and not to a position. The group adds
-  **one muted caption naming how many of that product's merges are
-  waiting on it** ("他 2 件が待機中"), rendered only when at least one
-  other merge is there to wait. A named cause and a named cost are what
-  separate a stuck train from a quiet one. It stays **neutral**: a rebase
-  conflict or a failing check is an ordinary outcome of landing work, not
-  a failure of the app — exactly as a review's `request_changes` is — so
-  the danger tokens do not enter here.
+- **Closed page — history.** Keep header navigation to `/closed` and
+  the `/done` replacement redirect. This flat list holds `done`,
+  `cancelled`, `dropped`, and archived legacy records, including old
+  subtasks. Rows sort by server-provided closing time, most recent
+  first; tie order is stable. Every row remains readable at its detail
+  URL. A retained legacy status is history, never an active pipeline
+  group. No sub-header or extra page title is introduced.
 
-  **Releases.** The outstanding `instant:release` tasks, under the caption
-  "release": at most one per product, issued by the landing and finished
-  by the tag a worker cut. Drawn like a train's cards — the product id as
-  the name, the **level** (`patch` / `minor` / `major`) and the status as
-  outline badges, and on a `blocked` release its reason under the title
-  as body-sm text with `white-space: pre-line`, neutral like a jammed
-  merge. A stopped release holds every later landing of its product back
-  the way a jammed merge holds its train, which is why it earns the same
-  legibility: a named cause on the card that has it. No control sits
-  here; calling a stopped release off happens on its Task Card, and the
-  next one is issued by hand over the API.
-
-  **Reconciliation.** The work the automation should be carrying and is
-  not: tasks that are `done` with no live review, tasks that are
-  `approved` with no live merge, and products whose landed work has no
-  live release. Every set is empty in a healthy pipeline, which is what
-  makes them a different kind of thing from the queues above and forbids
-  giving them the same look. This is the panel's
-  **one info-framed block**: the info-banner recipe (info text on
-  `info-subtle`, sm radius, 8px padding, body-sm) carrying
-  `role="status"` — a standing state the operator has to notice and think
-  about, not the outcome of a request they just made, so never
-  `role="alert"`, and not danger: nothing failed, the pipeline is holding
-  work and a person is being asked to look. It holds one captioned line
-  with its count pill per non-empty set — "review が発行されていない
-  task" / "merge が発行されていない task" / "release が発行されていない
-  product" — and under each the ordinary card list (for the release set,
-  one row per product carrying the count of tasks it would ship), whose
-  cards keep the neutral card recipe: **the info tint frames the fact
-  that the pipeline is holding work, and never tints the tasks
-  themselves**, which are ordinary work. The card is the border and
-  everything inside it: no second frame is drawn inside a card, so the
-  whole of it is what the pointer and the focus ring pick up. The
-  `releasable` set shares the tint for the same reason the others do — a
-  product waiting for its release is held work, not a failure.
-
-  **Stuck, inside reconciliation.** The server also measures waiting:
-  `GET /api/control` carries `stuck`, one row per task that has sat past
-  a threshold (a task never appears under two reasons), each with a fixed
-  `reason` (`unclaimed`, `lease-expired`, `no-subtask`,
-  `subtask-unclaimed`, `blocked`, `release-stalled`). The block renders
-  it as its last readout, **one captioned group per reason** in the order
-  the server listed them: the caption is the reason in plain Japanese
-  with its count pill, and under the caption one muted line says what to
-  do about it. The wording is fixed here:
-
-  | reason              | caption                          | note                                                      |
-  | ------------------- | -------------------------------- | --------------------------------------------------------- |
-  | `blocked`           | 長時間 blocked 状態              | 追加の議論が必要でしょうか。ご確認ください                |
-  | `unclaimed`         | 長時間 claim されていない        | worker が動いているかご確認ください                       |
-  | `lease-expired`     | lease が切れた                   | worker が途中で止まった可能性があります。ご確認ください   |
-  | `no-subtask`        | 次の subtask が発行されていない  | review / merge / release の発行が止まっています。ご確認ください |
-  | `subtask-unclaimed` | subtask が claim されていない    | subtask を拾う worker が動いているかご確認ください        |
-  | `release-stalled`   | release が進んでいない           | release task が止まっています。ご確認ください             |
-
-  Under each group the rows are **the ordinary task card**, the same
-  component the status groups draw: product first, then the title, then
-  the status badge with who blocked it and the kind — the reason lives
-  on the caption, the `since` timestamp is not drawn, and nothing about
-  the row is a bare id. The row's product and title come from the task
-  list the page already holds (a stuck row names only its task); a task
-  the list does not carry is drawn from what the server said — its id as
-  the title, its status and kind — with no invented product. The
-  judgment is the server's (a clock and a threshold), never the
-  screen's: the readout states the rows, sorts nothing, holds no button,
-  and follows the same rule as `releasable` — issued by nobody, pressed
-  by nobody. It is absent from the DOM while `stuck` is empty.
-
-  Reconciliation is also where the **cancelled blocked merge** surfaces.
-  Cancelling a blocked merge frees the rest of that product's train, but
-  its target is not re-issued — it falls back to `approved` with no merge
-  and appears here until a human moves it. **The panel states that as
-  state, never as instruction**: no sentence on this screen tells the
-  operator what to do next. Procedure belongs to the README; the screen's
-  only duty is that the stranded task cannot be missed.
-
-  **Panel states.** The panel exposes
-  `data-state="loading|empty|error|success"` on the same discipline as
-  the list: _loading_ is the centered spinner line; _error_ is the danger
-  body-sm line plus a default retry button — the one button the panel can
-  ever hold; _empty_ — nothing pending, nothing stranded — is one muted
-  line saying so ("運んでいるものはありません"); _success_ is the panel
-  above.
-
-  **Task list.** Below the panel, the open tasks grouped by status.
-  Groups follow the status vocabulary order — the main line `draft`,
-  `ready`, `wip`, `done`, `approved`, `merged`, then the sidetrack
-  `blocked` — and **a group holding nothing is not rendered at all**,
-  heading included. `cancelled` and `dropped` are never grouped: a task
-  that was called off leaves this page the way a released one does, and
-  the closed page is where a cancelled task keeps being readable. The order is the pipeline
-  read from its start, so `approved` sits between `done` and `merged`:
-  that is where the work stands — finished, carried past review, not
-  yet landed. `released`, `cancelled` and `dropped` are never shown —
-  shipped and called-off work leaves this page.
-
-  **What the list hides, and why.** The list shows `normal` tasks only,
-  and hides two things. A `normal` task hides while another region of
-  this same page already renders it — the panel draws stranded tasks in
-  reconciliation — because one object drawn twice on one screen reads as
-  two; it falls back into its status group the moment the panel stops
-  drawing it. A task whose `kind` is not `normal` hides always, whatever
-  its status: a `review`, `instant:merge` or `rework` task exists on this
-  page only through the panel's own readout — the review queue or the
-  merge trains — while it is in flight, and once it finishes it leaves the
-  page rather than falling into a status group. A `rework` is the pass a
-  verdict or a conflicted merge sent the work back for; its target stays
-  in the `wip` group meanwhile, which is where that work is. A review's verdict already lives on
-  its target's `latest_review`, and a landed merge's target already
-  carries the fact, so a finished subtask left behind here would be a
-  husk telling nothing the target's own card does not already tell. The
-  rule decides this; taste does not re-open it.
-
-  Each group is a section carrying its status as a data attribute,
-  headed by a label-type heading naming the status with its count pill
-  beside it; under the heading, cards per the family recipe
-  (surface-raised, 1px hairline, 8px radius, 10px padding) in a single
-  column with 8px gaps. A card links to its Task Card and **reads from
-  the forest to the tree to its state, top to bottom, in three lines**:
-  first the product id in body-sm on-surface text (not the muted
-  caption — it is the first thing read, not an afterthought), then the
-  title (label), wrapping onto further lines rather than being clipped
-  to one, then the neutral outline status badge. The heading groups;
-  the badge lets a single card be read on its own, and it keeps every
-  card on the page — group or readout — in one shape. A card whose
-  kind is not `normal` would add the kind badge after the status
-  badge, but every card here is a `normal` task, so in practice none
-  does. The card is one link and contains no other focusable element.
-  The list container keeps `data-state="loading|empty|error|success"`:
-  - _loading:_ centered muted body-sm text with the accent spinner
-    (1.5px-stroke circle, 1.1rem);
-  - _empty:_ centered muted body-sm message;
-  - _error:_ danger-colored body-sm message plus a default retry button;
-  - _success:_ the groups.
-
-- **Detail page — Task Card:** sub-header (title only) over a content
-  column whose head reads in the same order as a list card: **the
-  product id first** (body-sm, on-surface), then a row of outline badges
-  (caption type, 1px border, muted text; neutral chrome, not a data
-  color) — the status, and for a task whose kind is not `normal`
-  (`instant:merge`, `review`, `rework`) a second badge naming that kind. Below
-  the head comes **the summary** (`summary`, body text, on-surface) when
-  the task has one — the one or two sentences a person reads as the
-  completion report — then `commit_sha` as a muted caption, then the
-  **work record folded away**: `verification` and `checks` each sit in a
-  `<details>` element (summary lines 作業記録 and 確認結果) that is closed
-  by default, because they are the log, not the report. Then the body
-  text (body, 1.6, pre-line), and `available_transitions` as a row of
-  default buttons, one per reachable status. The `ready` transition, when present,
-  is the single primary (accent-filled) button — it is the human
-  decision the screen exists for. After a successful transition the
-  card reloads so status and buttons update. There is no
-  icon-dictionary fixture page.
-
-  **Status is worn, never tinted.** Every status reads through the same
-  neutral outline badge and its group heading; no status earns a color,
-  an icon, or a weight of its own. A `blocked` task wears one more
-  outline badge saying who stopped it — `保留` when a person parked it
-  (`blocked_by: operator`), `worker` when a report could not finish,
-  `system` when the control plane did it (a dependency called off) — on
-  the list card and the Task Card alike, after the status badge and
-  before the kind badge, in the same neutral chrome. A parked task is a
-  decision, not a jam: it stands in the `blocked` group with its badge
-  and never in the reconciliation block, whose `stuck` rows the server
-  reserves for `worker` and `system`. Parking is also the `ready → draft`
-  press: a ready task nobody holds goes back to the drawer, offered as
-  an ordinary transition button. `approved` is told apart from `done`
-  by where it sits in the vocabulary order — past review, before the
-  landing — and that position is the whole of its signal. `approved` is
-  also a status this screen never *produces*: a review report alone
-  enters it, so no control anywhere in this UI is labelled `approved`.
-
-  **Dependency.** `draft` is unfinished and `ready` is approved; a
-  dependency (`depends_on`) moves neither — it only decides when the
-  claim hands a ready task out. So the UI adds no status for waiting. A
-  task that waits for another carries one more muted caption in the
-  caption row, labelled `depends_on`, whose value is a link to that task.
-  A `ready` task whose dependency has not landed (the card payload
-  carries `dependency_status`) says why no worker has it yet in one more
-  muted line in the caption voice, reading `waiting depends_on: <id>`
-  with the id a link to that task — a line of text, not a badge, and
-  gone the moment the dependency lands or the task is anything but
-  `ready`. On the top page the status-group card of such a task carries
-  the same line under its title, as plain text because the card is
-  itself the link; a card whose dependency has landed, or that is not
-  `ready`, carries none. No control is added anywhere for it: a person
-  who wants to skip the order clears the dependency.
-
-  **Review block.** A task the card payload carries a review outcome
-  for (`review_verdict` and `review_findings`, however the server
-  sources them) renders one block **between the caption row and the
-  body**: a muted caption heading レビュー carrying the verdict as an
-  outline badge, then the findings **folded in a `<details>`** (summary
-  line レビュー所見, closed by default) as body-sm text with
-  `white-space: pre-line` — the verdict is the forest a reader needs at
-  once, the findings are the trees — the whole block built from the
-  card recipe (surface-raised, 1px hairline, md radius, 10px padding).
-  It sits
-  above the body because a worker reopening a task that came back to
-  `ready` has to read the correction before the instruction it
-  corrects; a reader who has to scroll past the brief to find out why
-  it reappeared has been told too late. It stays **neutral**:
-  `request_changes` is an ordinary outcome of review, not a failure of
-  the app, so the danger tokens stay reserved for requests that failed.
-  A task with no review outcome renders no block — never an empty one.
-  A `review` task's own card adds its subject commit as a muted caption
-  in the caption row, so the operator can see which commit the verdict
-  was passed on.
-- **Closed page — finished and called-off task list.** Reached from the
-  header's closed link (`/closed`; `/done` is the old address and is
-  rewritten to `/closed` in place); no sub-header, per Layout item 2 —
-  like the top page, the content column opens directly on the list and
-  current location is carried by the header's selected state alone, with
-  no page heading of its own. It lists every `kind: normal` task whose
-  status is `done`, `approved`, `merged`, `released` or `cancelled` —
-  non-`normal` tasks (`review`, `instant:merge`, `rework`) never appear,
-  and `dropped` never appears anywhere: it is the status of a subtask
-  folded for a rebuild, whose target keeps the history. (An operator may
-  also drop a `normal` task by hand; it then sits on no page until the
-  retention sweep deletes it, reachable only by its URL — `cancelled` is
-  the word for calling off normal work, and it stays readable here.) `released` and `cancelled`
-  are shown here on purpose: the top page drops a task the moment it
-  ships or is called off, and this one list is where closed work keeps
-  being readable, told apart by the status badge alone. Rows sort by the
-  moment they closed (`closed_at`: completion for finished work, the
-  cancelling for called-off work), most recent first.
-
-  **Deleting is not a screen.** A closed task can be deleted
-  (`DELETE /api/tasks/{id}`, the MCP `task_delete`, or the retention
-  sweep), but no page holds a delete control: the top page issues
-  nothing, and the closed page and the Task Card state what is, in the
-  same voice as everything else. Deleting is an operator's act over the
-  API, like issuing a release by hand.
-
-  Each row reuses the **card recipe** (`.cards` / `.card`:
-  surface-raised, 1px hairline, `--radius-md`, 10px padding, 8px gaps
-  between rows), stacked so the whole row is **one link to the Task Card
-  and never a second focus stop**. It reads **forest before trees**, in
-  this order: the product id first (`.product-first`, body-sm,
-  on-surface, as on the top page), the title (`.name`), then **the
-  summary** (`.summary`: body-sm, on-surface, `overflow-wrap: anywhere`)
-  — the one or two sentences a person reads as the completion report —
-  and last the tail (baseline-aligned) with the completion timestamp as
-  a muted caption, the **status badge** (outline badge recipe — neutral,
-  never tinted, per Status is worn, never tinted) and the **release tag**
-  when present (the same outline badge recipe, a second chip). The list
-  never shows the log: when a task has no `summary`, the summary line
-  shows the **first line of `verification` cut at 80 characters** (by
-  code point, no ellipsis) and nothing after it; a task with neither
-  renders no summary line at all, never an empty one. The rule of this
-  screen and the Task Card together: **a list is the forest (summary);
-  the Task Card's folded details are the trees (verification, checks,
-  review findings).**
-
-  The list container carries `data-state="loading|empty|error|success"`
-  on the task list's own discipline: _loading_ is the centered accent
-  spinner line; _empty_ is one centered muted `.state` line reading
-  "閉じたタスクがありません" and nothing else — no heading, no zero
-  pill; _error_ is the `.state.error` line plus a default "再試行"
-  button; _success_ is the rows. There is no group heading and no status
-  grouping here — unlike the top page's task list, the closed page is
-  already filtered to one purpose and reads faster as one flat,
-  time-ordered list than as separate single-status groups.
+  Reuse the single-link card recipe, in document order: product, title,
+  optional summary, then timestamp and outline status/optional release
+  tag badges. Archived rows can add a neutral 履歴 badge. With summary
+  absent, show only the first line of verification cut to 80 code
+  points; with neither, omit the summary element. No full logs on a
+  list. The same four list states apply; empty text remains
+  閉じたタスクがありません and error offers 再試行.
 - **Buttons:** default = surface-raised bg, 1px hairline, label type,
   sm radius, 8×14px padding, hover fills `--c-hover-1`. Primary =
   accent bg, `surface-raised`-token text — **at most one per primary
@@ -951,67 +700,35 @@ counterpart to carry, so it earns no token pair.
      it. Item 1 reads テーマ設定 and opens the centered theme modal.
   8. A Task Card sub-header contains the task title and zero
      buttons or links.
-  9. A Task Card shows body, commit_sha, status, and one control per
-     available transition, with `ready` as the only primary button when
-     it is offered. When the card payload carries `summary` it renders
-     first among the fields under the head (`data-field="summary"`);
-     `verification` and `checks` each sit inside a `<details>`
-     (`data-field="verification"` / `"checks"`) whose `open` is false on
-     render and whose `<summary>` reads 作業記録 / 確認結果; a task without
-     `checks` renders no checks details, and a task without `summary`
-     renders no summary element. Its head opens with the product id: in
-     document order the product precedes the status badge, and the kind
-     badge (when the kind is not `normal`) follows the status badge.
-     After a successful POST the displayed status and buttons match the
-     reloaded card.
-  10. On the top page the content column's first element child is the
-      control panel and the task list follows it. Each carries its own
-      `data-state`; forcing the list request to fail leaves the panel at
-      `success` with its readouts drawn, and forcing the control request to
-      fail leaves the list rendering its groups.
-  11. The top page has no primary button. With the control plane carrying
-      pending reviews, merges and releases and reporting stranded work of
-      every kind, the page region contains no `<button>` whose computed
-      background equals the accent (`rgb(94, 184, 199)` in Sumi,
-      `rgb(47, 111, 126)` in Kinari), and outside the panel's error state
-      the page contains no `<button>` at all. No `<dialog>` or
-      `role="dialog"` element exists on the top page.
-  12. The top page issues nothing. No control on the page is named for
-      release or merge; loading the page against a control plane that
-      reports mergeable, unreviewed and releasable work sends no request
-      with a method other than GET.
-  13. With at least one pending release the panel renders the releases
-      readout: a muted caption whose count pill number equals the number
-      of cards under it, each card linking to its `instant:release` task,
-      naming its product id, and wearing two outline badges — the level
-      (`patch`, `minor` or `major`) and the status. A `blocked` release
-      carries its reason as body-sm text preserving newlines
-      (`white-space` is `pre-line`) on its own card; a `ready` or `wip`
-      one renders no reason element. No text color or background in the
-      readout computes to the danger pair. With no pending release the
-      readout is absent from the DOM entirely.
-  14. With a product in `releasable`, the reconciliation block renders one
-      row per stranded product carrying its id and a count pill equal to
-      the number of tasks it would ship, under the caption "release が
-      発行されていない product", with no button in the row. With
-      `releasable` empty the row set is absent.
-  15. With nothing pending and nothing stranded the panel's `data-state`
-      is `empty` and it renders exactly one muted body-sm line and no
-      button; with anything carried it is `success`.
-  16. Status groups exist in the DOM only when non-empty; their document
-      order is draft, ready, wip, done, approved, merged, blocked,
-      cancelled, dropped; no group for `released` ever exists; each
-      heading's count pill number equals the number of cards under it;
-      `9999px` radius is computed only on count pills, outline badges,
-      and the spinner.
-  17. At 375px the panel's captions and readouts wrap without
-      `document.documentElement.scrollWidth` exceeding the viewport,
-      every card's hit box is at least 36px tall, and no two blocks of
-      the panel — review queue, merge trains, releases, reconciliation —
-      overlap (bounding boxes disjoint). At 900px the
-      content column computes to 720px wide with 12px left and right
-      padding and equal left/right margins (±1px), and the panel — its
-      child — computes to 696px.
+  9. Creating from an empty list saves a draft with the entered product,
+     title and multiline body. Opening its card, editing, saving and
+     reloading preserves the edits. A failed save preserves form text.
+  10. Current-status text and 到達実績 are separate DOM regions. A
+      `blocked` task with `implemented` and `verified` milestones shows
+      all three facts, each milestone's timestamp and supplied evidence.
+      An empty milestone array shows no invented achievement.
+  11. A blocked reason is visible without opening a details element.
+      Activating `ready` and reloading displays ready with the same
+      milestone records. Only available server transitions are offered.
+  12. Active groups are draft, ready, wip, blocked in that order, with
+      counts matching rows and no empty groups. Archived rows never
+      appear there. No automatic review/merge/release queues or
+      missing-subtask notices appear, including with legacy API fields.
+  13. Closed rows include done, cancelled, dropped and archived legacy
+      subtasks. Each row has one focusable link; clicking it opens the
+      preserved body and historical metadata.
+  14. At 320px and 375px, long title, evidence, stop reason and body
+      tokens produce no horizontal page overflow. At 900px the content
+      column is 720px with 12px side padding and 696px child width.
+  15. In Sumi and Kinari, new controls use existing tokens and card
+      geometry. The page and an open modal each contain at most one
+      accent-filled action. Labels associate with all form fields.
+  16. Keyboard opens create/edit, reaches fields, saves or cancels with
+      Esc, and returns focus to the opener. Failed saves keep the form
+      open; background refresh preserves fields and focus.
+  17. Loading, empty, error and success remain observable for lists.
+      Retry recovers a failed fetch. A run-history error leaves task
+      instructions and milestones visible.
   18. Every install asset is really served, not swallowed by the SPA
       fallback: the static server answers unknown paths with
       `index.html`, so a missing file still returns 200. `GET
@@ -1045,98 +762,7 @@ counterpart to carry, so it earns no token pair.
       clip (no ink lost) and the ink bounding box is at least 28px wide
       of the 48, so what remains is the whole check rather than a
       fragment.
-  22. Non-`normal` work never has a home in a status group, only in the
-      panel's own readout. While a `review` task is pending, a card for
-      it exists in the review queue and in no status group; once it is no
-      longer pending it leaves the top page entirely — no status group,
-      no card, whatever its status. No status group ever contains a card
-      for an `instant:merge` task either, pending or finished. A status
-      group card reads product, then title, then state: in document
-      order its product id precedes its title and its status badge
-      follows the title, and the status badge is the card's only badge,
-      because every card in a status group is a `normal` task. The
-      product id is not clipped, and a title longer than the card wraps
-      (the card's height grows; `document.documentElement.scrollWidth`
-      stays within a 375px viewport). Tabbing through any card — in a
-      status group, the review queue, a merge train, or the
-      reconciliation block — reaches exactly one focusable element, the
-      card link itself.
-  23. `approved` is a status the UI reads and never writes: on a `done`
-      task's Task Card no transition button's text is `approved`, and
-      across the top page and any open modal no control's text is
-      `approved`. An `approved` group renders like every other group —
-      neutral heading, count pill, and no color, icon, or weight telling
-      it apart from `done`.
-  24. A task carrying a review outcome renders the review block on its
-      Task Card, and the block precedes the body element in document
-      order (`compareDocumentPosition`). The block computes the card
-      geometry (1px border, 8px radius, 10px padding); its text colors
-      are the muted and on-surface tokens and never the danger pair; its
-      findings preserve newlines (`white-space` is `pre-line`). A task
-      with no review outcome renders no such block, empty or otherwise.
-      At 375px, findings holding a 40-character unbroken token still
-      leave `document.documentElement.scrollWidth` within the viewport.
-      A `review` task's card shows its subject commit as a muted
-      caption.
-  25. Readouts exist only when they hold something, controls always.
-      With at least one pending `review` task the panel renders the
-      review queue: a muted caption whose count pill number equals the
-      number of cards under it, each card linking to its review task and
-      wearing the neutral outline status badge that a status-group card
-      does not. With no pending review the queue is absent from the DOM
-      entirely — no caption, no empty message.
-  26. Merge trains are per product and a jam is legible. With merges
-      outstanding on two products the panel renders one group per
-      product, each captioned by its product id with a count pill equal
-      to its cards. A `blocked` merge carries the neutral outline status
-      badge and its reason as body-sm text preserving newlines
-      (`white-space` is `pre-line`) on its own card; no other card in
-      that group renders a reason element. When the group holds at least
-      one `ready` merge besides it, the group also renders exactly one
-      muted caption naming how many wait, whose number equals the count
-      of `ready` cards in that group; with none the caption is absent. A
-      group whose merges are all `ready`, and one whose holder is `wip`,
-      render no reason and no waiting caption. Blocking one product's
-      merge leaves the other product's group unchanged. No text color or
-      background inside a train computes to the danger pair, and no
-      caption in a train has a status name as its text. At 375px a reason
-      holding a 40-character unbroken token still leaves
-      `document.documentElement.scrollWidth` within the viewport.
-  27. A train's order says state and promises no sequence. In every
-      product group, each card whose status is `wip` or `blocked`
-      precedes every card that is neither
-      (`compareDocumentPosition`). No card in a train carries an
-      ordinal, a position number, an arrow, or the text 次: within a
-      group the only numeral rendered outside a card's own title and
-      status badge is the caption's count pill. Loading the page twice
-      against unchanged server state yields the same card order in
-      every group, and moving a group's `blocked` merge to `cancelled`
-      leaves the remaining cards in the order they already had.
-  28. Reconciliation is framed as the standing state it is. With nothing
-      stranded the block is absent from the DOM. With a `done` task
-      holding no live review, or an `approved` task holding no live
-      merge, it renders once, computes info text on an `info-subtle`
-      background and never the danger pair, carries `role="status"` and
-      never `role="alert"`, and holds one captioned line per non-empty
-      set whose count pill equals the cards under it; those cards are the
-      status-group card (product first, then title, then badges), compute
-      the ordinary card recipe (surface-raised background, 1px border,
-      8px radius) with no framed element inside them, and appear in no
-      status group. Cancelling a `blocked` merge and reloading leaves
-      that merge out of every train and its target inside this block.
-  29. A Task Card whose task carries `depends_on` renders a caption
-      labelled `depends_on` whose link resolves to that task's card;
-      without `depends_on` no such caption exists. When that task is
-      `ready` and the card payload carries `dependency_status`, one more
-      caption-toned line reads `waiting depends_on: <id>` with the id a
-      link to that task's card and no badge inside it; without
-      `dependency_status`, or on any status but `ready`, no such line
-      exists. On the top page the status-group card of a `ready` task
-      with `dependency_status` carries the same line as plain text under
-      its title with no anchor inside the card, and a card without
-      `dependency_status`, or not `ready`, carries none. No button
-      anywhere is added for dependencies.
-  30. Header closed link states, computed. Off `/closed`, the closed
+  22. Header closed link states, computed. Off `/closed`, the closed
       link's computed `background-color` is transparent and it carries no
       `aria-current` attribute. On `/closed`, it carries
       `aria-current="page"`, its computed `background-color` equals
@@ -1152,16 +778,7 @@ counterpart to carry, so it earns no token pair.
       with Enter navigates to `/closed` without a full page reload.
       Loading `/done` lands on the closed page with the address rewritten
       to `/closed` and no extra history entry.
-  31. The closed page shows only closed work, correctly typed. Every
-      row links to a task whose `kind` is `normal`; no `review`,
-      `instant:merge` or `rework` task ever appears. Every row's status is
-      one of `done`, `approved`, `merged`, `released`, `cancelled`; no
-      other status appears, and `dropped` appears nowhere. Loading the
-      page twice against unchanged server state yields rows in the same
-      order, and that order is non-increasing by `closed_at` (each row's
-      timestamp is at or after the next row's). The top page's status
-      groups hold no `cancelled` or `dropped` task.
-  32. Closed row composition and single focus stop. Each row computes the
+  23. Closed row composition and single focus stop. Each row computes the
       card recipe (1px border, 8px radius, 10px padding) and contains
       exactly one focusable element — the row's own link — regardless
       of whether a release-tag chip or a summary line is present. In
@@ -1174,7 +791,7 @@ counterpart to carry, so it earns no token pair.
       line's `textContent` is exactly the first line of `verification`
       cut to its first 80 code points; with neither, no `.summary`
       element exists.
-  33. Closed page states. With no closed tasks the list renders
+  24. Closed page states. With no closed tasks the list renders
       exactly one `.state` element reading "閉じたタスクがありません"
       and no row, no heading, and no pill. While loading it renders the
       centered accent spinner and no rows. On a failed fetch it renders
@@ -1182,26 +799,6 @@ counterpart to carry, so it earns no token pair.
       that re-fires the request on click. At 375px, a row whose
       summary line holds a 40-character unbroken token still leaves
       `document.documentElement.scrollWidth` within the viewport.
-  34. Stuck work is stated, not handled. With `stuck` non-empty the
-      reconciliation block renders a readout with one group per reason
-      (`data-reason`), in the server's order, each captioned with the
-      wording in the Stuck table, a count pill equal to its rows, and one
-      muted note line; each row is the ordinary task card link to
-      `/tasks/<task_id>` showing product, title and status (plus who
-      blocked it and the kind when present), no reason badge, no
-      timestamp, no bare id, and exactly one focusable element (itself);
-      the readout never carries a danger class or token, and the block
-      holds no `<button>`. With `stuck` empty the readout is absent from
-      the DOM.
-  35. Who blocked it is worn. A `blocked` card in a status group and a
-      `blocked` Task Card carry a second outline badge after the status:
-      `保留` for `blocked_by: operator`, `worker` and `system` for the
-      others, with `data-blocked-by` naming the value; a blocked row the
-      server did not label carries no second badge. The badge computes
-      the same neutral outline recipe as the status badge, never the
-      danger pair. A task blocked by the operator appears in the
-      `blocked` group and never in the reconciliation block's stuck
-      readout.
 
 ## Do's and Don'ts
 
@@ -1212,24 +809,9 @@ counterpart to carry, so it earns no token pair.
 - Do keep exactly one accent-filled primary action per region — one on
   the page, one inside an open modal; don't dim an accent fill to say
   "disabled", drop it to the default treatment instead.
-- Do let the page's one accent mark the point where the pipeline stops and
-  asks a human; don't hand it to whichever move happens most often, and
-  don't leave it on a control the operator no longer presses.
 - Do render a readout only while it holds something, and a control always,
   with its reason when it can do nothing; don't ship an empty readout with
   a zero pill, and don't let a control disappear when it is idle.
-- Do reserve the danger tokens for a request that failed and for the
-  pipeline holding work the automation should have carried; don't tint a
-  `blocked` merge or a `request_changes` review — those are ordinary
-  outcomes of the work.
-- Do show a stalled merge train's cause and what it is holding — the
-  reason on the stopped merge's own card and the count of the merges
-  waiting on it; don't let a jam read as ordinary slowness.
-- Do let a train's order say which merge is holding it up and nothing
-  more, drawing the holder first; don't number the cards, mark one as
-  next, or otherwise promise an order the server stopped keeping.
-- Do let the panel say what is true; don't put procedure on the screen —
-  what an operator should do about a stranded task belongs in the README.
 - Do name in text, beside the control, why a disabled control is
   disabled, and point at that text with `aria-describedby`; don't ship a
   control whose only signal is 50% opacity, and don't put an
@@ -1245,12 +827,6 @@ counterpart to carry, so it earns no token pair.
 - Do let a status say what it means through the vocabulary order and the
   neutral outline badge; don't give one status a color, an icon, or a
   weight the others don't have.
-- Do keep a task in its status group whenever it is waiting for someone
-  to claim it; hide it only when another region of the same page already
-  draws it.
-- Do show a review's findings on the reviewed task's own card, above the
-  body; don't make the worker who was sent back navigate elsewhere to
-  learn why.
 - Do present the menu as a hamburger-anchored dropdown; centered
   modals are for dialogs (theme settings), never for navigation.
 - Do give the closed link the selected-radio tint (`--c-accent-subtle`

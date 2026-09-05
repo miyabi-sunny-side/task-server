@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""Claim one task, run a fresh Codex, and durably report its outcome."""
+import argparse
+import ctypes
+from datetime import datetime
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import signal
+import subprocess
+import sys
+import time
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+
+def object_schema(properties):
+    return {'type': 'object', 'properties': properties, 'required': list(properties), 'additionalProperties': False}
+
+
+STRING = {'type': 'string'}
+NULLABLE = {'type': ['string', 'null']}
+SCHEMA = object_schema({
+    'outcome': {'type': 'string', 'enum': ['done', 'blocked']},
+    'summary': STRING, 'verification': STRING, 'commit_sha': NULLABLE,
+    'milestones': {'type': 'array', 'items': object_schema({'name': STRING, 'at': STRING, 'commit_sha': NULLABLE, 'evidence': STRING})},
+    'checks': {'type': 'array', 'items': object_schema({'name': STRING, 'exit_code': {'type': 'integer'}})},
+})
+
+
+def save(path, value):
+    """Replace one journal record only after its contents are on disk."""
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    with temporary.open('w') as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
+    directory = os.open(path.parent, os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def load(path):
+    return json.loads(path.read_text())
+
+
+def validate(value, schema=SCHEMA):
+    kind = schema['type']
+    if isinstance(kind, list):
+        if value is not None and not isinstance(value, str):
+            raise ValueError('expected string or null')
+        return
+    expected = {'object': dict, 'array': list, 'string': str, 'integer': int}[kind]
+    if type(value) is not expected:
+        raise ValueError('invalid result field type: ' + kind)
+    if kind == 'object':
+        if set(value) != set(schema['properties']):
+            raise ValueError('missing or unknown result fields')
+        for key, child in schema['properties'].items():
+            validate(value[key], child)
+    elif kind == 'array':
+        for item in value:
+            validate(item, schema['items'])
+    if 'enum' in schema and value not in schema['enum']:
+        raise ValueError('invalid outcome')
+
+
+def request(args, path, body, timeout=None):
+    req = Request(args.url.rstrip('/') + path, data=json.dumps(body).encode(), headers={'Content-Type': 'application/json'})
+    with urlopen(req, timeout=timeout or args.http_timeout) as response:
+        return None if response.status == 204 else json.load(response)
+
+
+def git(path, *args):
+    return subprocess.run(['git', '-C', str(path), *args], check=True, capture_output=True, text=True).stdout.strip()
+
+
+def workspace(args, task):
+    product = task.get('product_id') or ''
+    parts = product.split('/')
+    if len(parts) != 2 or any(p in ('', '.', '..') or '\\' in p for p in parts):
+        raise ValueError('task requires product_id org/repo')
+    root = args.projects_root.resolve()
+    repo = (root / product).resolve()
+    if not repo.is_relative_to(root) or not repo.is_dir():
+        raise ValueError('project is absent or outside projects-root')
+    key = hashlib.sha256((product + '\0' + task['id']).encode()).hexdigest()
+    ownership = args.state_dir / 'workspaces' / (key + '.json')
+    if ownership.exists():
+        previous = load(ownership)
+        path = Path(previous['path'])
+        if path.is_dir() and git(path, 'rev-parse', '--show-toplevel') == str(path):
+            return path  # Our saved task workspace may contain interrupted work.
+    entries = []
+    for record in git(repo, 'worktree', 'list', '--porcelain').split('\n\n'):
+        fields = dict(line.split(' ', 1) for line in record.splitlines() if ' ' in line)
+        if 'worktree' in fields and 'bare' not in record.splitlines():
+            entries.append(fields)
+    branch = task.get('branch')
+    for entry in entries:
+        if branch and entry.get('branch') == 'refs/heads/' + branch:
+            path = Path(entry['worktree'])
+            if git(path, 'status', '--porcelain'):
+                raise ValueError('task branch has an unowned dirty worktree')
+            save(ownership, {'path': str(path), 'task_id': task['id']})
+            return path
+    # Each task gets a worktree; unrelated main/feature workspaces stay untouched.
+    path = args.state_dir / 'worktrees' / key
+    try:
+        base = git(repo, 'symbolic-ref', 'refs/remotes/origin/HEAD')
+    except subprocess.CalledProcessError:
+        base = git(repo, 'symbolic-ref', 'HEAD')
+    branch = branch or 'task-loop/' + key[:16]
+    git(repo, 'check-ref-format', '--branch', branch)
+    try:
+        git(repo, 'show-ref', '--verify', 'refs/heads/' + branch)
+    except subprocess.CalledProcessError:
+        git(repo, 'worktree', 'add', '-b', branch, str(path), base)
+    else:
+        git(repo, 'worktree', 'add', str(path), branch)
+    save(ownership, {'path': str(path), 'task_id': task['id']})
+    return path
+
+
+def blocked(reason, task):
+    return {'outcome': 'blocked', 'summary': reason, 'verification': reason, 'commit_sha': task.get('commit_sha'), 'milestones': [], 'checks': []}
+
+
+def terminate(process):
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pass
+        # Kill descendants too, even if their immediate parent already exited.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+    except ProcessLookupError:
+        pass
+
+
+def process_identity(pid):
+    try:
+        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+        return None if fields[0] == 'Z' else fields[19]
+    except FileNotFoundError:
+        return None
+
+
+def supervise(parent, folder, command):
+    # The supervisor shares its process group with the agent and descendants.
+    # Arm parent-death handling before any child starts, then close the fork race.
+    signal.signal(signal.SIGTERM, lambda *_: os.killpg(os.getpgrp(), signal.SIGKILL))
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), 'cannot arm parent-death signal')
+    if os.getppid() != parent:
+        return 143
+    save(folder / 'process.json', {'pid': os.getpid(), 'starttime': process_identity(os.getpid())})
+    if os.getppid() != parent:
+        return 143
+    result = subprocess.run(command)
+    save(folder / 'agent-exit.json', {'exit_code': result.returncode})
+    return result.returncode
+
+
+def recover_process(folder):
+    record = folder / 'process.json'
+    if not record.exists():
+        return  # A not-yet-started supervisor checks its parent before launching.
+    saved = load(record)
+    pid = saved['pid']
+    if process_identity(pid) == saved['starttime']:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 3
+        while process_identity(pid) == saved['starttime']:
+            if time.monotonic() > deadline:
+                raise RuntimeError('previous agent has not stopped; report deferred')
+            time.sleep(.01)
+
+
+def read_result(path):
+    result = load(path)
+    validate(result)
+    if result['outcome'] == 'done' and any(check['exit_code'] != 0 for check in result['checks']):
+        raise ValueError('done result contains failed checks')
+    if not result['summary'].strip() or not result['verification'].strip():
+        raise ValueError('result summary and verification must be nonempty')
+    return result
+
+
+def tail(path):
+    if not path.exists():
+        return ''
+    with path.open('rb') as handle:
+        handle.seek(0, os.SEEK_END)
+        handle.seek(max(0, handle.tell() - 8192))
+        return handle.read().decode('utf-8', errors='replace')
+
+
+def execute(args, claim, folder):
+    task = claim['task']
+    save(folder / 'task.json', task)
+    process = None
+    started = time.monotonic()
+    exit_code = None
+    lost = False
+    try:
+        path = workspace(args, task)
+        context = {key: task.get(key) for key in ('id', 'title', 'body', 'product_id', 'branch', 'commit_sha', 'milestones', 'summary', 'verification')}
+        if isinstance(context['verification'], str):
+            context['verification'] = context['verification'].encode()[-8192:].decode('utf-8', errors='ignore')
+        prompt = ('このタスクだけを新しい文脈で実行する。AGENTS.md と knowledge-read を読み、'
+                  'deliver を入口として spike/polish で実装・検証・レビューを完遂する。'
+                  'レビューは delivery 内で行い、別のレビュータスクを発行しない。'
+                  'タスク本文に既に授権された merge/release 等の後続成果まで続ける。'
+                  '既存 milestones の証拠を確認し、完了した工程を重ねない。結果のmilestonesには今回新たに達成した工程だけを返す。'
+                  '記録する成果はタスクで依頼された範囲に限る。既存milestonesを結果へコピーしない。'
+                  '途中の変更を保全し、不足情報や実行障害で完了できなければ blocked とする。'
+                  'この実行のclaim/reportは外側のloopが所有する。新規taskをclaimしない。'
+                  '最後に指定schemaの結果を返す。checks は実行した検証のname/exit_code。\n'
+                  + json.dumps({'task': context, 'full_task_path': str(folder / 'task.json'), 'workspace': str(path), 'knowledge_repo': os.environ.get('KNOWLEDGE_REPO')}, ensure_ascii=False))
+        save(folder / 'prompt.txt', prompt)
+        save(folder / 'schema.json', SCHEMA)
+        command = shlex.split(args.agent_command) + ['--output-schema', str(folder / 'schema.json'), '-o', str(folder / 'result.json'), '-']
+        with (folder / 'prompt.txt').open('rb') as stdin, (folder / 'stdout.log').open('wb') as stdout, (folder / 'stderr.log').open('wb') as stderr:
+            process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--supervise', str(os.getpid()), str(folder), *command], cwd=path, stdin=stdin, stdout=stdout, stderr=stderr, start_new_session=True)
+            expiry = datetime.fromisoformat(claim['lease_expires_at'].replace('Z', '+00:00')).timestamp()
+            heartbeat_at = time.monotonic() + min(args.heartbeat_seconds, max(.01, (expiry - time.time()) / 2))
+            while process.poll() is None:
+                now = time.monotonic()
+                if time.time() >= expiry:
+                    lost = True
+                    raise RuntimeError('claim lease expired')
+                if now - started >= args.timeout_seconds:
+                    raise TimeoutError('agent timeout')
+                if now >= heartbeat_at:
+                    try:
+                        renewed = request(args, '/worker/heartbeat', {'claim_id': claim['claim_id']}, timeout=max(.01, min(args.http_timeout, expiry - time.time())))
+                        expiry = datetime.fromisoformat(renewed['lease_expires_at'].replace('Z', '+00:00')).timestamp()
+                    except HTTPError as error:
+                        if error.code in (404, 409, 410):
+                            lost = True
+                        raise
+                    except (URLError, TimeoutError, OSError):
+                        # Without renewal we cannot keep a competing writer alive.
+                        raise RuntimeError('heartbeat unavailable; execution stopped and logs preserved')
+                    heartbeat_at = time.monotonic() + min(args.heartbeat_seconds, max(.01, (expiry - time.time()) / 2))
+                time.sleep(min(.1, args.heartbeat_seconds))
+            exit_code = process.returncode
+            if exit_code:
+                raise RuntimeError(f'agent exited {exit_code}')
+        result = read_result(folder / 'result.json')
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        if process is not None:
+            terminate(process)
+            exit_code = process.returncode
+        result = blocked(str(error), task)
+    except BaseException:
+        if process is not None:
+            terminate(process)
+        raise
+    for filename in ('stdout.log', 'stderr.log'):
+        log = folder / filename
+        if log.exists():
+            with log.open('rb') as handle:
+                os.fsync(handle.fileno())
+    save(folder / 'outcome.json', result)
+    if lost:
+        save(folder / 'lease-lost.json', {'reason': result['verification']})
+    else:
+        save(folder / 'report.json', {'claim_id': claim['claim_id'], **result})
+    save(folder / 'run.json', {'source': 'worker', 'worker': args.worker, 'task_id': task['id'], 'product_id': task.get('product_id'), 'claim_id': claim['claim_id'], 'attempt': 1, 'outcome': result['outcome'], 'checks': result['checks'], 'commit_sha': result['commit_sha'], 'agent_exit': exit_code, 'agent_secs': int(time.monotonic() - started), 'stdout_tail': tail(folder / 'stdout.log'), 'stderr_tail': tail(folder / 'stderr.log'), 'note': result['summary']})
+
+
+def flush(args, folder):
+    report = folder / 'report.json'
+    if report.exists() and not (folder / 'reported.json').exists():
+        try:
+            response = request(args, '/worker/report', load(report))
+            save(folder / 'reported.json', response)
+        except HTTPError as error:
+            if error.code not in (404, 409, 410):
+                raise
+            save(folder / 'lease-lost.json', {'reason': f'report refused: HTTP {error.code}'})
+            report.rename(folder / 'refused-report.json')
+    if (folder / 'run.json').exists() and not (folder / 'run-sent.json').exists():
+        response = request(args, '/worker/runs', load(folder / 'run.json'))
+        save(folder / 'run-sent.json', response)
+
+
+def tick(args):
+    pending = False
+    for folder in sorted((args.state_dir / 'claims').iterdir()):
+        if not (folder / 'run-sent.json').exists():
+            pending = True
+            recover_process(folder)
+            if not (folder / 'run.json').exists():
+                # Do not relaunch an interrupted agent or discard its work.
+                claim = load(folder / 'claim.json')
+                result = blocked('loop interrupted; inspect saved workspace and logs before resuming', claim['task'])
+                try:
+                    source = folder / ('outcome.json' if (folder / 'outcome.json').exists() else 'result.json')
+                    if source.name == 'result.json':
+                        if not (folder / 'agent-exit.json').exists() or load(folder / 'agent-exit.json').get('exit_code') != 0:
+                            raise ValueError('agent successful exit is unconfirmed; raw result preserved')
+                    result = read_result(source)
+                except (OSError, ValueError) as error:
+                    result['verification'] += ': ' + str(error)
+                save(folder / 'outcome.json', result)
+                save(folder / 'report.json', {'claim_id': claim['claim_id'], **result})
+                save(folder / 'run.json', {'source': 'worker', 'task_id': claim['task']['id'], 'claim_id': claim['claim_id'], 'attempt': 1, 'outcome': result['outcome'], 'note': result['summary'], 'stdout_tail': tail(folder / 'stdout.log'), 'stderr_tail': tail(folder / 'stderr.log')})
+            flush(args, folder)
+    if pending:
+        return True
+    claim = request(args, '/worker/claim', {'worker': args.worker})
+    if claim is None:
+        return False
+    key = hashlib.sha256(claim['claim_id'].encode()).hexdigest()
+    folder = args.state_dir / 'claims' / key
+    folder.mkdir(mode=0o700, exist_ok=True)
+    save(folder / 'claim.json', claim)
+    execute(args, claim, folder)
+    flush(args, folder)
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--once', action='store_true', help='process at most one task (default)')
+    mode.add_argument('--loop', action='store_true', help='keep claiming, sleeping when idle')
+    parser.add_argument('--url', default='http://127.0.0.1:5004')
+    parser.add_argument('--worker', default='task-loop')
+    parser.add_argument('--projects-root', type=Path, default=Path.home() / 'projects')
+    parser.add_argument('--state-dir', type=Path, default=Path.home() / '.local/state/task-loop')
+    parser.add_argument('--agent-command', default='codex exec', help='Codex-compatible command argv, parsed without a shell')
+    parser.add_argument('--idle-seconds', type=float, default=10)
+    parser.add_argument('--heartbeat-seconds', type=float, default=30)
+    parser.add_argument('--timeout-seconds', type=float, default=3600)
+    parser.add_argument('--http-timeout', type=float, default=10)
+    args = parser.parse_args()
+    if any(getattr(args, key) <= 0 for key in ('idle_seconds', 'heartbeat_seconds', 'timeout_seconds', 'http_timeout')):
+        parser.error('timeouts and intervals must be positive')
+    args.state_dir = args.state_dir.expanduser().resolve()
+    os.umask(0o077)
+    for child in ('claims', 'workspaces', 'worktrees'):
+        (args.state_dir / child).mkdir(parents=True, exist_ok=True)
+    with (args.state_dir / 'lock').open('w') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print('another task-loop owns this state-dir', file=sys.stderr)
+            return 1
+        while True:
+            try:
+                worked = tick(args)
+            except (OSError, ValueError, RuntimeError) as error:
+                print(str(error), file=sys.stderr)
+                if not args.loop:
+                    return 1
+                worked = False
+            if not args.loop:
+                return 0
+            if not worked:
+                time.sleep(args.idle_seconds)
+
+
+if __name__ == '__main__':
+    if len(sys.argv) > 1 and sys.argv[1] == '--supervise':
+        raise SystemExit(supervise(int(sys.argv[2]), Path(sys.argv[3]), sys.argv[4:]))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    raise SystemExit(main())

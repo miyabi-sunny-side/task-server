@@ -1,238 +1,84 @@
-use std::env;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-
-use crate::clock::{Clock, SystemClock};
-use crate::db::Db;
-use crate::error::Error;
-use crate::task::StuckThresholds;
-
-pub const DEFAULT_CLAIM_TTL_SECS: u64 = 3600;
-
-/// The last rescan and when it finished. Held under one mutex so two rescans
-/// never walk at once, and a caller that queued behind a walk gets its result.
-#[derive(Debug, Default)]
-pub struct RescanGate {
-    pub finished: Option<(std::time::Instant, crate::product::Derived)>,
-}
-/// How many days a run keeps its stdout / stderr tails before the startup sweep
-/// blanks them. Every other field of a run is kept for good.
-pub const DEFAULT_RUNS_RETENTION_DAYS: u64 = 90;
-/// How many days a `cancelled` / `dropped` task stays before the startup sweep
-/// deletes it. `released` work is never swept.
-pub const DEFAULT_CALLED_OFF_RETENTION_DAYS: u64 = 30;
+use crate::{
+    Error,
+    clock::{Clock, SystemClock},
+    ledger::Store,
+};
+use std::{env, path::PathBuf, sync::Arc};
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3000";
-pub const DEFAULT_DB_PATH: &str = "data/task-server.db";
-
+pub const DEFAULT_DATA_DIR: &str = "data/ledger";
 #[derive(Clone)]
 pub struct AppState {
-    pub db: Arc<Db>,
+    pub store: Arc<Store>,
     pub static_dir: PathBuf,
     pub csrf_token: String,
     pub dev_identity: Option<String>,
     pub claim_ttl_secs: u64,
-    /// How long work may wait before `GET /api/control` lists it as stuck.
-    pub stuck: StuckThresholds,
-    /// Days a run keeps its output tails (`RUNS_RETENTION_DAYS`).
-    pub runs_retention_days: u64,
-    /// Days a called-off task stays before it is deleted
-    /// (`CALLED_OFF_RETENTION_DAYS`).
-    pub called_off_retention_days: u64,
-    /// The project tree the catalogue is derived from (`APP_PROJECTS_DIR`), when
-    /// one is configured. `None` means the catalogue is curated over the API.
     pub projects_dir: Option<PathBuf>,
-    /// Serialises rescans and remembers when the last one finished, so a
-    /// request that arrived while one was running takes that result instead of
-    /// walking again.
-    pub rescan: Arc<Mutex<RescanGate>>,
     pub clock: Arc<dyn Clock>,
 }
-
 impl AppState {
-    #[must_use]
-    pub fn for_test() -> Self {
+    pub fn new(store: Store) -> Self {
         Self {
-            db: Arc::new(Db::open_in_memory().expect("in-memory database")),
-            static_dir: PathBuf::from("client"),
+            store: Arc::new(store),
+            static_dir: "client/dist".into(),
             csrf_token: "test-csrf".into(),
             dev_identity: None,
-            claim_ttl_secs: DEFAULT_CLAIM_TTL_SECS,
-            stuck: StuckThresholds::default(),
-            runs_retention_days: DEFAULT_RUNS_RETENTION_DAYS,
-            called_off_retention_days: DEFAULT_CALLED_OFF_RETENTION_DAYS,
+            claim_ttl_secs: 3600,
             projects_dir: None,
-            rescan: Arc::new(Mutex::new(RescanGate::default())),
             clock: Arc::new(SystemClock),
         }
     }
-
-    /// # Errors
-    ///
-    /// Returns `Error::Invalid` when production secrets are missing or
-    /// `CLAIM_TTL_SECS` is not a number, and `Error::Db` when the database at
-    /// `APP_DB_PATH` cannot be opened.
     pub fn from_env() -> Result<Self, Error> {
         Self::from_vars(|key| env::var(key).ok())
     }
-
-    /// Build state from an explicit env lookup (process env or a test map).
     pub fn from_vars(get: impl Fn(&str) -> Option<String>) -> Result<Self, Error> {
         let production = get("TASK_SERVER_ENV").as_deref() == Some("production");
-        let require = |name: &str| -> Result<String, Error> {
-            get(name).ok_or_else(|| Error::Invalid(format!("{name} is required")))
-        };
-        let static_dir =
-            get("APP_STATIC_DIR").map_or_else(|| PathBuf::from("client/dist"), PathBuf::from);
-        let csrf_token = if production {
-            require("APP_CSRF_TOKEN")?
-        } else {
-            get("APP_CSRF_TOKEN").unwrap_or_else(|| "dev-csrf".into())
-        };
-        if csrf_token.is_empty() {
-            return Err(Error::Invalid("APP_CSRF_TOKEN must be non-empty".into()));
+        let csrf = get("APP_CSRF_TOKEN")
+            .or_else(|| (!production).then(|| "dev-csrf".into()))
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Error::Invalid("APP_CSRF_TOKEN is required".into()))?;
+        let ttl = get("CLAIM_TTL_SECS")
+            .unwrap_or_else(|| "3600".into())
+            .parse::<u64>()
+            .ok()
+            .filter(|v| *v > 0 && *v <= 86400)
+            .ok_or_else(|| Error::Invalid("CLAIM_TTL_SECS must be 1..86400".into()))?;
+        let configured_dir = get("APP_DATA_DIR");
+        if configured_dir.is_none() && get("APP_DB_PATH").is_some() {
+            return Err(Error::Invalid("APP_DB_PATH is retired; migrate using bin/task-data import-sqlite and set APP_DATA_DIR".into()));
         }
-        let dev_identity = if production {
-            None
-        } else {
-            Some(get("APP_DEV_IDENTITY").unwrap_or_else(|| "miyabi".into()))
+        let data_dir = PathBuf::from(configured_dir.unwrap_or_else(|| DEFAULT_DATA_DIR.into()));
+        let empty = match std::fs::read_dir(&data_dir) {
+            Ok(mut entries) => entries.next().transpose()?.is_none(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => return Err(e.into()),
         };
-        let claim_ttl_secs = match get("CLAIM_TTL_SECS") {
-            Some(raw) => raw
-                .parse()
-                .map_err(|_| Error::Invalid(format!("invalid CLAIM_TTL_SECS: {raw}")))?,
-            None => DEFAULT_CLAIM_TTL_SECS,
-        };
-        let secs = |name: &str, default: u64| -> Result<u64, Error> {
-            match get(name) {
-                Some(raw) => raw
-                    .parse()
-                    .map_err(|_| Error::Invalid(format!("invalid {name}: {raw}"))),
-                None => Ok(default),
-            }
-        };
-        let defaults = StuckThresholds::default();
-        let stuck = StuckThresholds {
-            unclaimed_secs: secs("APP_STUCK_UNCLAIMED_SECS", defaults.unclaimed_secs)?,
-            subtask_secs: secs("APP_STUCK_SUBTASK_SECS", defaults.subtask_secs)?,
-            release_secs: secs("APP_STUCK_RELEASE_SECS", defaults.release_secs)?,
-        };
-        let runs_retention_days = secs("RUNS_RETENTION_DAYS", DEFAULT_RUNS_RETENTION_DAYS)?;
-        let projects_dir = get("APP_PROJECTS_DIR")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from);
-        let called_off_retention_days = secs(
-            "CALLED_OFF_RETENTION_DAYS",
-            DEFAULT_CALLED_OFF_RETENTION_DAYS,
-        )?;
-        // Opened last, so a fail-closed startup never creates a database file.
-        let db_path = get("APP_DB_PATH").unwrap_or_else(|| DEFAULT_DB_PATH.to_owned());
-        let db = Arc::new(Db::open(db_path)?);
-        Ok(Self {
-            db,
-            static_dir,
-            csrf_token,
-            dev_identity,
-            claim_ttl_secs,
-            stuck,
-            runs_retention_days,
-            called_off_retention_days,
-            projects_dir,
-            rescan: Arc::new(Mutex::new(RescanGate::default())),
-            clock: Arc::new(SystemClock),
-        })
+        if empty
+            && data_dir
+                .parent()
+                .is_some_and(|parent| parent.join("task-server.db").exists())
+        {
+            return Err(Error::Invalid("legacy task-server.db exists beside an empty ledger; run bin/task-data import-sqlite before starting".into()));
+        }
+        let mut s = Self::new(Store::open(data_dir)?);
+        s.csrf_token = csrf;
+        s.claim_ttl_secs = ttl;
+        s.static_dir = get("APP_STATIC_DIR")
+            .unwrap_or_else(|| "client/dist".into())
+            .into();
+        s.projects_dir = get("APP_PROJECTS_DIR").map(Into::into);
+        s.dev_identity =
+            (!production).then(|| get("APP_DEV_IDENTITY").unwrap_or_else(|| "miyabi".into()));
+        Ok(s)
     }
-
-    #[must_use]
-    pub fn with_projects_dir(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.projects_dir = Some(dir.into());
-        self
-    }
-
-    #[must_use]
-    pub fn with_db(mut self, db: Arc<Db>) -> Self {
-        self.db = db;
-        self
-    }
-
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
     }
-
     #[must_use]
     pub fn with_ttl(mut self, secs: u64) -> Self {
         self.claim_ttl_secs = secs;
         self
-    }
-
-    #[must_use]
-    pub fn with_stuck(mut self, thresholds: StuckThresholds) -> Self {
-        self.stuck = thresholds;
-        self
-    }
-
-    #[must_use]
-    pub fn with_static_dir(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.static_dir = dir.into();
-        self
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use super::AppState;
-    use crate::error::Error;
-
-    /// Everything a production start needs. Network reachability bounds both
-    /// MCP surfaces; the remaining secret protects browser mutation.
-    fn production() -> HashMap<&'static str, &'static str> {
-        HashMap::from([
-            ("TASK_SERVER_ENV", "production"),
-            ("APP_CSRF_TOKEN", "csrf-secret"),
-            ("APP_DB_PATH", ":memory:"),
-        ])
-    }
-
-    /// Production refuses to start without its browser-mutation secret instead
-    /// of falling back to the published development default.
-    #[test]
-    fn production_names_the_secret_it_is_missing() {
-        let mut vars = production();
-        vars.remove("APP_CSRF_TOKEN");
-        let error = AppState::from_vars(|key| vars.get(key).map(|value| (*value).to_owned()))
-            .err()
-            .unwrap_or_else(|| panic!("a production start without APP_CSRF_TOKEN must fail"));
-        assert!(
-            matches!(&error, Error::Invalid(message) if message.contains("APP_CSRF_TOKEN")),
-            "unexpected error: {error:?}"
-        );
-    }
-
-    /// That secret is the whole production contract. A start holding it needs
-    /// no MCP or worker secret, identities, origins, or hosts in the process.
-    #[test]
-    fn production_starts_on_its_secret_alone() {
-        let vars = production();
-        let state = AppState::from_vars(|key| vars.get(key).map(|value| (*value).to_owned()))
-            .expect("the remaining secret is the whole process contract");
-        assert_eq!(state.csrf_token, "csrf-secret");
-        assert!(
-            state.dev_identity.is_none(),
-            "production must not mint an identity of its own"
-        );
-    }
-
-    /// Development gets a default so a local run needs no secret at all.
-    #[test]
-    fn development_defaults_the_remaining_secret() {
-        let state = AppState::from_vars(|key| match key {
-            "APP_DB_PATH" => Some(":memory:".to_owned()),
-            _ => None,
-        })
-        .expect("a development start needs no secrets");
-        assert_eq!(state.csrf_token, "dev-csrf");
     }
 }

@@ -7,14 +7,16 @@
     busy = false,
     error = "",
     ontransition,
+    onedit,
   }: {
     task: Task;
     busy?: boolean;
     error?: string;
     ontransition?: (status: string) => void;
+    onedit?: () => void;
   } = $props();
 
-  let transitions = $derived(task.available_transitions);
+  let transitions = $derived(task.archived ? [] : task.available_transitions);
   // Every kind but `normal` wears its name beside the status. Naming the
   // kinds one by one would leave the next one silent.
   let kind = $derived(task.kind === "normal" ? "" : task.kind);
@@ -25,14 +27,19 @@
     task.kind === "review" ? "subject_commit_sha" : "commit_sha",
   );
   let review = $derived(task.latest_review);
+  let reason = $derived(
+    task.status === "blocked" ? task.verification || task.summary : null,
+  );
 </script>
 
 <!-- The head reads in the same order as a list card (DESIGN.md, Detail
      page): product first, then the state. The title is the page's h1 above. -->
 <div class="meta">
   <p class="product">{task.product_id}</p>
-  <p class="badges">
+  <p class="caption">現在の状態</p>
+  <p class="badges" data-field="current-status">
     <span class="badge">{task.status}</span>
+    {#if task.archived}<span class="badge">履歴</span>{/if}
     {#if task.status === "blocked" && task.blocked_by}
       <span class="badge" data-blocked-by={task.blocked_by}
         >{blockedByLabel(task.blocked_by)}</span
@@ -48,6 +55,42 @@
      closed by default (DESIGN.md, Task Card). -->
 {#if task.summary}
   <p class="summary" data-field="summary">{task.summary}</p>
+{/if}
+{#if reason}
+  <section data-field="blocked-reason">
+    <h2 class="caption">停止理由</h2>
+    <p class="record-text">{reason}</p>
+  </section>
+{/if}
+<section class="milestones" data-field="milestones">
+  <h2 class="caption">到達実績</h2>
+  {#each task.milestones ?? [] as milestone, index (index)}
+    <div class="milestone">
+      <p class="caption">
+        <span class="badge">{milestone.name}</span> <time>{milestone.at}</time>
+      </p>
+      {#if milestone.commit_sha}<p class="caption">
+          {milestone.commit_sha}
+        </p>{/if}
+      {#if milestone.evidence}<p class="record-text">
+          {milestone.evidence}
+        </p>{/if}
+    </div>
+  {:else}
+    <p class="caption">到達実績はありません</p>
+  {/each}
+</section>
+{#if task.milestone_history?.length}
+  <details class="record" data-field="milestone-history">
+    <summary class="caption record-head">過去の到達実績</summary>
+    {#each task.milestone_history as milestone, index (index)}
+      <p class="record-text">
+        {milestone.name} · {milestone.at}
+        {milestone.commit_sha ?? ""}
+        {milestone.evidence ?? ""}
+      </p>
+    {/each}
+  </details>
 {/if}
 <p class="caption" data-field={commitField}>
   <span class="caption-label">{commitField}</span>
@@ -107,12 +150,18 @@
 {#if error}
   <p class="state error">{error}</p>
 {/if}
-{#if transitions.length > 0}
+{#if transitions.length > 0 || (!task.archived && onedit)}
   <div class="actions">
+    {#if !task.archived && onedit}<button
+        class="btn"
+        type="button"
+        disabled={busy}
+        onclick={onedit}>編集</button
+      >{/if}
     {#each transitions as status (status)}
       <button
         class="btn"
-        class:primary={status === "ready"}
+        class:primary={status === "ready" && !busy}
         type="button"
         disabled={busy}
         onclick={() => ontransition?.(status)}
@@ -207,7 +256,17 @@
     // the narrow viewport sideways.
     overflow-wrap: anywhere
 
+  .milestones
+    margin: var(--sp-4) 0
+
+  .milestone
+    margin-bottom: var(--sp-3)
+
+  .caption
+    overflow-wrap: anywhere
+
   .body-text
+    overflow-wrap: anywhere
     margin: var(--sp-3) 0 0
     white-space: pre-line
 

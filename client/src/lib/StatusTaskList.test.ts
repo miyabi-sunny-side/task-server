@@ -1,4 +1,4 @@
-import { cleanup, render } from "@testing-library/svelte";
+import { cleanup, render, screen } from "@testing-library/svelte";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { TaskSummary } from "./api";
@@ -60,16 +60,13 @@ function focusableIn(root: HTMLElement): Element[] {
 describe("StatusTaskList", () => {
   afterEach(cleanup);
 
-  it("orders the groups with approved between done and merged, and drops the empty ones", () => {
+  it("orders only the active statuses and drops the empty groups", () => {
     render(StatusTaskList, { props: { fetchState: "ready", items: ITEMS } });
 
     expect(groups().map((group) => group.dataset.status)).toEqual([
       "draft",
       "ready",
       "wip",
-      "done",
-      "approved",
-      "merged",
       "blocked",
     ]);
     // Called-off work leaves this page for the closed one, like released.
@@ -86,7 +83,7 @@ describe("StatusTaskList", () => {
       },
     });
 
-    expect(groups().map((group) => group.dataset.status)).toEqual(["approved"]);
+    expect(groups().map((group) => group.dataset.status)).toEqual([]);
     expect(document.querySelector('[data-status="released"]')).toBeNull();
     expect(document.querySelector('a[href="/tasks/t-x"]')).toBeNull();
   });
@@ -156,7 +153,6 @@ describe("StatusTaskList", () => {
       "draft",
       "ready",
       "wip",
-      "merged",
       "blocked",
     ]);
     const ready = groups().find((group) => group.dataset.status === "ready")!;
@@ -168,21 +164,14 @@ describe("StatusTaskList", () => {
     ).toBe("1");
   });
 
-  it("keeps a normal task the panel no longer draws in its status group", () => {
-    // Only `normal` tasks fall back into a status group once the panel stops
-    // drawing them; that part of the rule is unchanged.
+  it("keeps archived records out even when their retained status is ready", () => {
     render(StatusTaskList, {
       props: {
         fetchState: "ready",
-        items: [summary("t-done", "done")],
-        drawnElsewhere: [],
+        items: [{ ...summary("old", "ready"), archived: true }],
       },
     });
-
-    const done = groups().find((group) => group.dataset.status === "done")!;
-    expect(
-      done.querySelector<HTMLElement>('a[href="/tasks/t-done"]'),
-    ).not.toBeNull();
+    expect(screen.queryByRole("link")).toBeNull();
   });
 
   it("reads a card forest to tree to state: product, then title, then the status badge", () => {

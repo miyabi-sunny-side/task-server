@@ -102,9 +102,7 @@ describe("Detail", () => {
 
     await fireEvent.click(screen.getByRole("button", { name: "ready" }));
 
-    await waitFor(() =>
-      expect(screen.getByText("操作に失敗しました")).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByText("HTTP 409")).toBeTruthy());
   });
 
   it("reloads on the recurring interval while mounted, and stops after unmount", async () => {

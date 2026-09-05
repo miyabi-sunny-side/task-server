@@ -1,5 +1,12 @@
 <script lang="ts">
-  import { fetchTask, postTaskStatus, type TaskCard as Task } from "../lib/api";
+  import {
+    fetchTask,
+    postTaskStatus,
+    updateTask,
+    type TaskCard as Task,
+  } from "../lib/api";
+  import TaskForm from "../lib/TaskForm.svelte";
+  import RunHistory from "../lib/RunHistory.svelte";
   import TaskCard from "../lib/TaskCard.svelte";
   import { startAutoReload } from "../lib/auto-reload";
 
@@ -7,6 +14,7 @@
 
   let task = $state<Task | undefined>();
   let detailState = $state<"loading" | "error" | "success">("loading");
+  let editing = $state(false);
   let busy = $state(false);
   let actionError = $state("");
 
@@ -42,8 +50,9 @@
     try {
       await postTaskStatus(task.id, status);
       await load(task.id);
-    } catch {
-      actionError = "操作に失敗しました";
+    } catch (error) {
+      actionError =
+        error instanceof Error ? error.message : "操作に失敗しました";
     } finally {
       busy = false;
     }
@@ -74,7 +83,27 @@
   {:else if detailState === "error"}
     <p class="state error">読み込みに失敗しました</p>
   {:else if task}
-    <TaskCard {task} {busy} error={actionError} {ontransition} />
+    <TaskCard
+      {task}
+      {busy}
+      error={actionError}
+      {ontransition}
+      onedit={() => (editing = true)}
+    />
+    {#if editing}
+      <TaskForm
+        title="タスクを編集"
+        initial={task}
+        onclose={() => (editing = false)}
+        onsave={async (fields) => {
+          if (task) {
+            await updateTask(task.id, fields);
+            await load(task.id);
+          }
+        }}
+      />
+    {/if}
+    {#key task.id}<RunHistory taskId={task.id} />{/key}
   {/if}
 </div>
 

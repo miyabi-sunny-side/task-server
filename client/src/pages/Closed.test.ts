@@ -305,3 +305,22 @@ describe("Closed", () => {
     expect(screen.queryByRole("button", { name: "再試行" })).toBeNull();
   });
 });
+
+it("keeps archived legacy tasks and dropped records readable in history", async () => {
+  stubFetch(() =>
+    jsonResponse([
+      task({ id: "old-review", status: "ready", archived: true }),
+      task({ id: "discarded", status: "dropped" }),
+    ]),
+  );
+  render(Closed);
+  await screen.findByText("履歴");
+  expect(
+    screen.getByRole("link", { name: /old-review/ }).getAttribute("href"),
+  ).toBe("/tasks/old-review");
+  expect(screen.getByRole("link", { name: /discarded/ }).textContent).toContain(
+    "dropped",
+  );
+  cleanup();
+  vi.unstubAllGlobals();
+});

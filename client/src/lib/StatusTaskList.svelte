@@ -2,21 +2,7 @@
   import type { TaskSummary } from "./api";
   import TaskRow from "./TaskRow.svelte";
 
-  // DESIGN.md, Task list: the status vocabulary order, which is the pipeline
-  // read from its start — so `approved` sits between `done` and `merged`,
-  // past review and not yet landed. `released` is absent on purpose —
-  // shipped work leaves the top page.
-  // `released`, `cancelled` and `dropped` are not here: work that shipped or
-  // was called off leaves this page for the closed one (DESIGN.md, Task list).
-  const STATUS_ORDER = [
-    "draft",
-    "ready",
-    "wip",
-    "done",
-    "approved",
-    "merged",
-    "blocked",
-  ];
+  const STATUS_ORDER = ["draft", "ready", "wip", "blocked"];
 
   let {
     fetchState,
@@ -32,18 +18,12 @@
     onretry?: () => void;
   } = $props();
 
-  // A subtask (kind other than `normal`) exists on this page only while the
-  // panel is drawing it in a readout — the review queue, the merge trains, or
-  // reconciliation. It never falls into a status group, finished or not: a
-  // `review` verdict lives on its target's `latest_review`, so a husk card
-  // once the panel stops drawing it would carry no information the detail
-  // page does not already have. A `normal` task hides only while another
-  // region of this same page already draws it, because one object drawn
-  // twice on one screen reads as two; it falls back into its status group
-  // the moment the panel stops.
   let elsewhere = $derived(new Set(drawnElsewhere));
   let open = $derived(
-    items.filter((item) => item.kind === "normal" && !elsewhere.has(item.id)),
+    items.filter(
+      (item) =>
+        !item.archived && item.kind === "normal" && !elsewhere.has(item.id),
+    ),
   );
 
   let groups = $derived(

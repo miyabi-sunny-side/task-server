@@ -51,6 +51,9 @@ jobs:
       - name: Lint Rust
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: Test migration and execution loop
+        run: python3 -m unittest discover -s tests -p "test_*.py"
+
       - name: Test Rust
         run: cargo test --locked
 
@@ -126,8 +129,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       # Continuous backup is a sidecar a deployment adds, never something the
-      # image needs. The default image, given no backup variables at all, still
-      # has to come up on its own and create its database.
+      # image needs. The default image starts its Markdown ledger independently.
       - name: Smoke-test the image without any backup configuration
         shell: bash
         run: |
@@ -148,9 +150,8 @@ jobs:
           done
 
           test "$(curl --fail --silent http://127.0.0.1:3000/healthz)" = "ok"
-          # The database and its write-ahead log are what a sidecar replicates.
-          docker exec task-server-smoke sh -c 'test -s /app/data/task-server.db'
-          docker exec task-server-smoke sh -c 'test -e /app/data/task-server.db-wal'
+          docker exec task-server-smoke sh -c 'test -d /app/data/ledger/tasks'
+          curl --fail --silent http://127.0.0.1:3000/worker/snapshot | python3 -c 'import json,sys; assert "tasks" in json.load(sys.stdin)'
 
       # Every push to main publishes the image CI just tested as `sha-<short>`
       # and `edge`; the release workflow retags that image instead of rebuilding.

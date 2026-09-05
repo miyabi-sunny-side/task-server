@@ -276,3 +276,41 @@ describe("TaskCard", () => {
     expect(badges.slice(0, 2)).toEqual(["blocked", "保留"]);
   });
 });
+
+it("separates blocked state, visible reason and retained milestone evidence", () => {
+  render(TaskCard, {
+    task: {
+      ...FIXTURE,
+      status: "blocked",
+      milestones: [
+        {
+          name: "implemented",
+          at: "2026-09-05",
+          commit_sha: "head1",
+          evidence: "変更を実装",
+        },
+        {
+          name: "verified",
+          at: "2026-09-05",
+          commit_sha: "head1",
+          evidence: "unit tests passed",
+        },
+      ],
+    },
+  });
+  const reason = document.querySelector('[data-field="blocked-reason"]')!;
+  expect(reason.textContent).toContain(FIXTURE.verification);
+  expect(reason.closest("details")).toBeNull();
+  const milestones = document.querySelector('[data-field="milestones"]')!;
+  expect(milestones.textContent).toContain("implemented");
+  expect(milestones.textContent).toContain("unit tests passed");
+  expect(milestones.textContent).not.toContain("blocked");
+  cleanup();
+});
+it("renders archived task content read-only even if stale transitions are supplied", () => {
+  render(TaskCard, { task: { ...FIXTURE, archived: true }, onedit: vi.fn() });
+  expect(screen.getByText("履歴")).toBeTruthy();
+  expect(screen.getByText(FIXTURE.body)).toBeTruthy();
+  expect(screen.queryByRole("button")).toBeNull();
+  cleanup();
+});

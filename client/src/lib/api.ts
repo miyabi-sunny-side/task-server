@@ -11,7 +11,15 @@ export async function loadSession(signal?: AbortSignal): Promise<Session> {
   return session;
 }
 
+export interface Milestone {
+  name: "implemented" | "verified" | "reviewed" | "merged" | "released";
+  at: string;
+  commit_sha?: string | null;
+  evidence?: string | null;
+}
+
 export interface TaskSummary {
+  archived?: boolean;
   id: string;
   title: string;
   status: string;
@@ -49,6 +57,11 @@ export interface ReviewOutcome {
 }
 
 export interface TaskCard {
+  archived?: boolean;
+  milestones?: Milestone[];
+  milestone_history?: Milestone[];
+  runs_count?: number;
+  runs_unread?: number;
   id: string;
   title: string;
   body: string;
@@ -167,6 +180,7 @@ export function fetchDone(signal?: AbortSignal): Promise<DoneTask[]> {
 // called off, in one list. `closed_at` is the moment it closed (the server's
 // sort key: `done_at` for finished work, the cancelling for the rest).
 export interface ClosedTask extends DoneTask {
+  archived?: boolean;
   closed_at: string;
 }
 
@@ -182,32 +196,7 @@ export function postTaskStatus(id: string, status: string): Promise<TaskCard> {
   return postJson(`/api/tasks/${encodeURIComponent(id)}/status`, { status });
 }
 
-// Landed work no release is carrying, per product: the reconciliation window
-// for releases. Empty while the automatic issuing works.
-export interface Releasable {
-  product_id: string;
-  task_count: number;
-}
-
-// An outstanding merge, as /api/control reports it: the ordinary summary plus
-// why this one stopped. A blocked merge holds up every merge of its product,
-// so the reason travels with the queue rather than being fetched card by card
-// — one payload, one generation, nothing to fail on its own.
-export interface PendingMerge extends TaskSummary {
-  // `null` while the merge is running: only a blocked merge has a reason.
-  verification: string | null;
-}
-
-// An outstanding release, as /api/control reports it: the summary, how far it
-// steps the version, and why it stopped — the same shape as a pending merge,
-// read off the same payload.
-export interface PendingRelease extends TaskSummary {
-  release_level: "patch" | "minor" | "major";
-  // `null` while the release is running: only a blocked one has a reason.
-  verification: string | null;
-}
-
-// Why the server counts a task as stuck. A fixed vocabulary, worn as a badge.
+// Compatibility fields are accepted but never rendered as active pipeline work.
 export type StuckReason =
   | "unclaimed"
   | "lease-expired"
@@ -216,8 +205,6 @@ export type StuckReason =
   | "blocked"
   | "release-stalled";
 
-// One task the control plane is holding past its threshold. `since` is the
-// stored timestamp the wait is measured from.
 export interface Stuck {
   task_id: string;
   kind: string;
@@ -226,21 +213,62 @@ export interface Stuck {
   reason: StuckReason;
 }
 
-// What the top page needs to draw the automated stretch of the pipeline. The
-// `pending_*` lists are what the server is carrying; `mergeable`, `unreviewed`
-// `releasable` and `stuck` are the reconciliation windows, empty whenever the
-// automatic issuing works. Nothing here is a button: the page asks the human
-// for no decision.
 export interface ControlPlane {
   mergeable: TaskSummary[];
-  pending_merges: PendingMerge[];
-  pending_releases: PendingRelease[];
+  pending_merges: (TaskSummary & { verification: string | null })[];
+  pending_releases: (TaskSummary & {
+    verification: string | null;
+    release_level: "patch" | "minor" | "major";
+  })[];
   pending_reviews: TaskSummary[];
   unreviewed: TaskSummary[];
-  releasable: Releasable[];
+  releasable: { product_id: string; task_count: number }[];
   stuck: Stuck[];
 }
 
 export function fetchControl(signal?: AbortSignal): Promise<ControlPlane> {
   return requestJson("/api/control", { signal });
+}
+
+export interface TaskFields {
+  title: string;
+  product_id: string;
+  body: string;
+}
+
+export function createTask(fields: TaskFields): Promise<TaskCard> {
+  return postJson("/api/tasks", fields);
+}
+
+export function updateTask(id: string, fields: TaskFields): Promise<TaskCard> {
+  return requestJson(`/api/tasks/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(fields),
+  });
+}
+
+export interface Run {
+  id: number;
+  at: string;
+  source: string;
+  outcome?: string | null;
+  worker?: string | null;
+  model?: string | null;
+  commit_sha?: string | null;
+  agent_secs?: number | null;
+  note?: string | null;
+  stdout_tail?: string | null;
+  stderr_tail?: string | null;
+  checks?: { name: string; exit_code: number }[];
+  read_at?: string | null;
+}
+
+export function fetchRuns(
+  taskId: string,
+  since = 0,
+): Promise<{ runs: Run[]; next: number | null }> {
+  return requestJson(
+    `/api/runs?task_id=${encodeURIComponent(taskId)}&since=${since}`,
+  );
 }

@@ -31,12 +31,11 @@ FROM debian:bookworm-slim AS runtime
 WORKDIR /app
 COPY --from=backend /app/target/release/task-server /usr/local/bin/task-server
 COPY --from=frontend /app/client/dist ./client/dist
-# The sqlite database is created at APP_DB_PATH on first start, so the
-# unprivileged runtime user needs a writable directory for it.
+# Markdown records live below APP_DATA_DIR; the runtime user owns the directory.
 RUN install -d -o 10001 -g 10001 /app/data
 VOLUME ["/app/data"]
 ENV APP_BIND_ADDR=0.0.0.0:3000
-ENV APP_DB_PATH=/app/data/task-server.db
+ENV APP_DATA_DIR=/app/data/ledger
 EXPOSE 3000
 USER 10001:10001
 ENTRYPOINT ["task-server"]

@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""Lossless legacy import, generation snapshots, verified restore and R2 upload.
+
+Python standard library only. R2 upload additionally uses the official AWS CLI.
+A snapshot comes from the server's locked export, not a racy filesystem walk.
+"""
+import argparse
+import base64
+from contextlib import closing
+from datetime import datetime, timezone
+import hashlib
+import io
+import json
+import os
+from pathlib import Path, PurePosixPath
+import shutil
+import sqlite3
+import subprocess
+import tarfile
+import tempfile
+import urllib.request
+
+COLLECTIONS = ('tasks', 'products', 'runs', 'archive', 'claim_receipts')
+
+
+def filename(value):
+    return ''.join(chr(b) if (48 <= b <= 57 or 65 <= b <= 90 or 97 <= b <= 122 or b in b'-_~')
+                   else f'%{b:02X}' for b in str(value).encode()) + '.md'
+
+
+def document(record):
+    metadata = dict(record)
+    body = metadata.pop('body', '')
+    if not isinstance(body, str):
+        raise ValueError('body must be a string')
+    # JSON is valid YAML, readable without a third-party YAML serializer.
+    return ('---\n' + json.dumps(metadata, ensure_ascii=False, indent=2) + '\n---\n' + body).encode()
+
+
+def read_generated(path):
+    front, body = path.read_text().removeprefix('---\n').split('\n---\n', 1)
+    value = json.loads(front)
+    if body or 'title' in value:
+        value['body'] = body
+    return value
+
+
+def staged_directory(destination):
+    destination = Path(destination)
+    if destination.exists():
+        raise FileExistsError(f'destination must not exist: {destination}')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    return tempfile.TemporaryDirectory(prefix='.task-data-', dir=destination.parent)
+
+
+def publish(stage, destination):
+    if Path(destination).exists():
+        raise FileExistsError(f'destination already exists: {destination}')
+    os.rename(stage, destination)
+
+
+def encoded_sqlite(value):
+    if isinstance(value, bytes):
+        return {'__sqlite_blob_base64__': base64.b64encode(value).decode()}
+    return value
+
+
+def projected_task(row):
+    value = dict(row, legacy=dict(row), milestones=[], archived=row.get('kind', 'normal') != 'normal')
+    old = row.get('status', 'draft')
+    at = row.get('done_at') or row.get('updated_at') or row.get('created_at')
+    for field in ('claim_id', 'claimed_by', 'claimed_at', 'claim_expires_at', 'lease_expires_at'):
+        value[field] = None
+    checks = row.get('checks_json')
+    value['checks'] = json.loads(checks) if checks else []
+    if not value['archived'] and old in ('done', 'approved', 'merged', 'released'):
+        stages = ['implemented']
+        if value['checks'] and all(c.get('exit_code') == 0 for c in value['checks']):
+            stages.append('verified')
+        if old in ('approved', 'merged', 'released'): stages.append('reviewed')
+        if old in ('merged', 'released'): stages.append('merged')
+        if old == 'released' and row.get('release_tag'): stages.append('released')
+        value['milestones'] = [dict(name=name, at=at, commit_sha=row.get('commit_sha'),
+             evidence=f'Imported legacy status={old}; timestamp is historical estimate. '
+                      + (row.get('verification') or '')) for name in stages]
+    if old == 'released':
+        value['status'] = 'done'
+    elif old in ('wip', 'done', 'approved', 'merged'):
+        value['status'] = 'blocked'
+        value['blocked_by'] = 'system'
+        value['verification'] = (row.get('verification') or '') + '\n移行前の到達工程から再開待ち。'
+    return value
+
+
+def migrate(source, destination):
+    source, destination = Path(source).resolve(), Path(destination)
+    if not source.is_file(): raise FileNotFoundError(source)
+    with staged_directory(destination) as temporary:
+        stage = Path(temporary) / 'ledger'
+        stage.mkdir()
+        for name in COLLECTIONS: (stage / name).mkdir()
+        # Online backup reads a consistent SQLite snapshot without changing its source.
+        with closing(sqlite3.connect(source.as_uri() + '?mode=ro', uri=True)) as live, closing(sqlite3.connect(':memory:')) as db:
+            live.backup(db)
+            db.row_factory = sqlite3.Row
+            if db.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
+                raise ValueError('SQLite integrity check failed')
+            schema = [dict(r) for r in db.execute("SELECT name,sql FROM sqlite_master WHERE type='table'")]
+            counts = {}
+            for table in schema:
+                name = table['name']
+                quoted = '"' + name.replace('"', '""') + '"'
+                rows = [dict((k, encoded_sqlite(r[k])) for k in r.keys()) for r in db.execute(f'SELECT * FROM {quoted}')]
+                counts[name] = len(rows)
+                for index, raw in enumerate(rows):
+                    value = dict(raw)
+                    collection = name if name in COLLECTIONS else 'archive'
+                    if name == 'tasks': value = projected_task(raw)
+                    elif name == 'products':
+                        value['legacy'] = raw
+                        value['releases'] = bool(raw.get('releases', 1))
+                    elif name == 'runs':
+                        value['legacy'] = raw
+                        for key in ('checks','diff_stat'):
+                            if isinstance(value.get(key), str): value[key] = json.loads(value[key])
+                    elif name == 'claim_receipts':
+                        value = dict(id=raw['idempotency_key'], legacy=raw)
+                    else: value = dict(id=f'legacy:{name}:{index}', legacy=raw)
+                    identifier = value.get('id')
+                    if identifier is None or str(identifier) == '': raise ValueError(f'missing id in {name}')
+                    path = stage / collection / filename(identifier)
+                    if path.exists(): raise ValueError(f'duplicate id in {name}: {identifier}')
+                    path.write_bytes(document(value))
+            metadata = dict(id='migration', source_snapshot_sha256=hashlib.sha256(db.serialize()).hexdigest(),
+                            schema_version=db.execute('PRAGMA user_version').fetchone()[0],
+                            tables=schema, counts=counts, at=datetime.now(timezone.utc).isoformat())
+            (stage / 'archive' / 'migration.md').write_bytes(document(metadata))
+        (stage / '.gitignore').write_text('.lock\n*.tmp\n')
+        publish(stage, destination)
+        return counts
+
+
+def snapshot(records, archive):
+    if set(records) != set(COLLECTIONS): raise ValueError('incomplete snapshot collections')
+    files = {}
+    for collection, rows in records.items():
+        if not isinstance(rows, list): raise ValueError('snapshot collection must be a list')
+        for row in rows:
+            identifier = row.get('id')
+            if identifier is None: raise ValueError('snapshot record has no id')
+            name = f'{collection}/{filename(identifier)}'
+            if name in files: raise ValueError('duplicate snapshot id')
+            files[name] = document(row)
+    manifest = {name: hashlib.sha256(data).hexdigest() for name,data in files.items()}
+    files['manifest.json'] = json.dumps(manifest, sort_keys=True).encode()
+    archive = Path(archive)
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=archive.parent, delete=False) as temporary:
+        temp_path = Path(temporary.name)
+    try:
+        with tarfile.open(temp_path, 'w:gz') as tar:
+            for name, data in files.items():
+                entry = tarfile.TarInfo(name)
+                entry.mode = 0o600
+                entry.size = len(data)
+                tar.addfile(entry, io.BytesIO(data))
+        # Hard link publishes without overwriting an existing generation.
+        os.link(temp_path, archive)
+    finally:
+        temp_path.unlink(missing_ok=True)
+    return archive
+
+
+def restore(archive, destination):
+    with staged_directory(destination) as temporary:
+        stage = Path(temporary) / 'ledger'
+        stage.mkdir()
+        with tarfile.open(archive, 'r:gz') as tar:
+            members = tar.getmembers()
+            names = [m.name for m in members]
+            if len(names) != len(set(names)): raise ValueError('duplicate archive entry')
+            for member in members:
+                path = PurePosixPath(member.name)
+                valid = member.name == 'manifest.json' or (
+                    len(path.parts) == 2 and path.parts[0] in COLLECTIONS and path.suffix == '.md')
+                if not member.isfile() or path.is_absolute() or '..' in path.parts or not valid:
+                    raise ValueError('unexpected archive entry')
+            if 'manifest.json' not in names: raise ValueError('missing snapshot manifest')
+            manifest = json.load(tar.extractfile('manifest.json'))
+            if set(manifest) != set(names) - {'manifest.json'}: raise ValueError('manifest mismatch')
+            for member in members:
+                if member.name == 'manifest.json': continue
+                data = tar.extractfile(member).read()
+                if hashlib.sha256(data).hexdigest() != manifest[member.name]:
+                    raise ValueError(f'checksum mismatch: {member.name}')
+                path = stage / member.name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+        for name in COLLECTIONS: (stage / name).mkdir(exist_ok=True)
+        (stage / '.gitignore').write_text('.lock\n*.tmp\n')
+        publish(stage, destination)
+
+
+def upload(archive):
+    required = ('R2_ENDPOINT','R2_BUCKET','R2_ACCESS_KEY_ID','R2_SECRET_ACCESS_KEY')
+    missing = [name for name in required if not os.environ.get(name)]
+    if missing: raise ValueError('R2 configuration missing: ' + ', '.join(missing))
+    if not shutil.which('aws'): raise ValueError('R2 upload requires the AWS CLI executable')
+    prefix = os.environ.get('R2_PREFIX', 'task-server').strip('/')
+    key = '/'.join(filter(None, [prefix, Path(archive).name]))
+    env = dict(os.environ, AWS_ACCESS_KEY_ID=os.environ['R2_ACCESS_KEY_ID'],
+               AWS_SECRET_ACCESS_KEY=os.environ['R2_SECRET_ACCESS_KEY'], AWS_DEFAULT_REGION='auto',
+               AWS_REQUEST_CHECKSUM_CALCULATION='when_required', AWS_RESPONSE_CHECKSUM_VALIDATION='when_required')
+    subprocess.run(['aws', '--endpoint-url', os.environ['R2_ENDPOINT'], 's3', 'cp',
+                    str(archive), f"s3://{os.environ['R2_BUCKET']}/{key}", '--only-show-errors'], env=env, check=True)
+    return key
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest='command', required=True)
+    migration = commands.add_parser('import-sqlite')
+    migration.add_argument('source', type=Path)
+    migration.add_argument('destination', type=Path)
+    backup = commands.add_parser('snapshot')
+    backup.add_argument('--server', default='http://127.0.0.1:5004')
+    backup.add_argument('--output-dir', required=True, type=Path)
+    backup.add_argument('--upload', action='store_true')
+    restoration = commands.add_parser('restore')
+    restoration.add_argument('archive', type=Path)
+    restoration.add_argument('destination', type=Path)
+    sending = commands.add_parser('upload')
+    sending.add_argument('archive', type=Path)
+    args = parser.parse_args()
+    if args.command == 'import-sqlite': print(json.dumps(migrate(args.source, args.destination)))
+    elif args.command == 'restore':
+        restore(args.archive,args.destination)
+        print(f'Restored: {args.destination}')
+    elif args.command == 'upload': print(upload(args.archive))
+    else:
+        with urllib.request.urlopen(args.server.rstrip('/')+'/worker/snapshot',timeout=60) as response:
+            records = json.load(response)
+        name = datetime.now(timezone.utc).strftime('ledger-%Y%m%dT%H%M%S.%fZ.tar.gz')
+        archive = snapshot(records,args.output_dir/name)
+        print(f'Snapshot: {archive}')
+        if args.upload: print(f'Uploaded: {upload(archive)}')
+
+
+if __name__ == '__main__':
+    try: main()
+    except (OSError,ValueError,sqlite3.Error,tarfile.TarError,subprocess.CalledProcessError) as error:
+        raise SystemExit(f'task-data: {error}')

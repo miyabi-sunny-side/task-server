@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Snippet } from "svelte";
+  import { onMount, type Snippet } from "svelte";
 
   import Icon from "./Icon.svelte";
 
@@ -11,9 +11,13 @@
 
   let dialog = $state<HTMLElement | undefined>();
 
-  $effect(() => {
+  onMount(() => {
+    const opener = document.activeElement as HTMLElement | null;
     const autofocus = dialog?.querySelector<HTMLElement>("[data-autofocus]");
     (autofocus ?? dialog)?.focus();
+    return () => {
+      if (opener?.isConnected) opener.focus();
+    };
   });
 
   function onkeydown(event: KeyboardEvent) {
@@ -26,7 +30,7 @@
       return;
     }
     const focusables = dialog.querySelectorAll<HTMLElement>(
-      "button, a[href], input, select, textarea",
+      "button:not(:disabled), a[href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled)",
     );
     if (focusables.length === 0) {
       return;

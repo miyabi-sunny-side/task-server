@@ -2,6 +2,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ApiError,
+  createTask,
+  updateTask,
+  fetchRuns,
   fetchControl,
   fetchTasks,
   postTaskStatus,
@@ -112,5 +115,44 @@ describe("api", () => {
     await expect(postTaskStatus("alpha", "released")).rejects.toThrow(
       "HTTP 409",
     );
+  });
+});
+
+describe("ledger writes", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it("creates drafts and patches encoded task ids with CSRF", async () => {
+    setSessionCsrf("ledger-csrf");
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async () => jsonResponse(CARD));
+    vi.stubGlobal("fetch", fetchMock);
+    const fields = {
+      title: "変更",
+      product_id: "sunny-side/task-server",
+      body: "本文\n続き",
+    };
+    await createTask(fields);
+    await updateTask("a b", fields);
+    expect(
+      fetchMock.mock.calls.map(([url, init]) => [
+        url,
+        init?.method,
+        JSON.parse(init?.body as string),
+      ]),
+    ).toEqual([
+      ["/api/tasks", "POST", fields],
+      ["/api/tasks/a%20b", "PATCH", fields],
+    ]);
+    expect(
+      new Headers(fetchMock.mock.calls[1][1]?.headers).get("X-CSRF-Token"),
+    ).toBe("ledger-csrf");
+  });
+  it("reads a task's run history using its encoded filter and cursor", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(jsonResponse({ runs: [], next: null }));
+    vi.stubGlobal("fetch", fetchMock);
+    await fetchRuns("a b", 12);
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/runs?task_id=a%20b&since=12");
   });
 });
