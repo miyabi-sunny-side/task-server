@@ -29,6 +29,8 @@ all = "warn"
 pedantic = "warn"
 
 [profile.release]
-lto = true
+# Keep Cargo's release defaults for this I/O-oriented service.
+opt-level = 3
+lto = false
 strip = true
-codegen-units = 1
+codegen-units = 16

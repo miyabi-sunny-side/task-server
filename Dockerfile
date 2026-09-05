@@ -8,12 +8,12 @@ COPY client/ ./
 RUN npm run build
 
 # cargo-chef splits the Rust build into a dependency layer (cooked from the
-# recipe, cached as long as Cargo.toml/Cargo.lock do not change) and the crate's
-# own build, so a source-only change does not recompile every dependency.
+# recipe, which masks the local package version) and the crate's own build.
+# Source edits and release version bumps therefore reuse compiled dependencies.
 FROM rust:1.96-bookworm AS chef
 WORKDIR /app
 COPY rust-toolchain.toml ./
-RUN cargo install cargo-chef --locked
+RUN cargo install cargo-chef --version 0.1.78 --locked
 
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./

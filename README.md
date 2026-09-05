@@ -132,3 +132,29 @@ on the server so reader restarts do not lose unread work.
 
 See [AGENTS.md](AGENTS.md) for build/test commands and [DESIGN.md](DESIGN.md) for
 UI behavior. Tests isolate data and agent execution from deployed work.
+
+## Releases
+
+Push a `vMAJOR.MINOR.PATCH` tag matching `Cargo.toml` and `Cargo.lock` to run
+verification, build the container, smoke-test it with an empty ledger, and publish
+the tested image as `ghcr.io/<owner>/<repo>:<version>` and `:latest`. The GitHub
+Release records the image digest. Manual release runs must select a version tag.
+PRs and manual CI runs perform verification; pushes to `main` do not prebuild or
+publish images.
+
+BuildKit retains intermediate stages at `ghcr.io/<owner>/<repo>:build-cache`
+using the workflow's `GITHUB_TOKEN` with `packages: write`. This registry cache
+works across release tags; no R2 credentials or separate cache service are needed.
+An empty cache is valid. Cargo-chef separates dependencies from application code
+and masks the application's version in its recipe, so a version bump can reuse
+dependencies while the real manifest supplies the newly compiled application's
+version. The frontend has an independent build stage.
+
+The release profile uses Cargo's standard optimization and codegen settings,
+with symbols stripped, to keep build time reasonable for this I/O-oriented server.
+To run the same image check locally:
+
+```sh
+docker buildx build --load -t task-server:test .
+bash .github/smoke-image.sh task-server:test
+```
