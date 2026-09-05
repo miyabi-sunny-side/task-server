@@ -8,12 +8,14 @@
     error = "",
     ontransition,
     onedit,
+    onreport,
   }: {
     task: Task;
     busy?: boolean;
     error?: string;
     ontransition?: (status: string) => void;
     onedit?: () => void;
+    onreport?: (id: number) => void;
   } = $props();
 
   let transitions = $derived(task.archived ? [] : task.available_transitions);
@@ -53,7 +55,17 @@
 <!-- The forest first: the one or two sentences a person reads as the
      completion report. The log (verification, checks) is folded below it,
      closed by default (DESIGN.md, Task Card). -->
-{#if task.summary}
+{#if task.report_id}
+  <p class="caption">
+    <a
+      class="dependency"
+      href={`#run-${task.report_id}`}
+      onclick={() => onreport?.(task.report_id!)}
+      >報告 #{task.report_id} を読む</a
+    >
+  </p>
+{/if}
+{#if task.summary && !task.report_id}
   <p class="summary" data-field="summary">{task.summary}</p>
 {/if}
 {#if reason}
@@ -72,6 +84,14 @@
       {#if milestone.commit_sha}<p class="caption">
           {milestone.commit_sha}
         </p>{/if}
+      {#if milestone.report_id}<p class="caption">
+          <a
+            class="dependency"
+            href={`#run-${milestone.report_id}`}
+            onclick={() => onreport?.(milestone.report_id!)}
+            >報告 #{milestone.report_id} を読む</a
+          >
+        </p>{/if}
       {#if milestone.evidence}<p class="record-text">
           {milestone.evidence}
         </p>{/if}
@@ -80,6 +100,21 @@
     <p class="caption">到達実績はありません</p>
   {/each}
 </section>
+{#if task.legacy_completion?.length}
+  <details class="record" data-field="legacy-completion">
+    <summary class="caption record-head">以前の作業記録</summary>
+    {#each task.legacy_completion as record}
+      <p class="caption">{record.at ?? ""} {record.commit_sha ?? ""}</p>
+      {#if record.summary}<p class="record-text">{record.summary}</p>{/if}
+      {#if record.verification}<p class="record-text">
+          {record.verification}
+        </p>{/if}
+      {#each record.checks ?? [] as check}<p class="record-text">
+          {checkLabel(check)}
+        </p>{/each}
+    {/each}
+  </details>
+{/if}
 {#if task.milestone_history?.length}
   <details class="record" data-field="milestone-history">
     <summary class="caption record-head">過去の到達実績</summary>
@@ -88,6 +123,12 @@
         {milestone.name} · {milestone.at}
         {milestone.commit_sha ?? ""}
         {milestone.evidence ?? ""}
+        {#if milestone.report_id}<a
+            class="dependency"
+            href={`#run-${milestone.report_id}`}
+            onclick={() => onreport?.(milestone.report_id!)}
+            >報告 #{milestone.report_id} を読む</a
+          >{/if}
       </p>
     {/each}
   </details>

@@ -158,3 +158,53 @@ To run the same image check locally:
 docker buildx build --load -t task-server:test .
 bash .github/smoke-image.sh task-server:test
 ```
+
+### One original completion report
+
+New workers submit one free-form Markdown original. Structured fields identify
+what was done; the server never infers a verified milestone from the prose:
+
+```json
+{
+  "claim_id": "the-current-lease",
+  "outcome": "done",
+  "report_markdown": "# Result\nImplemented the change.\n\n# Verification\ncargo test passed.\n\n# Remaining\nThe design idea is unverified.",
+  "commit_sha": "the-subject-commit",
+  "milestones": [{"name": "implemented"}, {"name": "verified"}],
+  "checks": [{"name": "cargo test", "exit_code": 0}],
+  "run": {"worker": "task-loop", "agent_exit": 0}
+}
+```
+
+Send this to `POST /worker/report`. The response is the task object itself:
+`report_id` is its numeric run ID, `report_ids` retains earlier report references,
+and submitted milestones receive that same `report_id`. Milestone timestamps and
+commit default to the report time and task commit. Evidence text is optional on
+this path: it refers to the original instead of requiring another explanation.
+Only explicitly submitted milestones are recorded. Checks are optional structured
+command results; a `done` report cannot contain a nonzero exit code.
+
+The original is the untruncated body of `runs/<id>.md`. Task instructions stay in
+the task Markdown body. `GET /api/runs/<id>` and MCP `run_get` (`{"id":"42"}`)
+return the original, task/claim IDs, subject commit and checks. The browser's
+report links open the same record in execution history. Raw Markdown is displayed
+as text, so embedded HTML cannot execute. Existing run notes, reading receipts,
+task evidence and legacy reports remain readable; `summary`/`verification`
+report requests still use the legacy path. Do not mix those fields into a new
+`report_markdown` request.
+
+The run is durably accepted before task state changes. Its `report_request`
+metadata holds the replayable intent; it never contains another copy of the
+Markdown original. On an interrupted task write, startup and subsequent task
+operations/readers replay that accepted intent before lease expiry. A failure to
+persist the original cannot complete a task. Resend the identical payload after a
+lost response: the claim identifies its report and no new run or milestone is
+created. A different payload for that claim conflicts. Later claims cannot be
+rewound by an old resend. Task deletion retains the run original.
+
+`bin/task-loop` sends its command/timing metadata in `run`, completes its journal
+from the returned `report_id`, and does not make a second haystack request on
+success. A refused/expired lease still uses `/worker/runs` to preserve the raw
+body and logs without completing the task. Existing pending loop journals remain
+readable. Knowledge selection consumes the same haystack originals through the
+existing next/read receipt flow; its success is not a condition of completion.

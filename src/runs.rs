@@ -13,6 +13,11 @@ pub fn append(s: &AppState, mut v: Value, rescue: bool) -> Result<Value, Error> 
     if !v.is_object() {
         return Err(Error::Invalid("run must be an object".into()));
     }
+    if v.get("report_request").is_some() {
+        return Err(Error::Invalid(
+            "report_request is reserved for worker/report".into(),
+        ));
+    }
     if rescue {
         v["source"] = json!("rescue");
     }

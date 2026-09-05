@@ -23,6 +23,7 @@ class LoopTests(unittest.TestCase):
             subprocess.run(['git', '-C', str(self.repo), *args], check=True, capture_output=True)
         self.calls = []
         self.fail_report = False
+        self.refuse_report = False
         self.claim_id = 'claim-one'
         self.lose_claim = False
         self.task = {'id': 'task-one', 'title': 'Small task', 'body': 'Do the requested work', 'product_id': 'org/repo', 'branch': None, 'milestones': []}
@@ -36,7 +37,8 @@ class LoopTests(unittest.TestCase):
                     status = 200 if case.task else 204
                     result = {'claim_id': case.claim_id, 'lease_expires_at': '2099-01-01T00:00:00Z', 'task': case.task}
                 elif self.path == '/worker/report':
-                    status = 503 if case.fail_report else 200
+                    status = 503 if case.fail_report else 409 if case.refuse_report else 200
+                    result = {**case.task, 'report_id': 17}
                 elif self.path == '/worker/heartbeat':
                     status = 409 if case.lose_claim else 200
                     result = {'claim_id': case.claim_id, 'lease_expires_at': '2099-01-01T00:00:00Z', 'task': case.task}
@@ -50,7 +52,8 @@ class LoopTests(unittest.TestCase):
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.agent = self.root / 'agent'
-        self.set_agent("import json,sys\nfrom pathlib import Path\nPath(sys.argv[sys.argv.index('-o')+1]).write_text(json.dumps({'outcome':'done','summary':'Complete','verification':'isolated check passed','commit_sha':None,'milestones':[],'checks':[{'name':'test','exit_code':0}]}))\n")
+        self.report_markdown = '# 完了\n\n自由な報告。  \n検証結果と判断を一度だけ記録。\n'
+        self.set_agent("import json,sys\nfrom pathlib import Path\nPath(sys.argv[sys.argv.index('-o')+1]).write_text(json.dumps({'outcome':'done','report_markdown':" + repr(self.report_markdown) + ",'commit_sha':None,'milestones':[{'name':'implemented','at':'2026-09-06T00:00:00Z','commit_sha':None}],'checks':[{'name':'test','exit_code':0}]}))\n")
 
     def tearDown(self):
         self.server.shutdown()
@@ -76,13 +79,104 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.reports()[0]['outcome'], 'done')
         self.assertTrue(list((self.root/'state').glob('claims/*/prompt.txt')))
-        self.assertEqual(len([p for p,b in self.calls if p == '/worker/runs']), 1)
+        report = self.reports()[0]
+        self.assertEqual(report['report_markdown'], self.report_markdown)
+        self.assertNotIn('summary', report)
+        self.assertNotIn('verification', report)
+        self.assertNotIn('evidence', report['milestones'][0])
+        self.assertEqual(report['run']['agent_exit'], 0)
+        self.assertFalse(any(p == '/worker/runs' for p,b in self.calls))
 
     def test_no_work_does_not_launch(self):
         self.task = None
         self.set_agent('raise RuntimeError("must not start")\n')
         self.assertEqual(self.run_loop().returncode, 0)
         self.assertEqual(self.reports(), [])
+
+    def test_refused_report_rescues_full_original_body(self):
+        self.refuse_report = True
+        self.report_markdown = '原文の長い報告\n' * 2000
+        self.set_agent("import json,sys\nfrom pathlib import Path\nPath(sys.argv[sys.argv.index('-o')+1]).write_text(json.dumps({'outcome':'done','report_markdown':" + repr(self.report_markdown) + ",'commit_sha':None,'milestones':[],'checks':[]}))\n")
+        self.assertEqual(self.run_loop().returncode, 0)
+        runs = [body for path, body in self.calls if path == '/worker/runs']
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]['body'], self.report_markdown)
+
+    def test_report_receipt_recovery_does_not_send_second_run(self):
+        self.assertEqual(self.run_loop().returncode, 0)
+        folder = next((self.root/'state/claims').iterdir())
+        (folder/'run-sent.json').unlink()
+        self.calls.clear()
+        self.assertEqual(self.run_loop().returncode, 0)
+        self.assertEqual(self.calls, [])
+        self.assertTrue((folder/'run-sent.json').exists())
+
+    def test_legacy_pending_journal_converts_without_losing_evidence(self):
+        self.fail_report = True
+        self.assertNotEqual(self.run_loop().returncode, 0)
+        folder = next((self.root/'state/claims').iterdir())
+        legacy = {'outcome': 'done', 'summary': 'Old summary', 'verification': 'Old checks', 'commit_sha': None,
+                  'milestones': [{'name': 'implemented', 'at': '2026-09-06T00:00:00Z', 'commit_sha': None, 'evidence': 'Old evidence'}], 'checks': []}
+        original = json.dumps({'claim_id': self.claim_id, **legacy})
+        (folder/'report.json').write_text(original)
+        (folder/'outcome.json').write_text(json.dumps(legacy))
+        self.fail_report = False
+        self.calls.clear()
+        self.assertEqual(self.run_loop().returncode, 0)
+        report = self.reports()[0]
+        for text in ('Old summary', 'Old checks', 'Old evidence'):
+            self.assertIn(text, report['report_markdown'])
+        self.assertNotIn('evidence', report['milestones'][0])
+        self.assertEqual((folder/'report.json').read_text(), original)
+        self.assertFalse(any(path == '/worker/runs' for path, body in self.calls))
+
+    def test_legacy_reported_journal_only_finishes_old_run(self):
+        self.fail_report = True
+        self.assertNotEqual(self.run_loop().returncode, 0)
+        folder = next((self.root/'state/claims').iterdir())
+        (folder/'reported.json').write_text(json.dumps({'task': {'id': self.task['id']}}))
+        self.calls.clear()
+        self.assertEqual(self.run_loop().returncode, 0)
+        self.assertEqual([path for path, body in self.calls], ['/worker/runs'])
+
+    def test_legacy_interrupted_outcome_can_resume(self):
+        self.fail_report = True
+        self.assertNotEqual(self.run_loop().returncode, 0)
+        folder = next((self.root/'state/claims').iterdir())
+        (folder/'outcome.json').write_text(json.dumps({'outcome': 'done', 'summary': 'Old summary', 'verification': 'Old checks', 'commit_sha': None, 'milestones': [], 'checks': []}))
+        for name in ('run.json', 'report.json'):
+            (folder/name).unlink()
+        self.calls.clear()
+        self.fail_report = False
+        self.assertEqual(self.run_loop().returncode, 0)
+        self.assertEqual(self.reports()[0]['outcome'], 'done')
+        self.assertIn('Old checks', self.reports()[0]['report_markdown'])
+
+    def test_legacy_interrupted_raw_result_can_resume(self):
+        self.fail_report = True
+        self.assertNotEqual(self.run_loop().returncode, 0)
+        folder = next((self.root/'state/claims').iterdir())
+        (folder/'result.json').write_text(json.dumps({'outcome': 'done', 'summary': 'Old raw summary', 'verification': 'Old raw checks', 'commit_sha': None, 'milestones': [], 'checks': []}))
+        for name in ('outcome.json', 'run.json', 'report.json'):
+            (folder/name).unlink()
+        self.calls.clear()
+        self.fail_report = False
+        self.assertEqual(self.run_loop().returncode, 0)
+        self.assertEqual(self.reports()[0]['outcome'], 'done')
+        self.assertIn('Old raw checks', self.reports()[0]['report_markdown'])
+
+    def test_interrupted_malformed_result_is_blocked(self):
+        self.fail_report = True
+        self.assertNotEqual(self.run_loop().returncode, 0)
+        folder = next((self.root/'state/claims').iterdir())
+        (folder/'result.json').write_text('{}')
+        for name in ('outcome.json', 'run.json', 'report.json'):
+            (folder/name).unlink()
+        self.calls.clear()
+        self.fail_report = False
+        result = self.run_loop()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.reports()[0]['outcome'], 'blocked')
 
     def test_malformed_is_blocked(self):
         self.set_agent('pass\n')
@@ -98,7 +192,7 @@ class LoopTests(unittest.TestCase):
         self.set_agent('import time\ntime.sleep(30)\n')
         self.assertEqual(self.run_loop('--timeout-seconds', '.15').returncode, 0)
         self.assertEqual(self.reports()[0]['outcome'], 'blocked')
-        self.assertIn('timeout', self.reports()[0]['verification'])
+        self.assertIn('timeout', self.reports()[0]['report_markdown'])
 
     def test_pending_report_retried_without_rerunning(self):
         self.fail_report = True
@@ -153,7 +247,7 @@ class LoopTests(unittest.TestCase):
         self.set_agent('raise RuntimeError("must not rerun")\n')
         self.assertEqual(self.run_loop().returncode, 0)
         self.assertEqual(self.reports()[0]['outcome'], 'done')
-        self.assertEqual(self.reports()[0]['summary'], 'Complete')
+        self.assertEqual(self.reports()[0]['report_markdown'], self.report_markdown)
         self.assertFalse(any(p == '/worker/claim' for p,b in self.calls))
 
     def test_sigkill_after_raw_done_result_reports_blocked(self):
@@ -174,7 +268,7 @@ class LoopTests(unittest.TestCase):
             self.calls.clear()
             self.assertEqual(self.run_loop().returncode, 0)
             self.assertEqual(self.reports()[0]['outcome'], 'blocked')
-            self.assertIn('unconfirmed', self.reports()[0]['verification'])
+            self.assertIn('unconfirmed', self.reports()[0]['report_markdown'])
             self.assertEqual(json.loads(results[0].read_text())['outcome'], 'done')
             self.assertFalse(any(p == '/worker/claim' for p,b in self.calls))
         finally:
@@ -225,7 +319,7 @@ class LoopTests(unittest.TestCase):
         self.assertEqual((Path(record['path'])/'unfinished.txt').read_text(), 'keep me')
         self.claim_id = 'claim-two'
         self.calls.clear()
-        self.set_agent("import json,sys\nfrom pathlib import Path\nassert Path('unfinished.txt').read_text() == 'keep me'\nPath(sys.argv[sys.argv.index('-o')+1]).write_text(json.dumps({'outcome':'done','summary':'Resumed','verification':'kept previous work','commit_sha':None,'milestones':[],'checks':[]}))\n")
+        self.set_agent("import json,sys\nfrom pathlib import Path\nassert Path('unfinished.txt').read_text() == 'keep me'\nPath(sys.argv[sys.argv.index('-o')+1]).write_text(json.dumps({'outcome':'done','report_markdown':'Resumed; kept previous work','commit_sha':None,'milestones':[],'checks':[]}))\n")
         self.assertEqual(self.run_loop().returncode, 0)
         self.assertEqual(self.reports()[0]['outcome'], 'done')
 
@@ -250,6 +344,30 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(self.run_loop().returncode, 0)
         self.assertEqual(self.reports(), [])
         self.assertTrue(list((self.root/'state').glob('claims/*/lease-lost.json')))
+        runs = [body for path, body in self.calls if path == '/worker/runs']
+        self.assertEqual(len(runs), 1)
+        self.assertIn('409', runs[0]['body'])
+
+    def test_interrupted_lease_loss_only_rescues_run(self):
+        self.lose_claim = True
+        self.set_agent('import time\ntime.sleep(30)\n')
+        self.assertEqual(self.run_loop().returncode, 0)
+        folder = next((self.root/'state/claims').iterdir())
+        for name in ('run.json', 'run-sent.json'):
+            (folder/name).unlink()
+        self.calls.clear()
+        self.assertEqual(self.run_loop().returncode, 0)
+        self.assertEqual([path for path, body in self.calls], ['/worker/runs'])
+
+    def test_lease_loss_rescues_raw_body_without_claiming_success(self):
+        self.lose_claim = True
+        self.agent.write_text(self.agent.read_text() + 'import time\ntime.sleep(30)\n')
+        self.assertEqual(self.run_loop('--heartbeat-seconds', '.2').returncode, 0)
+        self.assertEqual(self.reports(), [])
+        run = next(body for path, body in self.calls if path == '/worker/runs')
+        self.assertEqual(run['outcome'], 'blocked')
+        self.assertEqual(run['body'], self.report_markdown)
+        self.assertIn('409', run['note'])
 
 
 if __name__ == '__main__':

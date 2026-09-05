@@ -105,6 +105,7 @@ pub async fn api_set_status(
     Ok(Json(task::card(&s, &id)?))
 }
 fn history(s: &AppState, done: bool) -> Result<Value, Error> {
+    task::sweep(s)?;
     let mut ts = s.store.list("tasks")?;
     ts.retain(|t| {
         if done {
@@ -208,6 +209,7 @@ pub async fn api_runs_post(
     Ok(Json(runs::append(&s, v, true)?))
 }
 fn filtered_runs(s: &AppState, q: &BTreeMap<String, String>) -> Result<Vec<Value>, Error> {
+    task::sweep(s)?;
     let mut rs = s.store.list("runs")?;
     rs.retain(|r| {
         ["task_id", "product_id", "source"]
@@ -282,11 +284,22 @@ pub async fn api_run_read(
     )?))
 }
 pub async fn worker_snapshot(State(s): State<AppState>) -> Result<Json<Value>, Error> {
+    task::sweep(&s)?;
     Ok(Json(s.store.transaction(|a| {
+        crate::report::recover(a)?;
         let mut result = json!({});
         for c in ["tasks", "products", "runs", "archive", "claim_receipts"] {
             result[c] = json!(a.list(c)?);
         }
         Ok(result)
     })?))
+}
+
+pub async fn api_run(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, Error> {
+    identity(&h, &s)?;
+    Ok(Json(crate::report::get(&s, &id)?))
 }

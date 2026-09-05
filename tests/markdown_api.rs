@@ -166,44 +166,46 @@ fn report_resend_is_idempotent_but_conflicting_outcome_is_rejected() {
     assert!(task::report(&s, json!({"claim_id":c["claim_id"],"outcome":"blocked"})).is_err());
 }
 
+use axum::http::HeaderMap;
+async fn rpc(
+    app: axum::Router,
+    session: Option<&str>,
+    message: serde_json::Value,
+) -> (StatusCode, HeaderMap, serde_json::Value) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream");
+    if let Some(session) = session {
+        request = request.header("mcp-session-id", session);
+    }
+    let response = app
+        .oneshot(request.body(Body::from(message.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(status.is_success(), "MCP {status}: {text}");
+    let value = serde_json::from_str(&text).unwrap_or_else(|_| {
+        text.lines()
+            .find_map(|line| {
+                line.strip_prefix("data: ")
+                    .and_then(|json| serde_json::from_str(json).ok())
+            })
+            .unwrap_or_default()
+    });
+    (status, headers, value)
+}
+
 #[tokio::test]
 async fn mcp_flat_crud_contract_over_json_rpc() {
-    use axum::http::HeaderMap;
-    async fn rpc(
-        app: axum::Router,
-        session: Option<&str>,
-        message: serde_json::Value,
-    ) -> (StatusCode, HeaderMap, serde_json::Value) {
-        let mut request = Request::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header("host", "localhost")
-            .header("content-type", "application/json")
-            .header("accept", "application/json, text/event-stream");
-        if let Some(session) = session {
-            request = request.header("mcp-session-id", session);
-        }
-        let response = app
-            .oneshot(request.body(Body::from(message.to_string())).unwrap())
-            .await
-            .unwrap();
-        let status = response.status();
-        let headers = response.headers().clone();
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let text = String::from_utf8(bytes.to_vec()).unwrap();
-        assert!(status.is_success(), "MCP {status}: {text}");
-        let value = serde_json::from_str(&text).unwrap_or_else(|_| {
-            text.lines()
-                .find_map(|line| {
-                    line.strip_prefix("data: ")
-                        .and_then(|json| serde_json::from_str(json).ok())
-                })
-                .unwrap_or_default()
-        });
-        (status, headers, value)
-    }
     let dir = tempfile::tempdir().unwrap();
-    let app = task_server::app(AppState::new(Store::open(dir.path()).unwrap()));
+    let state = AppState::new(Store::open(dir.path()).unwrap());
+    let app = task_server::app(state.clone());
     let (code, headers, initialized)=rpc(app.clone(),None,json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"contract-test","version":"1"}}})).await;
     assert_eq!(code, StatusCode::OK);
     assert!(initialized["result"]["capabilities"]["tools"].is_object());
@@ -234,8 +236,51 @@ async fn mcp_flat_crud_contract_over_json_rpc() {
     );
     let (_,_,updated)=rpc(app.clone(),Some(session),json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"task_update","arguments":{"id":"mcp-task","title":"updated"}}})).await;
     assert_eq!(updated["result"]["structuredContent"]["title"], "updated");
-    let (_,_,got)=rpc(app,Some(session),json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"task_get","arguments":{"id":"mcp-task"}}})).await;
+    let (_,_,got)=rpc(app.clone(),Some(session),json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"task_get","arguments":{"id":"mcp-task"}}})).await;
     assert_eq!(got["result"]["structuredContent"]["body"], "markdown");
+    state
+        .store
+        .put("products", "a/b", json!({"id":"a/b"}))
+        .unwrap();
+    task::patch(&state, "mcp-task", json!({"product_id":"a/b"})).unwrap();
+    task::set_status(&state, "mcp-task", "ready").unwrap();
+    let claim = task::claim(&state, "test").unwrap().unwrap();
+    let payload = json!({"claim_id":claim["claim_id"],"outcome":"done","report_markdown":"# Original\nUnverified idea.","commit_sha":"abc","checks":[{"name":"cargo test","exit_code":0}],"milestones":[{"name":"implemented"}]});
+    let (code, reported) = request(
+        app.clone(),
+        "POST",
+        "/worker/report",
+        payload.clone(),
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let id = reported["report_id"].as_u64().unwrap().to_string();
+    let (_,_,run)=rpc(app.clone(),Some(session),json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"run_get","arguments":{"id":id}}})).await;
+    assert_eq!(
+        run["result"]["structuredContent"]["body"],
+        payload["report_markdown"]
+    );
+    assert_eq!(
+        run["result"]["structuredContent"]["claim_id"],
+        claim["claim_id"]
+    );
+    let (code, original) = request(
+        app.clone(),
+        "GET",
+        &format!("/api/runs/{id}"),
+        json!(null),
+        true,
+        false,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(original["body"], payload["report_markdown"]);
+    assert_eq!(original["checks"][0]["exit_code"], 0);
+    let (_, repeated) = request(app, "POST", "/worker/report", payload, false, false).await;
+    assert_eq!(repeated["report_id"], reported["report_id"]);
+    assert_eq!(state.store.list("runs").unwrap().len(), 1);
 }
 
 #[test]

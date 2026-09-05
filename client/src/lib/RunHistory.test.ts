@@ -94,3 +94,26 @@ it("loads only when opened, retries errors, and pages without marking read", asy
     ),
   ).toBe(true);
 });
+it("opens a referenced original with claim, commit and evidence, without marking it read", async () => {
+  const fetchMock = vi.fn().mockResolvedValue(
+    new Response(
+      JSON.stringify({
+        id: 42,
+        at: "2026-09-06",
+        source: "worker",
+        outcome: "blocked",
+        body: "# 原文\n未検証 <script>bad()</script>",
+        claim_id: "claim-42",
+        commit_sha: "abc",
+        checks: [{ name: "cargo test", exit_code: 1 }],
+      }),
+    ),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  render(RunHistory, { taskId: "one", selectedReport: 42 });
+  await screen.findByText(/未検証/);
+  expect(document.querySelector("script")).toBeNull();
+  expect(screen.getByText(/claim-42/)).toBeTruthy();
+  expect(screen.getByText("cargo test: exit 1")).toBeTruthy();
+  expect(fetchMock.mock.calls[0][0]).toBe("/api/runs/42");
+});

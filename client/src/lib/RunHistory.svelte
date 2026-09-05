@@ -1,6 +1,33 @@
 <script lang="ts">
-  import { checkLabel, fetchRuns, type Run } from "./api";
-  let { taskId }: { taskId: string } = $props();
+  import { tick } from "svelte";
+  import { checkLabel, fetchRun, fetchRuns, type Run } from "./api";
+  let { taskId, selectedReport }: { taskId: string; selectedReport?: number } =
+    $props();
+  let opened = $state(false);
+  let selectedError = $state(false);
+
+  async function select(id: number) {
+    opened = true;
+    busy = true;
+    error = "";
+    selectedError = false;
+    try {
+      const run = await fetchRun(id);
+      runs = [...runs.filter((r) => r.id !== id), run];
+      if (!loaded) next = 0;
+      loaded = true;
+      await tick();
+      document.getElementById(`run-${id}`)?.focus();
+    } catch {
+      error = "実行履歴の読み込みに失敗しました";
+      selectedError = true;
+    } finally {
+      busy = false;
+    }
+  }
+  $effect(() => {
+    if (selectedReport !== undefined) void select(selectedReport);
+  });
   let runs = $state<Run[]>([]);
   let next = $state<number | null>(null);
   let loaded = $state(false);
@@ -13,7 +40,11 @@
     error = "";
     try {
       const page = await fetchRuns(taskId, next ?? 0);
-      runs = [...runs, ...page.runs];
+      runs = [
+        ...new Map(
+          [...runs, ...page.runs].map((run) => [run.id, run]),
+        ).values(),
+      ];
       next = page.next;
       loaded = true;
     } catch {
@@ -26,19 +57,31 @@
 
 <details
   class="history"
+  bind:open={opened}
   data-field="runs"
   ontoggle={(event) => {
-    if (event.currentTarget.open && !loaded) void load();
+    if (event.currentTarget.open && !loaded && selectedReport === undefined)
+      void load();
   }}
 >
   <summary>実行履歴</summary>
   {#if busy}<p class="caption" role="status">読み込み中…</p>{/if}
   {#if error}<p class="state error">{error}</p>
-    <button class="btn" type="button" onclick={() => void load()}>再試行</button
+    <button
+      class="btn"
+      type="button"
+      onclick={() =>
+        selectedError && selectedReport !== undefined
+          ? void select(selectedReport)
+          : void load()}>再試行</button
     >{/if}
   {#each runs as run (run.id)}
-    <details class="run">
-      <summary>{run.at} · {run.outcome ?? run.source}</summary>
+    <details class="run" open={run.id === selectedReport}>
+      <summary id={`run-${run.id}`} tabindex="-1"
+        >報告 #{run.id} · {run.at} · {run.outcome ?? run.source}</summary
+      >
+      {#if run.body}<pre data-field="report-original">{run.body}</pre>{/if}
+      {#if run.claim_id}<p class="caption">実行 {run.claim_id}</p>{/if}
       {#if run.note}<p>{run.note}</p>{/if}
       <p class="caption">
         {run.worker ?? ""}

@@ -109,6 +109,15 @@ impl Admin {
             a.status.as_deref().unwrap_or(""),
         ))
     }
+    #[tool(
+        description = "Read a run/report original Markdown, task, claim, commit and checks by run id"
+    )]
+    fn run_get(&self, Parameters(a): Parameters<Args>) -> CallToolResult {
+        answer(crate::report::get(
+            &self.state,
+            a.id.as_deref().unwrap_or(""),
+        ))
+    }
     #[tool(description = "Delete a closed task; session haystack remains")]
     fn task_delete(&self, Parameters(a): Parameters<Args>) -> CallToolResult {
         answer(task::delete(&self.state, a.id.as_deref().unwrap_or("")))

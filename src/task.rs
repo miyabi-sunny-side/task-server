@@ -62,7 +62,7 @@ pub fn create(s: &AppState, v: Value) -> Result<Value, Error> {
     }
     s.store.create("tasks", &id, t)
 }
-fn invalidate(t: &mut Value, new: &Value) {
+pub(crate) fn invalidate(t: &mut Value, new: &Value) {
     if &t["commit_sha"] != new {
         let old = t["milestones"].as_array().cloned().unwrap_or_default();
         let (expired, keep): (Vec<_>, Vec<_>) = old.into_iter().partition(|m| {
@@ -81,7 +81,12 @@ fn invalidate(t: &mut Value, new: &Value) {
         t["commit_sha"] = new.clone();
     }
 }
-fn milestones(t: &mut Value, v: &Value, now: &str) -> Result<(), Error> {
+pub(crate) fn milestones(
+    t: &mut Value,
+    v: &Value,
+    now: &str,
+    report_id: Option<u64>,
+) -> Result<(), Error> {
     let Some(items) = v.as_array() else {
         return Err(Error::Invalid("milestones must be an array".into()));
     };
@@ -99,7 +104,8 @@ fn milestones(t: &mut Value, v: &Value, now: &str) -> Result<(), Error> {
         if m["commit_sha"].is_null() {
             m["commit_sha"] = t["commit_sha"].clone();
         }
-        if m["evidence"].is_null() {
+        if m["evidence"].is_null() && (report_id.is_none() || m["report_id"].as_u64() != report_id)
+        {
             return Err(Error::Invalid("milestone evidence is required".into()));
         }
         if m["commit_sha"] != t["commit_sha"] {
@@ -113,44 +119,47 @@ fn milestones(t: &mut Value, v: &Value, now: &str) -> Result<(), Error> {
     Ok(())
 }
 pub fn patch(s: &AppState, id: &str, v: Value) -> Result<Value, Error> {
-    s.store.update("tasks", id, |t| {
-        if v.get("status").is_some() {
-            return Err(Error::Invalid("use status endpoint".into()));
-        }
-        if t["claim_id"].is_string() {
-            return Err(Error::Conflict("task has an execution lease".into()));
-        }
-        if let Some(p) = v["product_id"].as_str() {
-            crate::product::check_product_id("product_id", p)?;
-        }
-        if v.get("title").is_some() {
-            required(&v, "title")?;
-        }
-        if let Some(commit) = v.get("commit_sha") {
-            invalidate(t, commit);
-        }
-        for k in [
-            "title",
-            "body",
-            "product_id",
-            "priority",
-            "depends_on",
-            "branch",
-            "verification",
-            "summary",
-            "checks",
-            "release_level",
-        ] {
-            if let Some(value) = v.get(k) {
-                t[k] = value.clone();
+    s.store.transaction(|a| {
+        expire(a, &format_z(s.clock.now()))?;
+        a.update("tasks", id, |t| {
+            if v.get("status").is_some() {
+                return Err(Error::Invalid("use status endpoint".into()));
             }
-        }
-        let now = format_z(s.clock.now());
-        if let Some(m) = v.get("milestones") {
-            milestones(t, m, &now)?;
-        }
-        t["updated_at"] = json!(now);
-        Ok(())
+            if t["claim_id"].is_string() {
+                return Err(Error::Conflict("task has an execution lease".into()));
+            }
+            if let Some(p) = v["product_id"].as_str() {
+                crate::product::check_product_id("product_id", p)?;
+            }
+            if v.get("title").is_some() {
+                required(&v, "title")?;
+            }
+            if let Some(commit) = v.get("commit_sha") {
+                invalidate(t, commit);
+            }
+            for k in [
+                "title",
+                "body",
+                "product_id",
+                "priority",
+                "depends_on",
+                "branch",
+                "verification",
+                "summary",
+                "checks",
+                "release_level",
+            ] {
+                if let Some(value) = v.get(k) {
+                    t[k] = value.clone();
+                }
+            }
+            let now = format_z(s.clock.now());
+            if let Some(m) = v.get("milestones") {
+                milestones(t, m, &now, None)?;
+            }
+            t["updated_at"] = json!(now);
+            Ok(())
+        })
     })
 }
 fn ready_gate(a: &StoreAccess<'_>, t: &Value) -> Result<(), Error> {
@@ -167,6 +176,7 @@ fn ready_gate(a: &StoreAccess<'_>, t: &Value) -> Result<(), Error> {
 pub fn set_status(s: &AppState, id: &str, status: &str) -> Result<Value, Error> {
     check_status(status)?;
     s.store.transaction(|a| {
+        expire(a, &format_z(s.clock.now()))?;
         let mut t = a.get("tasks", id)?;
         if !active(&t) {
             return Err(Error::Gone);
@@ -197,6 +207,7 @@ pub fn set_status(s: &AppState, id: &str, status: &str) -> Result<Value, Error> 
 }
 pub fn delete(s: &AppState, id: &str) -> Result<Value, Error> {
     s.store.transaction(|a| {
+        expire(a, &format_z(s.clock.now()))?;
         let t = a.get("tasks", id)?;
         if !closed(string(&t, "status")) {
             return Err(Error::Conflict("only closed tasks may be deleted".into()));
@@ -205,6 +216,7 @@ pub fn delete(s: &AppState, id: &str) -> Result<Value, Error> {
     })
 }
 fn expire(a: &StoreAccess<'_>, now: &str) -> Result<(), Error> {
+    crate::report::recover(a)?;
     for mut t in a.list("tasks")? {
         if t["status"] == "wip"
             && t["claim_id"].is_string()
@@ -336,7 +348,7 @@ pub fn claim(s: &AppState, worker: &str) -> Result<Option<Value>, Error> {
         Ok(None)
     })
 }
-fn claimed(a: &StoreAccess<'_>, id: &str, now: &str) -> Result<Value, Error> {
+pub(crate) fn claimed(a: &StoreAccess<'_>, id: &str, now: &str) -> Result<Value, Error> {
     expire(a, now)?;
     a.list("tasks")?
         .into_iter()
@@ -358,6 +370,9 @@ pub fn heartbeat(s: &AppState, id: &str) -> Result<Value, Error> {
     })
 }
 pub fn report(s: &AppState, v: Value) -> Result<Value, Error> {
+    if v.get("report_markdown").is_some() {
+        return crate::report::submit(s, &v);
+    }
     let claim = required(&v, "claim_id")?;
     let outcome = required(&v, "outcome")?;
     if !["done", "blocked"].contains(&outcome.as_str()) {
@@ -386,8 +401,9 @@ pub fn report(s: &AppState, v: Value) -> Result<Value, Error> {
             }
         }
         if let Some(m) = v.get("milestones") {
-            milestones(&mut t, m, &now)?;
+            milestones(&mut t, m, &now, None)?;
         }
+        t["report_id"] = Value::Null;
         t["last_report"] = v.clone();
         t["last_claim_id"] = t["claim_id"].take();
         t["lease_expires_at"] = Value::Null;

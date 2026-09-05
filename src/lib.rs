@@ -14,6 +14,7 @@ pub mod http;
 pub mod ledger;
 pub mod mcp;
 pub mod product;
+pub mod report;
 pub mod runs;
 pub mod scan;
 pub mod state;
@@ -39,6 +40,7 @@ pub fn app(state: AppState) -> Router {
         .route("/control", get(http::api_control))
         .route("/runs", get(http::api_runs).post(http::api_runs_post))
         .route("/runs/next", get(http::api_runs_next))
+        .route("/runs/{id}", get(http::api_run))
         .route("/runs/{id}/read", post(http::api_run_read))
         .route("/products", get(http::api_products))
         .route("/products/rescan", post(http::api_rescan_products))

@@ -12,6 +12,7 @@ export async function loadSession(signal?: AbortSignal): Promise<Session> {
 }
 
 export interface Milestone {
+  report_id?: number;
   name: "implemented" | "verified" | "reviewed" | "merged" | "released";
   at: string;
   commit_sha?: string | null;
@@ -66,6 +67,15 @@ export function checkLabel(check: Check): string {
 }
 
 export interface TaskCard {
+  report_id?: number;
+  report_ids?: number[];
+  legacy_completion?: {
+    at?: string;
+    commit_sha?: string;
+    summary?: string;
+    verification?: string;
+    checks?: Check[];
+  }[];
   archived?: boolean;
   milestones?: Milestone[];
   milestone_history?: Milestone[];
@@ -258,6 +268,9 @@ export function updateTask(id: string, fields: TaskFields): Promise<TaskCard> {
 }
 
 export interface Run {
+  body?: string;
+  claim_id?: string;
+  task_id?: string;
   id: number;
   at: string;
   source: string;
@@ -280,4 +293,8 @@ export function fetchRuns(
   return requestJson(
     `/api/runs?task_id=${encodeURIComponent(taskId)}&since=${since}`,
   );
+}
+
+export function fetchRun(id: number): Promise<Run> {
+  return requestJson(`/api/runs/${id}`);
 }

@@ -17,6 +17,7 @@
   let editing = $state(false);
   let busy = $state(false);
   let actionError = $state("");
+  let selectedReport = $state<number>();
 
   let controller: AbortController | undefined;
   // The id whose card is currently drawn, so a background reload's failure
@@ -61,6 +62,7 @@
   $effect(() => {
     if (loadedId !== id) {
       detailState = "loading";
+      selectedReport = undefined;
     }
     void load(id);
     const stopAutoReload = startAutoReload(() => void load(id));
@@ -89,6 +91,7 @@
       error={actionError}
       {ontransition}
       onedit={() => (editing = true)}
+      onreport={(id) => (selectedReport = id)}
     />
     {#if editing}
       <TaskForm
@@ -103,7 +106,11 @@
         }}
       />
     {/if}
-    {#key task.id}<RunHistory taskId={task.id} />{/key}
+    {#key task.id}<RunHistory
+        taskId={task.id}
+        selectedReport={selectedReport ??
+          (task.status === "blocked" ? task.report_id : undefined)}
+      />{/key}
   {/if}
 </div>
 
