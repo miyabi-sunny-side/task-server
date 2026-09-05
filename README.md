@@ -77,8 +77,8 @@ MCP tools use flat arguments:
 
 - `product_register(id, repository, description?, local_path?, releases?)` creates
   a new ID only; existing IDs conflict, including archived IDs.
-- `product_get(id)` reads the full record; `product_list()` returns all registered
-  products. These reads do not touch the filesystem outside the ledger.
+- `product_get(id)` reads the full record; `product_list(limit?, offset?, archived?)` returns paged compact
+  summaries. Follow `next_offset` until null for all matching products. These reads do not touch the filesystem outside the ledger.
 - `product_update(id, repository?, description?, local_path?, releases?)` patches
   only supplied fields. Explicit `local_path:null` clears placement and
   `releases:null` clears the policy; omitted fields remain unchanged.
@@ -128,11 +128,14 @@ even when an earlier implementation step succeeded.
 
 ## Execution handoff
 
-MCP `task_checkpoint_get` takes `id` and optional `execution_id`. It returns
-`task_id`, `active_claim_id`, and `checkpoints` in oldest-first order. Each
+MCP `task_checkpoint_get` takes `id`, optional `execution_id`, `limit`, and
+`offset`. It returns `task_id`, `active_claim_id`, `checkpoints`, `total`, and
+`next_offset` in oldest-first order. Each
 checkpoint contains `execution_id` (the claim UUID), `revision`, `updated_at`,
-and a free-form JSON object `values`. Without `execution_id`, all executions are
-returned, including expired ones; a task never claimed has an empty array.
+and a free-form JSON object `values`. Without `execution_id`, executions are
+paged (default 50, maximum 200), including expired ones; follow `next_offset`
+until null. Use `execution_id` to directly select the current claim even when
+it is beyond the first page. A task never claimed has an empty array.
 A new claim starts with empty values at revision 0 and keeps older executions.
 An existing lease from an older server is exposed at revision 0 without rewriting
 its file on read; its first update persists the checkpoint.
@@ -149,7 +152,8 @@ MCP `task_checkpoint_update` takes:
 }
 ```
 
-The result is the updated checkpoint. `set` replaces only the specified top-level
+The MCP result is a receipt with the new revision; the worker HTTP result is
+the updated checkpoint. `set` replaces only the specified top-level
 keys (a nested object is one value); `null` is a value, not deletion. `delete_keys`
 removes keys, including absent ones. Setting and deleting the same key is invalid.
 Values are limited to 64 keys and 32768 bytes of serialized JSON per execution;
@@ -313,3 +317,45 @@ success. A refused/expired lease still uses `/worker/runs` to preserve the raw
 body and logs without completing the task. Existing pending loop journals remain
 readable. Knowledge selection consumes the same haystack originals through the
 existing next/read receipt flow; its success is not a condition of completion.
+
+## Compact MCP reads and mutation receipts
+
+MCP and HTTP share the same domain operations and Markdown records. MCP returns
+purpose-specific views; the existing browser and worker HTTP responses stay intact.
+No ledger migration or rewriting is required.
+
+| Tool | Response and explicit follow-up |
+| --- | --- |
+| `task_list(status?, product_id?, limit?, offset?)` | `tasks` with ID, product, title, status, priority, dependency/status and blocker; no prose or evidence. Default excludes closed tasks; supply one lifecycle status to include that status. |
+| `task_get(id)` | Task body and current lifecycle, claim, commit, report ID, timestamps, transitions and run counts. It does not expand completion prose, milestones, history or checkpoint values. |
+| `task_history(id, limit?, offset?)` | `entries` tagged by source field: `current_completion` (summary/verification/checks), `last_report`, `milestones`, `milestone_history`, `legacy_completion`, `report_ids`, `legacy`. Array entries retain their original index; historical values retain their original provenance, including overlapping legacy evidence. |
+| `run_list(task_id?, product_id?, source?, unread?, limit?, offset?)` | `runs` with metadata and IDs, without original body/notes/tails/checks. `unread:true` selects unread; `false` selects read. |
+| `run_get(id)` | Original run/report including Markdown body, notes and evidence; numeric run IDs are passed as strings. |
+| `product_list(archived?, limit?, offset?)` | `products` with ID, description and archive metadata. `product_get(id)` reads repository, placement, release policy and the full original record. |
+| `task_checkpoint_get(id, execution_id?, limit?, offset?)` | Explicit handoff values; see Execution handoff above. |
+
+Every paged response includes `total` after filtering and `next_offset` (integer
+or null). Limits are 1..200, default 50; offsets are nonnegative integers, default
+0. Filters are applied before slicing. Task order is priority descending then ID;
+products sort by ID, runs by numeric ID, checkpoints oldest first, and history by
+the source-field order above then array index. An offset beyond the end returns
+an empty page. These are views of current state, not frozen snapshots: restart a
+traversal if concurrent edits change membership/order. `/worker/snapshot` remains
+the consistent five-collection export for backup.
+
+Task create/update/status responses contain `ok`, ID, compact task state,
+`updated_at`, and `changed` field names; they do not echo submitted bodies or
+historical evidence. Delete returns `ok`, ID and `deleted`. Product mutations
+return current registered metadata without body or legacy fields. Checkpoint
+updates return `ok`, `task_id`, `execution_id`, `revision`, and `updated_at`,
+without echoing `values`; use the returned revision for the next update.
+
+Tool-specific schemas reject unknown or irrelevant arguments. Invalid statuses,
+product IDs, page sizes, types and negative offsets fail explicitly. A task patch
+can clear `product_id`, `depends_on`, `release_level`, or `commit_sha` with null;
+omitted fields are unchanged. Other optional task fields do not accept null.
+
+Clients migrating from unpaged MCP reads must follow `next_offset` with the same
+filters until null, fetch product metadata before acting on release policy, and
+use the explicit history/run/checkpoint tools when those records are needed.
+`bin/task-loop` uses the unchanged worker HTTP contract and needs no adapter.

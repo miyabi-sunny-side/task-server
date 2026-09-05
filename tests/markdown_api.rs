@@ -593,3 +593,281 @@ async fn explicit_product_mcp_updates_reach_http_and_worker_without_rescan() {
     let (status, _) = request(app, "POST", "/api/products/rescan", json!({}), true, true).await;
     assert_eq!(status, StatusCode::GONE);
 }
+
+async fn mcp_call(
+    app: &axum::Router,
+    session: &str,
+    name: &str,
+    args: serde_json::Value,
+) -> serde_json::Value {
+    rpc(app.clone(), Some(session), json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":name,"arguments":args}})).await.2
+}
+
+async fn rejects_arguments(
+    app: &axum::Router,
+    session: &str,
+    cases: Vec<(&str, serde_json::Value)>,
+) {
+    for (name, args) in cases {
+        let result = mcp_call(app, session, name, args.clone()).await;
+        assert!(
+            result.get("error").is_some() || result["result"]["isError"] == true,
+            "{name} {args}: {result}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mcp_compact_reads_paginate_filter_and_reject_ignored_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(Store::open(dir.path()).unwrap());
+    for (id, product, priority) in [("a", "a/b", 2), ("b", "a/b", 2), ("c", "c/d", 1)] {
+        task::create(&state, json!({"id":id,"title":id,"body":"original task body","product_id":product,"priority":priority})).unwrap();
+    }
+    let prose = "legacy evidence".repeat(100);
+    state
+        .store
+        .update("tasks", "a", |t| {
+            t["verification"] = json!(prose);
+            t["last_report"] = json!({"verification":prose,"claim_id":"old"});
+            t["milestones"] = json!([{"name":"verified","evidence":prose}]);
+            t["milestone_history"] = json!([{"name":"reviewed","evidence":"old evidence"}]);
+            t["execution_checkpoints"] =
+                json!([{"execution_id":"old","revision":1,"values":{"next_step":"resume here"}}]);
+            Ok(())
+        })
+        .unwrap();
+    let app = task_server::app(state.clone());
+    let (_, headers, _) = rpc(app.clone(), None, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"compact-test","version":"1"}}})).await;
+    let session = headers["mcp-session-id"].to_str().unwrap();
+    let first = mcp_call(
+        &app,
+        session,
+        "task_list",
+        json!({"product_id":"a/b","status":"draft","limit":1}),
+    )
+    .await;
+    let page = &first["result"]["structuredContent"];
+    assert_eq!(page["total"], 2);
+    assert_eq!(page["next_offset"], 1);
+    assert_eq!(page["tasks"][0]["id"], "a");
+    assert!(page["tasks"][0].get("verification").is_none());
+    assert!(page["tasks"][0].get("body").is_none());
+    let second = mcp_call(
+        &app,
+        session,
+        "task_list",
+        json!({"product_id":"a/b","status":"draft","limit":1,"offset":1}),
+    )
+    .await;
+    assert_eq!(second["result"]["structuredContent"]["tasks"][0]["id"], "b");
+    assert!(second["result"]["structuredContent"]["next_offset"].is_null());
+    let got = mcp_call(&app, session, "task_get", json!({"id":"a"})).await;
+    let card = &got["result"]["structuredContent"];
+    assert_eq!(card["body"], "original task body");
+    for key in [
+        "last_report",
+        "verification",
+        "milestones",
+        "milestone_history",
+        "execution_checkpoints",
+    ] {
+        assert!(card.get(key).is_none(), "{key}");
+    }
+    let history = mcp_call(&app, session, "task_history", json!({"id":"a","limit":1})).await;
+    assert!(
+        history["result"]["structuredContent"]["total"]
+            .as_u64()
+            .unwrap()
+            >= 3
+    );
+    let checkpoint = mcp_call(
+        &app,
+        session,
+        "task_checkpoint_get",
+        json!({"id":"a","execution_id":"old"}),
+    )
+    .await;
+    assert_eq!(
+        checkpoint["result"]["structuredContent"]["checkpoints"][0]["values"]["next_step"],
+        "resume here"
+    );
+    let updated = mcp_call(
+        &app,
+        session,
+        "task_update",
+        json!({"id":"a","body":"replacement"}),
+    )
+    .await;
+    assert_eq!(updated["result"]["structuredContent"]["ok"], true);
+    assert!(updated["result"]["structuredContent"].get("body").is_none());
+    assert_eq!(task::card(&state, "a").unwrap()["verification"], prose);
+    assert_eq!(task::card(&state, "a").unwrap()["body"], "replacement");
+}
+
+#[tokio::test]
+async fn mcp_product_run_and_checkpoint_pages_preserve_originals() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(Store::open(dir.path()).unwrap());
+    for (id, archived) in [("a/one", false), ("a/two", false), ("z/old", true)] {
+        state.store.put("products",id,json!({"id":id,"repository":"https://example.test/repo","description":id,"archived":archived})).unwrap();
+    }
+    task::create(
+        &state,
+        json!({"id":"t","title":"task","product_id":"a/one"}),
+    )
+    .unwrap();
+    state
+        .store
+        .update("tasks", "t", |t| {
+            t["execution_checkpoints"] = json!([
+                {"execution_id":"one","revision":1,"values":{"next_step":"first"}},
+                {"execution_id":"two","revision":2,"values":{"next_step":"second"}}
+            ]);
+            Ok(())
+        })
+        .unwrap();
+    for (id, task, source, read) in [
+        (1, "t", "worker", false),
+        (2, "other", "worker", false),
+        (3, "t", "rescue", false),
+        (4, "t", "worker", true),
+        (5, "t", "worker", false),
+    ] {
+        state.store.put("runs",&id.to_string(),json!({"id":id,"task_id":task,"product_id":"a/one","source":source,"read_at":if read { json!("2026-09-05") } else { json!(null) },"body":format!("original {id}"),"note":format!("note {id}")})).unwrap();
+    }
+    let app = task_server::app(state);
+    let (_, headers, _) = rpc(app.clone(),None,json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"pages-test","version":"1"}}})).await;
+    let session = headers["mcp-session-id"].to_str().unwrap();
+    let p = mcp_call(
+        &app,
+        session,
+        "product_list",
+        json!({"archived":false,"limit":1,"offset":1}),
+    )
+    .await;
+    assert_eq!(
+        p["result"]["structuredContent"]["products"][0]["id"],
+        "a/two"
+    );
+    assert_eq!(p["result"]["structuredContent"]["total"], 2);
+    assert!(p["result"]["structuredContent"]["next_offset"].is_null());
+    let p = mcp_call(&app, session, "product_list", json!({"archived":true})).await;
+    assert_eq!(
+        p["result"]["structuredContent"]["products"][0]["id"],
+        "z/old"
+    );
+    for (offset, id, next) in [(0, 1, json!(1)), (1, 5, json!(null))] {
+        let r = mcp_call(&app,session,"run_list",json!({"task_id":"t","product_id":"a/one","source":"worker","unread":true,"limit":1,"offset":offset})).await;
+        let page = &r["result"]["structuredContent"];
+        assert_eq!(page["total"], 2);
+        assert_eq!(page["next_offset"], next);
+        assert_eq!(page["runs"][0]["id"], id);
+        assert!(page["runs"][0].get("body").is_none());
+        let r = mcp_call(&app, session, "run_get", json!({"id":id.to_string()})).await;
+        assert_eq!(
+            r["result"]["structuredContent"]["body"],
+            format!("original {id}")
+        );
+        assert_eq!(
+            r["result"]["structuredContent"]["note"],
+            format!("note {id}")
+        );
+    }
+    let r = mcp_call(&app, session, "run_list", json!({"unread":false})).await;
+    assert_eq!(r["result"]["structuredContent"]["runs"][0]["id"], 4);
+    let p = mcp_call(
+        &app,
+        session,
+        "task_checkpoint_get",
+        json!({"id":"t","limit":1,"offset":1}),
+    )
+    .await;
+    assert_eq!(
+        p["result"]["structuredContent"]["checkpoints"][0]["values"]["next_step"],
+        "second"
+    );
+    assert_eq!(p["result"]["structuredContent"]["total"], 2);
+    for (name, args) in [
+        ("task_checkpoint_get", json!({"id":"t","limit":0})),
+        ("run_list", json!({"unread":"true"})),
+        ("run_list", json!({"status":"done"})),
+        ("task_list", json!({"limit":null})),
+        ("task_update", json!({"id":"t","title":null})),
+        ("task_update", json!({"id":"t","product_id":42})),
+        ("product_list", json!({"archived":"false"})),
+    ] {
+        let r = mcp_call(&app, session, name, args.clone()).await;
+        assert!(
+            r.get("error").is_some() || r["result"]["isError"] == true,
+            "{name} {args}: {r}"
+        );
+    }
+    let empty = mcp_call(&app, session, "run_list", json!({"offset":999})).await;
+    assert_eq!(empty["result"]["structuredContent"]["runs"], json!([]));
+    assert!(empty["result"]["structuredContent"]["next_offset"].is_null());
+}
+
+#[tokio::test]
+async fn mcp_execution_filter_finds_checkpoints_beyond_default_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(Store::open(dir.path()).unwrap());
+    task::create(&state, json!({"id":"t","title":"long execution history"})).unwrap();
+    state.store.update("tasks","t",|t| {
+        t["execution_checkpoints"] = json!((0..55).map(|i| json!({"execution_id":format!("execution-{i}"),"revision":i,"values":{"next_step":format!("step-{i}")}})).collect::<Vec<_>>());
+        Ok(())
+    }).unwrap();
+    let app = task_server::app(state);
+    let (_, headers, _) = rpc(app.clone(),None,json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"execution-test","version":"1"}}})).await;
+    let session = headers["mcp-session-id"].to_str().unwrap();
+    let first = mcp_call(&app, session, "task_checkpoint_get", json!({"id":"t"})).await;
+    assert_eq!(
+        first["result"]["structuredContent"]["checkpoints"]
+            .as_array()
+            .unwrap()
+            .len(),
+        50
+    );
+    assert_eq!(first["result"]["structuredContent"]["next_offset"], 50);
+    let last = mcp_call(
+        &app,
+        session,
+        "task_checkpoint_get",
+        json!({"id":"t","execution_id":"execution-54"}),
+    )
+    .await;
+    assert_eq!(last["result"]["structuredContent"]["total"], 1);
+    assert_eq!(
+        last["result"]["structuredContent"]["checkpoints"][0]["values"]["next_step"],
+        "step-54"
+    );
+}
+
+#[tokio::test]
+async fn mcp_tool_schemas_reject_ignored_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = task_server::app(AppState::new(Store::open(dir.path()).unwrap()));
+    let (_, headers, _) = rpc(app.clone(),None,json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"validation-test","version":"1"}}})).await;
+    let session = headers["mcp-session-id"].to_str().unwrap();
+    rejects_arguments(
+        &app,
+        session,
+        vec![
+            ("task_list", json!({"title":"ignored"})),
+            ("task_list", json!({"status":"bogus"})),
+            ("task_list", json!({"product_id":"invalid"})),
+            ("task_list", json!({"limit":0})),
+            ("task_list", json!({"limit":201})),
+            ("task_list", json!({"offset":-1})),
+            ("task_get", json!({"id":"a","status":"draft"})),
+            ("task_update", json!({"id":"a","status":"done"})),
+            ("task_create", json!({"title":"x","commit_sha":"ignored"})),
+            ("product_list", json!({"unknown":true})),
+            (
+                "task_checkpoint_update",
+                json!({"id":"a","claim_id":"old","expected_revision":0,"unknown":true}),
+            ),
+        ],
+    )
+    .await;
+}
