@@ -230,7 +230,6 @@ fn legacy_product_documents_survive_restart_and_directory_changes() {
         }
         let s = AppState::from_vars(|key| match key {
             "APP_DATA_DIR" => Some(data.path().to_string_lossy().into_owned()),
-            "APP_PROJECTS_DIR" => Some(root.path().to_string_lossy().into_owned()),
             _ => None,
         })
         .unwrap();
@@ -248,10 +247,7 @@ fn legacy_product_documents_survive_restart_and_directory_changes() {
 }
 
 #[test]
-fn legacy_database_configuration_requires_explicit_migration() {
-    assert!(
-        matches!(AppState::from_vars(|key| (key=="APP_DB_PATH").then(||"old.db".into())),Err(task_server::Error::Invalid(message)) if message.contains("migrate"))
-    );
+fn adjacent_legacy_database_requires_explicit_migration() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("task-server.db"), "old database").unwrap();
     let ledger = root.path().join("ledger");

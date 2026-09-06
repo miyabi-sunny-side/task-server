@@ -29,11 +29,8 @@ impl AppState {
             .ok()
             .filter(|v| *v > 0 && *v <= 86400)
             .ok_or_else(|| Error::Invalid("CLAIM_TTL_SECS must be 1..86400".into()))?;
-        let configured_dir = get("APP_DATA_DIR");
-        if configured_dir.is_none() && get("APP_DB_PATH").is_some() {
-            return Err(Error::Invalid("APP_DB_PATH is retired; migrate using bin/task-data import-sqlite and set APP_DATA_DIR".into()));
-        }
-        let data_dir = PathBuf::from(configured_dir.unwrap_or_else(|| DEFAULT_DATA_DIR.into()));
+        let data_dir =
+            PathBuf::from(get("APP_DATA_DIR").unwrap_or_else(|| DEFAULT_DATA_DIR.into()));
         let empty = match std::fs::read_dir(&data_dir) {
             Ok(mut entries) => entries.next().transpose()?.is_none(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,

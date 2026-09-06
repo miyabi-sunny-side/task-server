@@ -21,12 +21,14 @@ the frontend and restart `cargo run` to embed the new assets. For distribution,
 run `cargo build --locked --release` after the frontend build and copy only
 `target/release/task-server`; no UI directory is needed at runtime.
 
-| Variable | Default / purpose |
-|---|---|
-| `APP_DATA_DIR` | `data/ledger`, Markdown records |
-| `PORT` | `3000`; decimal TCP port from `1` to `65535`. Invalid values fail startup with a `PORT` error. |
-| `LOG_LEVEL` | `info`; accepts exactly `off`, `error`, `warn`, `info`, `debug`, or `trace`. Unset or invalid values use `info`. |
-| `CLAIM_TTL_SECS` | Claim lifetime; the loop sends heartbeats |
+The server reads these application settings:
+
+| Variable | Default / purpose | Owner |
+|---|---|---|
+| `APP_DATA_DIR` | `data/ledger`, relative to the working directory; Markdown records | `src/state.rs` |
+| `PORT` | `3000`; decimal TCP port from `1` to `65535`. Invalid values fail startup with a `PORT` error. | `src/port.rs` |
+| `LOG_LEVEL` | `info`; accepts exactly `off`, `error`, `warn`, `info`, `debug`, or `trace`. Unset or invalid values use `info`. | `src/logging.rs` |
+| `CLAIM_TTL_SECS` | `3600` seconds; integer in `1..86400`. A claim and each heartbeat set the lease expiry to the current time plus this lifetime. Invalid values fail startup. | `src/state.rs`, `src/task.rs` |
 
 The server listens on `0.0.0.0:${PORT}` in both native and container runs. Native
 runs therefore accept connections on all IPv4 interfaces. `APP_BIND_ADDR` is no
@@ -69,7 +71,7 @@ Individual record replacement is atomic; there is no general multi-file transact
 
 The product Markdown record is the sole owner of operational product metadata.
 The server never discovers repositories, reads repository configuration, or scans
-local directories. `APP_PROJECTS_DIR` is ignored; `product_rescan` is removed and
+local directories. `product_rescan` is removed and
 `POST /api/products/rescan` returns 410. Directory changes and restarts cannot add,
 archive, revive, or change products. The browser menu's product list shows all
 registered products, including archived entries and unknown release policies.
@@ -225,13 +227,35 @@ The archive contains a SHA-256 manifest. Restore validates all entries and check
 before publishing a new directory. Open that directory with a separate server to
 verify task history and unread haystack counts. It does not overwrite a live ledger.
 
-For R2, install the AWS CLI and configure `R2_ENDPOINT`, `R2_BUCKET`,
-`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, and optional `R2_PREFIX` (default
-`task-server`) outside Git. Then use `snapshot --upload` or `upload <archive>`.
+For R2, install the AWS CLI and configure the upload settings below outside Git.
+Then use `snapshot --upload` or `upload <archive>`.
 Each generation has a unique timestamp; uploads do not synchronize deletions.
 R2 uses its S3 endpoint and region `auto` ([Cloudflare documentation](https://developers.cloudflare.com/r2/examples/aws/aws-cli/)).
 Without credentials, local snapshots and restore remain usable; no remote backup
 is claimed. Configure retention on the backup destination to suit available space.
+
+### Helper and deployment settings
+
+These settings belong to the helper CLIs; the server does not read them.
+
+| Variable | Default / purpose | Owner |
+|---|---|---|
+| `KNOWLEDGE_REPO` | Unset; optional knowledge checkout included in the fresh agent's task context | `bin/task-loop` |
+| `R2_ENDPOINT`, `R2_BUCKET` | No defaults; required endpoint and bucket for uploads | `bin/task-data` |
+| `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | No defaults; required upload credentials, passed to the AWS CLI | `bin/task-data` |
+| `R2_PREFIX` | `task-server`; uploaded archive key prefix | `bin/task-data` |
+
+`import-sqlite` takes its source database and new destination as positional
+arguments. It does not read application storage settings. Loop options and local
+snapshot/restore paths are CLI arguments; see each command's `--help`.
+
+The [sandbox deployment](https://github.com/miyabisun/sandbox-server/blob/main/README.md#ローカル設定)
+owns `TASK_SERVER_DATA_DIR` (host bind directory), `TASK_SERVER_UID` and
+`TASK_SERVER_GID` (host file ownership), plus backup-wrapper settings.
+The [home deployment](https://github.com/miyabisun/home-server/blob/main/docs/task-server.md)
+owns its named volume and backup service. Both Compose files pass application
+settings explicitly; a shared deployment env file is not the server's env file.
+Deployment defaults and secret storage belong to those repositories.
 
 ## API
 
