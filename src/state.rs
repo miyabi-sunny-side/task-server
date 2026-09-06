@@ -4,7 +4,6 @@ use crate::{
     ledger::Store,
 };
 use std::{env, path::PathBuf, sync::Arc};
-pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3000";
 pub const DEFAULT_DATA_DIR: &str = "data/ledger";
 #[derive(Clone)]
 pub struct AppState {

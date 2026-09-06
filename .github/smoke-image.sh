@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Exercise the image with its default empty ledger and no backup configuration.
 set -euo pipefail
-image=${1:?usage: smoke-image.sh IMAGE}
-container=$(docker run --detach --publish 127.0.0.1::3000 "$image")
+image=${1:?usage: smoke-image.sh IMAGE [PORT]}
+listen_port=${2:-3000}
+container=$(docker run --detach --env PORT="$listen_port" --env APP_BIND_ADDR=invalid-legacy-address --publish "127.0.0.1::$listen_port" "$image")
 trap 'docker rm --force --volumes "$container" >/dev/null' EXIT
-port=$(docker port "$container" 3000/tcp)
+port=$(docker port "$container" "$listen_port/tcp")
 base="http://$port"
 
 for attempt in {1..40}; do

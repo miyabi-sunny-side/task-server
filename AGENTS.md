@@ -48,9 +48,10 @@ existing destinations are never overwritten. Old automatic pipeline rules are re
 
 ## Network and backup
 
-The default bind is loopback. HTTP and MCP surfaces rely on the existing trusted
-LAN/tailnet boundary. The app does not authenticate callers or treat identity
-headers as proof of identity. Preserve the deployment exposure and task claim,
+The listener binds all IPv4 interfaces on `PORT` (default 3000). Deployment owns
+the published interfaces and existing trusted LAN/tailnet boundary for HTTP and
+MCP. The app does not authenticate callers or treat identity headers as proof of
+identity. Preserve the deployment exposure and task claim,
 lease, state and history constraints.
 
 Backups are external: `GET /worker/snapshot` exports all collections under the

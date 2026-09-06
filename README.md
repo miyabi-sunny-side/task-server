@@ -24,11 +24,15 @@ run `cargo build --locked --release` after the frontend build and copy only
 | Variable | Default / purpose |
 |---|---|
 | `APP_DATA_DIR` | `data/ledger`, Markdown records |
-| `APP_BIND_ADDR` | `127.0.0.1:3000` |
+| `PORT` | `3000`; decimal TCP port from `1` to `65535`. Invalid values fail startup with a `PORT` error. |
 | `LOG_LEVEL` | `info`; accepts exactly `off`, `error`, `warn`, `info`, `debug`, or `trace`. Unset or invalid values use `info`. |
 | `CLAIM_TTL_SECS` | Claim lifetime; the loop sends heartbeats |
 
-The container listens on port 3000 and stores records below `/app/data/ledger`.
+The server listens on `0.0.0.0:${PORT}` in both native and container runs. Native
+runs therefore accept connections on all IPv4 interfaces. `APP_BIND_ADDR` is no
+longer read. For example, `PORT=3100 cargo run --locked` serves port 3100.
+The container defaults to port 3000 and stores records below `/app/data/ledger`.
+When overriding it, pass `-e PORT=3100 -p 127.0.0.1:3100:3100` to `docker run`.
 Publish it on loopback behind the existing trusted LAN/tailnet ingress. HTTP
 and MCP endpoints rely on that network boundary. The app does not authenticate
 callers, require identity headers or provide a browser session API. Claim ownership,
