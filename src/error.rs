@@ -6,8 +6,6 @@ use axum::{
 use serde_json::json;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("unauthorized")]
-    Unauthorized,
     #[error("{0}")]
     NotFound(String),
     #[error("{0}")]
@@ -44,7 +42,6 @@ impl Error {
     #[must_use]
     pub fn code(&self) -> &'static str {
         match self {
-            Self::Unauthorized => "unauthorized",
             Self::NotFound(_) => "not_found",
             Self::Invalid(_) => "invalid",
             Self::Conflict(_) => "conflict",
@@ -58,7 +55,6 @@ impl Error {
     #[must_use]
     pub fn status(&self) -> StatusCode {
         match self {
-            Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Invalid(_) => StatusCode::BAD_REQUEST,
             Self::Conflict(_) => StatusCode::CONFLICT,

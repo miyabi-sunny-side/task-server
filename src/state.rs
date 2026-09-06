@@ -9,7 +9,6 @@ pub const DEFAULT_DATA_DIR: &str = "data/ledger";
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
-    pub dev_identity: Option<String>,
     pub claim_ttl_secs: u64,
     pub clock: Arc<dyn Clock>,
 }
@@ -17,7 +16,6 @@ impl AppState {
     pub fn new(store: Store) -> Self {
         Self {
             store: Arc::new(store),
-            dev_identity: None,
             claim_ttl_secs: 3600,
             clock: Arc::new(SystemClock),
         }
@@ -26,7 +24,6 @@ impl AppState {
         Self::from_vars(|key| env::var(key).ok())
     }
     pub fn from_vars(get: impl Fn(&str) -> Option<String>) -> Result<Self, Error> {
-        let production = get("TASK_SERVER_ENV").as_deref() == Some("production");
         let ttl = get("CLAIM_TTL_SECS")
             .unwrap_or_else(|| "3600".into())
             .parse::<u64>()
@@ -52,8 +49,6 @@ impl AppState {
         }
         let mut s = Self::new(Store::open(data_dir)?);
         s.claim_ttl_secs = ttl;
-        s.dev_identity =
-            (!production).then(|| get("APP_DEV_IDENTITY").unwrap_or_else(|| "miyabi".into()));
         Ok(s)
     }
     #[must_use]

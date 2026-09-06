@@ -25,12 +25,13 @@ run `cargo build --locked --release` after the frontend build and copy only
 |---|---|
 | `APP_DATA_DIR` | `data/ledger`, Markdown records |
 | `APP_BIND_ADDR` | `127.0.0.1:3000` |
-| `TASK_SERVER_ENV` | Set `production` behind trusted ingress |
 | `CLAIM_TTL_SECS` | Claim lifetime; the loop sends heartbeats |
 
 The container listens on port 3000 and stores records below `/app/data/ledger`.
-Publish it on loopback behind the existing authenticated/trusted ingress. Worker
-and MCP endpoints are trusted-network surfaces, not public endpoints.
+Publish it on loopback behind the existing trusted LAN/tailnet ingress. HTTP
+and MCP endpoints rely on that network boundary. The app does not authenticate
+callers, require identity headers or provide a browser session API. Claim ownership,
+lease checks, state transitions and history remain part of task management.
 
 ## Files and progress
 
@@ -90,8 +91,7 @@ MCP tools use flat arguments:
   unknown frontmatter, and archive history. It prevents new runnable work.
 
 Human HTTP has `GET /api/products`, `GET /api/products/{org}/{repo}`, create-only
-`PUT /api/products/{org}/{repo}`, and partial `PATCH` at the same path. Mutations
-retain ingress identity checks. The trusted worker read is
+`PUT /api/products/{org}/{repo}`, and partial `PATCH` at the same path. The worker read is
 `GET /worker/products/{org}/{repo}`. Product policy does not authorize a particular
 execution: its user's permission or restriction still applies. Unknown policy
 must be resolved before publication, and `false` must not be treated as unknown.

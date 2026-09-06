@@ -26,7 +26,6 @@ pub use state::AppState;
 pub fn app(state: AppState) -> Router {
     let api = Router::new()
         .route("/health", get(http::api_health))
-        .route("/session", get(http::api_session))
         .route("/tasks", get(http::api_tasks).post(http::api_create_task))
         .route(
             "/tasks/{id}",

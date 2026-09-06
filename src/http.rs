@@ -2,35 +2,21 @@ use crate::{AppState, Error, product, runs, task};
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-fn identity(h: &HeaderMap, s: &AppState) -> Result<String, Error> {
-    ["x-auth-user", "tailscale-user-login"]
-        .iter()
-        .find_map(|k| h.get(*k).and_then(|v| v.to_str().ok()))
-        .or(s.dev_identity.as_deref())
-        .filter(|v| !v.trim().is_empty())
-        .map(str::to_owned)
-        .ok_or(Error::Unauthorized)
-}
 pub async fn healthz() -> &'static str {
     "ok\n"
 }
 pub async fn api_health() -> Json<Value> {
     Json(json!({"status":"ok"}))
 }
-pub async fn api_session(State(s): State<AppState>, h: HeaderMap) -> Result<Json<Value>, Error> {
-    Ok(Json(json!({"user":identity(&h,&s)?})))
-}
 pub async fn api_tasks(
     State(s): State<AppState>,
-    h: HeaderMap,
     Query(q): Query<BTreeMap<String, String>>,
 ) -> Result<Json<Value>, Error> {
-    identity(&h, &s)?;
     let mut ts = if q.get("archived").is_some_and(|v| v == "true") {
         s.store
             .list("tasks")?
@@ -49,46 +35,36 @@ pub async fn api_tasks(
 }
 pub async fn api_task(
     State(s): State<AppState>,
-    h: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, Error> {
-    identity(&h, &s)?;
     Ok(Json(task::card(&s, &id)?))
 }
 pub async fn api_create_task(
     State(s): State<AppState>,
-    h: HeaderMap,
     Json(v): Json<Value>,
 ) -> Result<(StatusCode, Json<Value>), Error> {
-    identity(&h, &s)?;
     Ok((StatusCode::CREATED, Json(task::create(&s, v)?)))
 }
 pub async fn api_patch_task(
     State(s): State<AppState>,
-    h: HeaderMap,
     Path(id): Path<String>,
     Json(v): Json<Value>,
 ) -> Result<Json<Value>, Error> {
-    identity(&h, &s)?;
     task::patch(&s, &id, v)?;
     Ok(Json(task::card(&s, &id)?))
 }
 pub async fn api_delete_task(
     State(s): State<AppState>,
-    h: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, Error> {
-    identity(&h, &s)?;
     task::delete(&s, &id)?;
     Ok(StatusCode::NO_CONTENT)
 }
 pub async fn api_set_status(
     State(s): State<AppState>,
-    h: HeaderMap,
     Path(id): Path<String>,
     Json(v): Json<Value>,
 ) -> Result<Json<Value>, Error> {
-    identity(&h, &s)?;
     task::set_status(&s, &id, task::string(&v, "status"))?;
     Ok(Json(task::card(&s, &id)?))
 }
@@ -105,24 +81,20 @@ fn history(s: &AppState, done: bool) -> Result<Value, Error> {
     ts.sort_by(|a, b| task::string(b, "closed_at").cmp(task::string(a, "closed_at")));
     Ok(json!(ts.iter().map(task::summary).collect::<Vec<_>>()))
 }
-pub async fn api_done(State(s): State<AppState>, h: HeaderMap) -> Result<Json<Value>, Error> {
-    identity(&h, &s)?;
+pub async fn api_done(State(s): State<AppState>) -> Result<Json<Value>, Error> {
     Ok(Json(history(&s, true)?))
 }
-pub async fn api_closed(State(s): State<AppState>, h: HeaderMap) -> Result<Json<Value>, Error> {
-    identity(&h, &s)?;
+pub async fn api_closed(State(s): State<AppState>) -> Result<Json<Value>, Error> {
     Ok(Json(history(&s, false)?))
 }
-pub async fn api_control(State(s): State<AppState>, h: HeaderMap) -> Result<Json<Value>, Error> {
-    identity(&h, &s)?;
+pub async fn api_control(State(s): State<AppState>) -> Result<Json<Value>, Error> {
     let ts = task::list(&s, Some("blocked"))?;
     let stuck=ts.iter().map(|t|json!({"task_id":t["id"],"kind":t["kind"],"status":"blocked","since":t["updated_at"],"reason":"blocked"})).collect::<Vec<_>>();
     Ok(Json(
         json!({"mergeable":[],"pending_merges":[],"pending_releases":[],"pending_reviews":[],"unreviewed":[],"releasable":[],"stuck":stuck}),
     ))
 }
-pub async fn api_products(State(s): State<AppState>, h: HeaderMap) -> Result<Json<Value>, Error> {
-    identity(&h, &s)?;
+pub async fn api_products(State(s): State<AppState>) -> Result<Json<Value>, Error> {
     Ok(Json(json!(
         s.store
             .list("products")?
@@ -133,28 +105,22 @@ pub async fn api_products(State(s): State<AppState>, h: HeaderMap) -> Result<Jso
 }
 pub async fn api_product(
     State(s): State<AppState>,
-    h: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, Error> {
-    identity(&h, &s)?;
     Ok(Json(s.store.get("products", &id)?))
 }
 pub async fn api_put_product(
     State(s): State<AppState>,
-    h: HeaderMap,
     Path(id): Path<String>,
     Json(v): Json<Value>,
 ) -> Result<Json<Value>, Error> {
-    identity(&h, &s)?;
     Ok(Json(product::put(&s, &id, v)?))
 }
 pub async fn api_patch_product(
     State(s): State<AppState>,
-    h: HeaderMap,
     Path(id): Path<String>,
     Json(v): Json<Value>,
 ) -> Result<Json<Value>, Error> {
-    identity(&h, &s)?;
     Ok(Json(product::update(&s, &id, v)?))
 }
 pub async fn worker_product(
@@ -198,10 +164,8 @@ pub async fn worker_runs(
 }
 pub async fn api_runs_post(
     State(s): State<AppState>,
-    h: HeaderMap,
     Json(v): Json<Value>,
 ) -> Result<Json<Value>, Error> {
-    identity(&h, &s)?;
     Ok(Json(runs::append(&s, v, true)?))
 }
 fn filtered_runs(s: &AppState, q: &BTreeMap<String, String>) -> Result<Vec<Value>, Error> {
@@ -218,10 +182,8 @@ fn filtered_runs(s: &AppState, q: &BTreeMap<String, String>) -> Result<Vec<Value
 }
 pub async fn api_runs(
     State(s): State<AppState>,
-    h: HeaderMap,
     Query(q): Query<BTreeMap<String, String>>,
 ) -> Result<Json<Value>, Error> {
-    identity(&h, &s)?;
     let since = q
         .get("since")
         .map(|v| v.parse::<u64>())
@@ -250,10 +212,8 @@ pub async fn api_runs(
 }
 pub async fn api_runs_next(
     State(s): State<AppState>,
-    h: HeaderMap,
     Query(q): Query<BTreeMap<String, String>>,
 ) -> Result<Response, Error> {
-    identity(&h, &s)?;
     let mut rs = filtered_runs(&s, &q)?;
     rs.retain(|r| r["read_at"].is_null());
     rs.sort_by(|a, b| {
@@ -268,11 +228,9 @@ pub async fn api_runs_next(
 }
 pub async fn api_run_read(
     State(s): State<AppState>,
-    h: HeaderMap,
     Path(id): Path<String>,
     body: Option<Json<Value>>,
 ) -> Result<Json<Value>, Error> {
-    identity(&h, &s)?;
     Ok(Json(runs::read(
         &s,
         &id,
@@ -293,10 +251,8 @@ pub async fn worker_snapshot(State(s): State<AppState>) -> Result<Json<Value>, E
 
 pub async fn api_run(
     State(s): State<AppState>,
-    h: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, Error> {
-    identity(&h, &s)?;
     Ok(Json(crate::report::get(&s, &id)?))
 }
 
