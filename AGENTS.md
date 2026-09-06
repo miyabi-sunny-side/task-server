@@ -48,9 +48,9 @@ existing destinations are never overwritten. Old automatic pipeline rules are re
 
 ## Network and backup
 
-The default bind is loopback. Production human mutation requires ingress identity
-and `X-CSRF-Token`; `APP_CSRF_TOKEN` is required in production. Worker and MCP
-surfaces rely on trusted network ingress. Preserve this deployment boundary.
+The default bind is loopback. Production human requests require ingress identity.
+Worker and MCP surfaces rely on trusted network ingress. Preserve this deployment
+boundary.
 
 Backups are external: `GET /worker/snapshot` exports all collections under the
 writer lock. `bin/task-data` creates checksummed generations and restores to a new

@@ -1,16 +1,3 @@
-import { authHeaders, setSessionCsrf } from "./auth";
-
-export interface Session {
-  user: string;
-  csrf_token: string;
-}
-
-export async function loadSession(signal?: AbortSignal): Promise<Session> {
-  const session = await requestJson<Session>("/api/session", { signal });
-  setSessionCsrf(session.csrf_token);
-  return session;
-}
-
 export interface Milestone {
   report_id?: number;
   name: "implemented" | "verified" | "reviewed" | "merged" | "released";
@@ -153,13 +140,7 @@ function refusal(status: number, body: string): ApiError {
 }
 
 async function requestJson<T>(url: string, init: RequestInit = {}): Promise<T> {
-  const headers = new Headers(init.headers);
-  for (const [key, value] of Object.entries(authHeaders())) {
-    if (!headers.has(key)) {
-      headers.set(key, value);
-    }
-  }
-  const response = await fetch(url, { ...init, headers });
+  const response = await fetch(url, init);
   if (!response.ok) {
     throw refusal(response.status, await response.text());
   }

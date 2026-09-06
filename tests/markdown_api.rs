@@ -11,7 +11,6 @@ async fn request(
     path: &str,
     body: serde_json::Value,
     auth: bool,
-    csrf: bool,
 ) -> (StatusCode, serde_json::Value) {
     let mut r = Request::builder()
         .method(method)
@@ -19,9 +18,6 @@ async fn request(
         .header("content-type", "application/json");
     if auth {
         r = r.header("x-auth-user", "test");
-    }
-    if csrf {
-        r = r.header("x-csrf-token", "test-csrf");
     }
     let r = app
         .oneshot(r.body(Body::from(body.to_string())).unwrap())
@@ -83,25 +79,11 @@ async fn http_auth_retirement_snapshot_and_run_receipts() {
             "POST",
             "/api/tasks",
             json!({"title":"new"}),
-            false,
             false
         )
         .await
         .0,
         StatusCode::UNAUTHORIZED
-    );
-    assert_eq!(
-        request(
-            app.clone(),
-            "POST",
-            "/api/tasks",
-            json!({"title":"new"}),
-            true,
-            false
-        )
-        .await
-        .0,
-        StatusCode::FORBIDDEN
     );
     let (code, t) = request(
         app.clone(),
@@ -109,43 +91,26 @@ async fn http_auth_retirement_snapshot_and_run_receipts() {
         "/api/tasks",
         json!({"title":"new"}),
         true,
-        true,
     )
     .await;
     assert_eq!(code, StatusCode::CREATED);
     assert!(t["id"].is_string());
     assert_eq!(
-        request(app.clone(), "POST", "/api/merges", json!({}), true, true)
+        request(app.clone(), "POST", "/api/merges", json!({}), true)
             .await
             .0,
         StatusCode::GONE
     );
     let run =
         json!({"source":"worker","claim_id":"c","attempt":1,"task_id":t["id"],"note":"evidence"});
-    let (_, a) = request(
-        app.clone(),
-        "POST",
-        "/worker/runs",
-        run.clone(),
-        false,
-        false,
-    )
-    .await;
-    let (_, b) = request(app.clone(), "POST", "/worker/runs", run, false, false).await;
+    let (_, a) = request(app.clone(), "POST", "/worker/runs", run.clone(), false).await;
+    let (_, b) = request(app.clone(), "POST", "/worker/runs", run, false).await;
     assert_eq!(a["id"], b["id"]);
     let path = format!("/api/runs/{}/read", a["id"]);
-    let (code, r) = request(
-        app.clone(),
-        "POST",
-        &path,
-        json!({"note":"filed"}),
-        true,
-        false,
-    )
-    .await;
+    let (code, r) = request(app.clone(), "POST", &path, json!({"note":"filed"}), true).await;
     assert_eq!(code, StatusCode::OK);
     assert_eq!(r["read_note"], "filed");
-    let (_, snap) = request(app, "GET", "/worker/snapshot", json!({}), false, false).await;
+    let (_, snap) = request(app, "GET", "/worker/snapshot", json!({}), false).await;
     assert_eq!(snap["tasks"].as_array().unwrap().len(), 1);
     assert_eq!(snap["runs"].as_array().unwrap().len(), 1);
 }
@@ -252,7 +217,6 @@ async fn mcp_flat_crud_contract_over_json_rpc() {
         "/worker/report",
         payload.clone(),
         false,
-        false,
     )
     .await;
     assert_eq!(code, StatusCode::OK);
@@ -272,13 +236,12 @@ async fn mcp_flat_crud_contract_over_json_rpc() {
         &format!("/api/runs/{id}"),
         json!(null),
         true,
-        false,
     )
     .await;
     assert_eq!(code, StatusCode::OK);
     assert_eq!(original["body"], payload["report_markdown"]);
     assert_eq!(original["checks"][0]["exit_code"], 0);
-    let (_, repeated) = request(app, "POST", "/worker/report", payload, false, false).await;
+    let (_, repeated) = request(app, "POST", "/worker/report", payload, false).await;
     assert_eq!(repeated["report_id"], reported["report_id"]);
     assert_eq!(state.store.list("runs").unwrap().len(), 1);
 }
@@ -370,7 +333,7 @@ async fn list_shapes_summary_projection_and_haystack_cursor_contract() {
         .unwrap();
     let app = task_server::app(s.clone());
     for path in ["/api/tasks", "/api/done", "/api/closed", "/api/products"] {
-        let (status, list) = request(app.clone(), "GET", path, json!({}), true, false).await;
+        let (status, list) = request(app.clone(), "GET", path, json!({}), true).await;
         assert_eq!(status, StatusCode::OK);
         let list = list.as_array().unwrap();
         assert_eq!(list.len(), 1);
@@ -378,15 +341,7 @@ async fn list_shapes_summary_projection_and_haystack_cursor_contract() {
         assert!(list[0].get("body").is_none());
         assert!(list[0].get("last_report").is_none());
     }
-    let (_, detail) = request(
-        app.clone(),
-        "GET",
-        "/api/tasks/draft",
-        json!({}),
-        true,
-        false,
-    )
-    .await;
+    let (_, detail) = request(app.clone(), "GET", "/api/tasks/draft", json!({}), true).await;
     assert_eq!(detail["body"], "large body");
     assert!(detail.get("legacy").is_some());
     for attempt in [1, 2] {
@@ -397,15 +352,7 @@ async fn list_shapes_summary_projection_and_haystack_cursor_contract() {
         )
         .unwrap();
     }
-    let (_, first) = request(
-        app.clone(),
-        "GET",
-        "/api/runs?limit=1",
-        json!({}),
-        true,
-        false,
-    )
-    .await;
+    let (_, first) = request(app.clone(), "GET", "/api/runs?limit=1", json!({}), true).await;
     assert_eq!(first["next"], 1);
     let (_, last) = request(
         app.clone(),
@@ -413,7 +360,6 @@ async fn list_shapes_summary_projection_and_haystack_cursor_contract() {
         "/api/runs?since=1&limit=1",
         json!({}),
         true,
-        false,
     )
     .await;
     assert!(last["next"].is_null());
@@ -430,7 +376,7 @@ async fn list_shapes_summary_projection_and_haystack_cursor_contract() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let (_, unread) = request(app, "GET", "/api/runs?unread=true", json!({}), true, false).await;
+    let (_, unread) = request(app, "GET", "/api/runs?unread=true", json!({}), true).await;
     assert_eq!(unread["runs"].as_array().unwrap().len(), 1);
     assert_eq!(unread["runs"][0]["id"], 2);
 }
@@ -575,22 +521,14 @@ async fn explicit_product_mcp_updates_reach_http_and_worker_without_rescan() {
         ("/api/products/stable/id", true),
         ("/worker/products/stable%2Fid", false),
     ] {
-        let (status, actual) = request(app.clone(), "GET", path, json!(null), auth, false).await;
+        let (status, actual) = request(app.clone(), "GET", path, json!(null), auth).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(&actual, expected);
     }
-    let (_, list) = request(
-        app.clone(),
-        "GET",
-        "/api/products",
-        json!(null),
-        true,
-        false,
-    )
-    .await;
+    let (_, list) = request(app.clone(), "GET", "/api/products", json!(null), true).await;
     assert_eq!(list[0]["archived"], true);
     assert_eq!(list[0]["repository"], "https://example/canonical/repo");
-    let (status, _) = request(app, "POST", "/api/products/rescan", json!({}), true, true).await;
+    let (status, _) = request(app, "POST", "/api/products/rescan", json!({}), true).await;
     assert_eq!(status, StatusCode::GONE);
 }
 
@@ -870,4 +808,77 @@ async fn mcp_tool_schemas_reject_ignored_arguments() {
         ],
     )
     .await;
+}
+
+#[test]
+fn production_starts_without_browser_token_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::from_vars(|key| match key {
+        "TASK_SERVER_ENV" => Some("production".into()),
+        "APP_DATA_DIR" => Some(dir.path().to_string_lossy().into_owned()),
+        _ => None,
+    })
+    .unwrap();
+    assert_eq!(state.claim_ttl_secs, 3600);
+    assert!(state.dev_identity.is_none());
+}
+
+#[tokio::test]
+async fn browser_writes_preserve_validation_and_state_constraints() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = task_server::app(AppState::new(Store::open(dir.path()).unwrap()));
+    let (code, session) = request(app.clone(), "GET", "/api/session", json!({}), true).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(session, json!({"user":"test"}));
+    let (code, _) = request(app.clone(), "POST", "/api/tasks", json!({"title":""}), true).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    let (code, _) = request(
+        app.clone(),
+        "POST",
+        "/api/tasks",
+        json!({"id":"browser-write","title":"new"}),
+        true,
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED);
+    let (code, card) = request(
+        app.clone(),
+        "PATCH",
+        "/api/tasks/browser-write",
+        json!({"title":"edited"}),
+        true,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(card["title"], "edited");
+    let (code, _) = request(
+        app.clone(),
+        "POST",
+        "/api/tasks/browser-write/status",
+        json!({"status":"wip"}),
+        true,
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    let (code, _) = request(
+        app.clone(),
+        "DELETE",
+        "/api/tasks/browser-write",
+        json!({}),
+        true,
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    let (code, card) = request(
+        app.clone(),
+        "POST",
+        "/api/tasks/browser-write/status",
+        json!({"status":"cancelled"}),
+        true,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(card["status"], "cancelled");
+    let (code, _) = request(app, "DELETE", "/api/tasks/browser-write", json!({}), true).await;
+    assert_eq!(code, StatusCode::NO_CONTENT);
 }

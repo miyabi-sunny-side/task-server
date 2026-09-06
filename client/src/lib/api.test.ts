@@ -10,7 +10,6 @@ import {
   postTaskStatus,
   type TaskCard,
 } from "./api";
-import { setSessionCsrf } from "./auth";
 
 const CARD: TaskCard = {
   id: "alpha",
@@ -62,8 +61,7 @@ describe("api", () => {
     );
   });
 
-  it("posts a status transition with the auth headers and returns the card", async () => {
-    setSessionCsrf("csrf-token-1");
+  it("posts a status transition with JSON headers and returns the card", async () => {
     const fetchMock = vi
       .fn<typeof fetch>()
       .mockResolvedValue(jsonResponse(CARD));
@@ -78,7 +76,7 @@ describe("api", () => {
     expect(init?.body).toBe(JSON.stringify({ status: "ready" }));
     const headers = new Headers(init?.headers);
     expect(headers.get("content-type")).toBe("application/json");
-    expect(headers.get("X-CSRF-Token")).toBe("csrf-token-1");
+    expect([...headers.keys()]).toEqual(["content-type"]);
     expect(card).toEqual(CARD);
   });
 
@@ -120,8 +118,7 @@ describe("api", () => {
 
 describe("ledger writes", () => {
   afterEach(() => vi.unstubAllGlobals());
-  it("creates drafts and patches encoded task ids with CSRF", async () => {
-    setSessionCsrf("ledger-csrf");
+  it("creates drafts and patches encoded task ids without a session handshake", async () => {
     const fetchMock = vi
       .fn<typeof fetch>()
       .mockImplementation(async () => jsonResponse(CARD));
@@ -143,9 +140,9 @@ describe("ledger writes", () => {
       ["/api/tasks", "POST", fields],
       ["/api/tasks/a%20b", "PATCH", fields],
     ]);
-    expect(
-      new Headers(fetchMock.mock.calls[1][1]?.headers).get("X-CSRF-Token"),
-    ).toBe("ledger-csrf");
+    for (const [, init] of fetchMock.mock.calls) {
+      expect([...new Headers(init?.headers).keys()]).toEqual(["content-type"]);
+    }
   });
   it("reads a task's run history using its encoded filter and cursor", async () => {
     const fetchMock = vi

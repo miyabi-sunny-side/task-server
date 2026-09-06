@@ -8,8 +8,6 @@ use serde_json::json;
 pub enum Error {
     #[error("unauthorized")]
     Unauthorized,
-    #[error("forbidden")]
-    Forbidden,
     #[error("{0}")]
     NotFound(String),
     #[error("{0}")]
@@ -47,7 +45,6 @@ impl Error {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Unauthorized => "unauthorized",
-            Self::Forbidden => "forbidden",
             Self::NotFound(_) => "not_found",
             Self::Invalid(_) => "invalid",
             Self::Conflict(_) => "conflict",
@@ -62,7 +59,6 @@ impl Error {
     pub fn status(&self) -> StatusCode {
         match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
-            Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Invalid(_) => StatusCode::BAD_REQUEST,
             Self::Conflict(_) => StatusCode::CONFLICT,

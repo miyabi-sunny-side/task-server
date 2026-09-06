@@ -26,7 +26,6 @@ run `cargo build --locked --release` after the frontend build and copy only
 | `APP_DATA_DIR` | `data/ledger`, Markdown records |
 | `APP_BIND_ADDR` | `127.0.0.1:3000` |
 | `TASK_SERVER_ENV` | Set `production` behind trusted ingress |
-| `APP_CSRF_TOKEN` | Required in production for browser mutation |
 | `CLAIM_TTL_SECS` | Claim lifetime; the loop sends heartbeats |
 
 The container listens on port 3000 and stores records below `/app/data/ledger`.
@@ -92,7 +91,7 @@ MCP tools use flat arguments:
 
 Human HTTP has `GET /api/products`, `GET /api/products/{org}/{repo}`, create-only
 `PUT /api/products/{org}/{repo}`, and partial `PATCH` at the same path. Mutations
-retain ingress identity and CSRF checks. The trusted worker read is
+retain ingress identity checks. The trusted worker read is
 `GET /worker/products/{org}/{repo}`. Product policy does not authorize a particular
 execution: its user's permission or restriction still applies. Unknown policy
 must be resolved before publication, and `false` must not be treated as unknown.
@@ -231,7 +230,7 @@ is claimed. Configure retention on the backup destination to suit available spac
 
 ## API
 
-The browser uses `/api/session`, `/api/tasks`, `/api/tasks/{id}`,
+The browser uses `/api/tasks`, `/api/tasks/{id}`,
 `/api/tasks/{id}/status`, `/api/closed`, `/api/products` and `/api/runs`.
 MCP CRUD remains available at `/mcp`. `/worker/claim`, `/worker/heartbeat`,
 `/worker/report` and `/worker/runs` serve the small loop. `/worker/snapshot`

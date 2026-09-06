@@ -1,6 +1,5 @@
 <script lang="ts">
   import Header from "./lib/Header.svelte";
-  import { loadSession } from "./lib/api";
   import { initRouter, router } from "./lib/router.svelte";
   import Detail from "./pages/Detail.svelte";
   import Closed from "./pages/Closed.svelte";
@@ -8,7 +7,6 @@
   import Products from "./pages/Products.svelte";
 
   $effect(() => {
-    void loadSession();
     initRouter();
   });
 </script>

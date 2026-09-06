@@ -16,16 +16,6 @@ fn identity(h: &HeaderMap, s: &AppState) -> Result<String, Error> {
         .map(str::to_owned)
         .ok_or(Error::Unauthorized)
 }
-fn mutation(h: &HeaderMap, s: &AppState) -> Result<(), Error> {
-    identity(h, s)?;
-    if h.get("x-csrf-token").and_then(|v| v.to_str().ok()) == Some(s.csrf_token.as_str())
-        && !s.csrf_token.is_empty()
-    {
-        Ok(())
-    } else {
-        Err(Error::Forbidden)
-    }
-}
 pub async fn healthz() -> &'static str {
     "ok\n"
 }
@@ -33,9 +23,7 @@ pub async fn api_health() -> Json<Value> {
     Json(json!({"status":"ok"}))
 }
 pub async fn api_session(State(s): State<AppState>, h: HeaderMap) -> Result<Json<Value>, Error> {
-    Ok(Json(
-        json!({"user":identity(&h,&s)?,"csrf_token":s.csrf_token}),
-    ))
+    Ok(Json(json!({"user":identity(&h,&s)?})))
 }
 pub async fn api_tasks(
     State(s): State<AppState>,
@@ -72,7 +60,7 @@ pub async fn api_create_task(
     h: HeaderMap,
     Json(v): Json<Value>,
 ) -> Result<(StatusCode, Json<Value>), Error> {
-    mutation(&h, &s)?;
+    identity(&h, &s)?;
     Ok((StatusCode::CREATED, Json(task::create(&s, v)?)))
 }
 pub async fn api_patch_task(
@@ -81,7 +69,7 @@ pub async fn api_patch_task(
     Path(id): Path<String>,
     Json(v): Json<Value>,
 ) -> Result<Json<Value>, Error> {
-    mutation(&h, &s)?;
+    identity(&h, &s)?;
     task::patch(&s, &id, v)?;
     Ok(Json(task::card(&s, &id)?))
 }
@@ -90,7 +78,7 @@ pub async fn api_delete_task(
     h: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, Error> {
-    mutation(&h, &s)?;
+    identity(&h, &s)?;
     task::delete(&s, &id)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -100,7 +88,7 @@ pub async fn api_set_status(
     Path(id): Path<String>,
     Json(v): Json<Value>,
 ) -> Result<Json<Value>, Error> {
-    mutation(&h, &s)?;
+    identity(&h, &s)?;
     task::set_status(&s, &id, task::string(&v, "status"))?;
     Ok(Json(task::card(&s, &id)?))
 }
@@ -157,7 +145,7 @@ pub async fn api_put_product(
     Path(id): Path<String>,
     Json(v): Json<Value>,
 ) -> Result<Json<Value>, Error> {
-    mutation(&h, &s)?;
+    identity(&h, &s)?;
     Ok(Json(product::put(&s, &id, v)?))
 }
 pub async fn api_patch_product(
@@ -166,7 +154,7 @@ pub async fn api_patch_product(
     Path(id): Path<String>,
     Json(v): Json<Value>,
 ) -> Result<Json<Value>, Error> {
-    mutation(&h, &s)?;
+    identity(&h, &s)?;
     Ok(Json(product::update(&s, &id, v)?))
 }
 pub async fn worker_product(
@@ -213,7 +201,7 @@ pub async fn api_runs_post(
     h: HeaderMap,
     Json(v): Json<Value>,
 ) -> Result<Json<Value>, Error> {
-    mutation(&h, &s)?;
+    identity(&h, &s)?;
     Ok(Json(runs::append(&s, v, true)?))
 }
 fn filtered_runs(s: &AppState, q: &BTreeMap<String, String>) -> Result<Vec<Value>, Error> {

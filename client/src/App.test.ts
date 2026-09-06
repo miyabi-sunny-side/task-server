@@ -42,16 +42,7 @@ describe("App", () => {
       "fetch",
       vi
         .fn<typeof fetch>()
-        .mockImplementation(
-          async (input) =>
-            new Response(
-              JSON.stringify(
-                String(input) === "/api/session"
-                  ? { user: "test", csrf_token: "test" }
-                  : [],
-              ),
-            ),
-        ),
+        .mockImplementation(async () => new Response(JSON.stringify([]))),
     );
     window.history.replaceState(null, "", "/products");
     render(App);
@@ -118,9 +109,7 @@ describe("App", () => {
                   unreviewed: [],
                   releasable: [],
                 }
-              : url === "/api/session"
-                ? { user: "test", csrf_token: "test-csrf" }
-                : TASK;
+              : TASK;
         return Promise.resolve(
           new Response(JSON.stringify(payload), { status: 200 }),
         );
