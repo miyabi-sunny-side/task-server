@@ -764,10 +764,9 @@ async fn mcp_tool_schemas_reject_ignored_arguments() {
 }
 
 #[test]
-fn starts_without_identity_configuration() {
+fn starts_without_environment_mode_or_identity_configuration() {
     let dir = tempfile::tempdir().unwrap();
     let state = AppState::from_vars(|key| match key {
-        "TASK_SERVER_ENV" => Some("production".into()),
         "APP_DATA_DIR" => Some(dir.path().to_string_lossy().into_owned()),
         _ => None,
     })
