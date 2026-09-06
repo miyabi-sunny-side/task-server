@@ -20,8 +20,6 @@ done
 
 test "$(curl --fail --silent "$base/healthz")" = "ok"
 test "$(curl --fail --silent "$base/api/health")" = '{"status":"ok"}'
-curl --fail --silent "$base/" | grep --ignore-case '<!doctype html'
-test "$(curl --silent --output /dev/null --write-out '%{http_code}' "$base/api/missing")" = "404"
-test "$(curl --silent --output /dev/null --write-out '%{http_code}' "$base/projects/example")" = "200"
-docker exec "$container" sh -c 'test "$(id -u)" != 0 && test -d /app/data/ledger/tasks && test -w /app/data/ledger/tasks'
+python3 "$(dirname "$0")/smoke-ui.py" "$base"
+docker exec "$container" sh -c 'test "$(id -u)" != 0 && test -d /app/data/ledger/tasks && test -w /app/data/ledger/tasks && test ! -e /app/client'
 curl --fail --silent "$base/worker/snapshot" | python3 -c 'import json,sys; assert "tasks" in json.load(sys.stdin)'

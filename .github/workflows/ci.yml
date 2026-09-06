@@ -56,3 +56,28 @@ jobs:
 
       - name: Test Rust
         run: cargo test --locked
+
+      - name: Smoke-test the standalone binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked
+          smoke_dir=$(mktemp -d)
+          cp target/debug/task-server "$smoke_dir/"
+          (
+            cd "$smoke_dir"
+            exec ./task-server
+          ) >"$smoke_dir/server.log" 2>&1 &
+          server_pid=$!
+          trap 'kill -INT "$server_pid" 2>/dev/null || true; wait "$server_pid" || true; rm -rf "$smoke_dir"' EXIT
+          for attempt in {1..40}; do
+            if curl --fail --silent http://127.0.0.1:3000/healthz >/dev/null; then
+              break
+            fi
+            if [[ "$attempt" == 40 ]]; then
+              cat "$smoke_dir/server.log"
+              exit 1
+            fi
+            sleep 0.5
+          done
+          python3 .github/smoke-ui.py http://127.0.0.1:3000

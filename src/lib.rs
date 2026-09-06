@@ -1,12 +1,13 @@
 #![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 use axum::{
     Router,
+    http::{Uri, header},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
-use tower_http::{
-    services::{ServeDir, ServeFile},
-    trace::TraceLayer,
-};
+use tower_http::trace::TraceLayer;
+
+static UI: include_dir::Dir<'_> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/client/dist");
 pub mod checkpoint;
 pub mod clock;
 pub mod error;
@@ -23,7 +24,6 @@ pub use clock::{Clock, SharedClock, SystemClock, format_z};
 pub use error::Error;
 pub use state::AppState;
 pub fn app(state: AppState) -> Router {
-    let static_dir = state.static_dir.clone();
     let api = Router::new()
         .route("/health", get(http::api_health))
         .route("/session", get(http::api_session))
@@ -56,6 +56,8 @@ pub fn app(state: AppState) -> Router {
         .fallback(http::api_not_found);
     Router::new()
         .route("/healthz", get(http::healthz))
+        .route("/api", axum::routing::any(http::api_not_found))
+        .route("/api/", axum::routing::any(http::api_not_found))
         .nest("/api", api)
         .route("/worker/products/{*id}", get(http::worker_product))
         .route("/worker/claim", post(http::worker_claim))
@@ -70,9 +72,22 @@ pub fn app(state: AppState) -> Router {
         .route("/worker/claim/release", post(http::retired))
         .route("/worker/review-report", post(http::retired))
         .merge(mcp::endpoints(&state))
-        .fallback_service(
-            ServeDir::new(&static_dir).fallback(ServeFile::new(static_dir.join("index.html"))),
-        )
+        .fallback_service(get(ui))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn ui(uri: Uri) -> Response {
+    let file = UI
+        .get_file(uri.path().trim_start_matches('/'))
+        .unwrap_or_else(|| {
+            UI.get_file("index.html")
+                .expect("build requires index.html")
+        });
+    let content_type = mime_guess::from_path(file.path()).first_or_octet_stream();
+    (
+        [(header::CONTENT_TYPE, content_type.as_ref())],
+        file.contents(),
+    )
+        .into_response()
 }

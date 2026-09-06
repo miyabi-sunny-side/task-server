@@ -15,11 +15,16 @@ APP_DATA_DIR=data/ledger cargo run --locked
 Open `http://127.0.0.1:3000`. The browser lists active work and history, edits tasks,
 shows stopping reasons and milestone evidence, and resumes blocked work.
 
+The Rust build embeds `client/dist` in the binary, so build the frontend first
+for both development and release builds. After changing frontend files, rebuild
+the frontend and restart `cargo run` to embed the new assets. For distribution,
+run `cargo build --locked --release` after the frontend build and copy only
+`target/release/task-server`; no UI directory is needed at runtime.
+
 | Variable | Default / purpose |
 |---|---|
 | `APP_DATA_DIR` | `data/ledger`, Markdown records |
 | `APP_BIND_ADDR` | `127.0.0.1:3000` |
-| `APP_STATIC_DIR` | `client/dist` |
 | `TASK_SERVER_ENV` | Set `production` behind trusted ingress |
 | `APP_CSRF_TOKEN` | Required in production for browser mutation |
 | `CLAIM_TTL_SECS` | Claim lifetime; the loop sends heartbeats |

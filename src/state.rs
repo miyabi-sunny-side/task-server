@@ -9,7 +9,6 @@ pub const DEFAULT_DATA_DIR: &str = "data/ledger";
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
-    pub static_dir: PathBuf,
     pub csrf_token: String,
     pub dev_identity: Option<String>,
     pub claim_ttl_secs: u64,
@@ -19,7 +18,6 @@ impl AppState {
     pub fn new(store: Store) -> Self {
         Self {
             store: Arc::new(store),
-            static_dir: "client/dist".into(),
             csrf_token: "test-csrf".into(),
             dev_identity: None,
             claim_ttl_secs: 3600,
@@ -61,9 +59,6 @@ impl AppState {
         let mut s = Self::new(Store::open(data_dir)?);
         s.csrf_token = csrf;
         s.claim_ttl_secs = ttl;
-        s.static_dir = get("APP_STATIC_DIR")
-            .unwrap_or_else(|| "client/dist".into())
-            .into();
         s.dev_identity =
             (!production).then(|| get("APP_DEV_IDENTITY").unwrap_or_else(|| "miyabi".into()));
         Ok(s)
