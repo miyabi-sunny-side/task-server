@@ -25,6 +25,7 @@ run `cargo build --locked --release` after the frontend build and copy only
 |---|---|
 | `APP_DATA_DIR` | `data/ledger`, Markdown records |
 | `APP_BIND_ADDR` | `127.0.0.1:3000` |
+| `LOG_LEVEL` | `info`; accepts exactly `off`, `error`, `warn`, `info`, `debug`, or `trace`. Unset or invalid values use `info`. |
 | `CLAIM_TTL_SECS` | Claim lifetime; the loop sends heartbeats |
 
 The container listens on port 3000 and stores records below `/app/data/ledger`.
