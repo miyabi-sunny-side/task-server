@@ -370,6 +370,24 @@ pub fn heartbeat(s: &AppState, id: &str) -> Result<Value, Error> {
         Ok(envelope(a.put("tasks", &tid, t)?))
     })
 }
+pub(crate) fn finish_report(t: &mut Value, outcome: &Value, now: &str) {
+    t["last_claim_id"] = t["claim_id"].take();
+    t["lease_expires_at"] = Value::Null;
+    t["status"] = outcome.clone();
+    t["updated_at"] = json!(now);
+    t["blocked_by"] = if outcome == "blocked" {
+        json!("worker")
+    } else {
+        Value::Null
+    };
+    if outcome == "done" {
+        if t["done_at"].is_null() {
+            t["done_at"] = json!(now);
+        }
+        t["closed_at"] = json!(now);
+    }
+}
+
 pub fn report(s: &AppState, v: Value) -> Result<Value, Error> {
     if v.get("report_markdown").is_some() {
         return crate::report::submit(s, &v);
@@ -406,21 +424,7 @@ pub fn report(s: &AppState, v: Value) -> Result<Value, Error> {
         }
         t["report_id"] = Value::Null;
         t["last_report"] = v.clone();
-        t["last_claim_id"] = t["claim_id"].take();
-        t["lease_expires_at"] = Value::Null;
-        t["status"] = json!(outcome);
-        t["updated_at"] = json!(now);
-        t["blocked_by"] = if outcome == "blocked" {
-            json!("worker")
-        } else {
-            Value::Null
-        };
-        if outcome == "done" {
-            if t["done_at"].is_null() {
-                t["done_at"] = json!(now);
-            }
-            t["closed_at"] = json!(now);
-        }
+        finish_report(&mut t, &v["outcome"], &now);
         let id = required(&t, "id")?;
         a.put("tasks", &id, t)
     })

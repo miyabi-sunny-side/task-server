@@ -24,6 +24,47 @@ fn setup() -> (tempfile::TempDir, AppState, SharedClock, serde_json::Value) {
 }
 
 #[test]
+fn both_report_formats_preserve_lifecycle_across_reopened_executions() {
+    for prose in ["summary", "report_markdown"] {
+        let (_dir, state, clock, mut claim) = setup();
+        let mut done_at = serde_json::Value::Null;
+        let mut closed_at = serde_json::Value::Null;
+        for outcome in ["blocked", "done", "blocked", "done"] {
+            clock.advance_secs(1);
+            let now = json!(task_server::format_z(task_server::Clock::now(&clock)));
+            let payload = json!({"claim_id":claim["claim_id"],"outcome":outcome,prose:"result"});
+            let record = task::report(&state, payload.clone()).unwrap();
+            if outcome == "done" {
+                if done_at.is_null() {
+                    done_at = now.clone();
+                }
+                closed_at = now.clone();
+            }
+            assert_eq!(record["status"], outcome);
+            assert!(record["claim_id"].is_null());
+            assert!(record["lease_expires_at"].is_null());
+            assert_eq!(record["last_claim_id"], claim["claim_id"]);
+            assert_eq!(record["updated_at"], now);
+            assert_eq!(record["done_at"], done_at);
+            assert_eq!(record["closed_at"], closed_at);
+            assert_eq!(
+                record["blocked_by"],
+                if outcome == "blocked" {
+                    json!("worker")
+                } else {
+                    serde_json::Value::Null
+                }
+            );
+            clock.advance_secs(1);
+            assert_eq!(task::report(&state, payload).unwrap(), record);
+            assert!(task::heartbeat(&state, claim["claim_id"].as_str().unwrap()).is_err());
+            task::set_status(&state, "t", "ready").unwrap();
+            claim = task::claim(&state, "worker").unwrap().unwrap();
+        }
+    }
+}
+
+#[test]
 fn report_stores_one_raw_document_and_references_without_inventing_verification() {
     let (dir, state, _, claim) = setup();
     let raw = format!(

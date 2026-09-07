@@ -115,21 +115,7 @@ fn apply(mut t: Value, run: &Value) -> Result<Value, Error> {
     ids.push(run["id"].clone());
     t["report_ids"] = json!(ids);
     // Historical legacy prose/evidence stays intact; new prose lives only in run.body.
-    t["last_claim_id"] = t["claim_id"].take();
-    t["lease_expires_at"] = Value::Null;
-    t["status"] = v["outcome"].clone();
-    t["updated_at"] = json!(now);
-    t["blocked_by"] = if v["outcome"] == "blocked" {
-        json!("worker")
-    } else {
-        Value::Null
-    };
-    if v["outcome"] == "done" {
-        if t["done_at"].is_null() {
-            t["done_at"] = json!(now);
-        }
-        t["closed_at"] = json!(now);
-    }
+    task::finish_report(&mut t, &v["outcome"], now);
     Ok(t)
 }
 
