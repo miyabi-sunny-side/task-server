@@ -21,14 +21,21 @@ the frontend and restart `cargo run` to embed the new assets. For distribution,
 run `cargo build --locked --release` after the frontend build and copy only
 `target/release/task-server`; no UI directory is needed at runtime.
 
-The server reads these application settings:
+## Environment variables
 
-| Variable | Default / purpose | Owner |
-|---|---|---|
-| `APP_DATA_DIR` | `data/ledger`, relative to the working directory; Markdown records | `src/state.rs` |
-| `PORT` | `3000`; decimal TCP port from `1` to `65535`. Invalid values fail startup with a `PORT` error. | `src/port.rs` |
-| `LOG_LEVEL` | `info`; accepts exactly `off`, `error`, `warn`, `info`, `debug`, or `trace`. Unset or invalid values use `info`. | `src/logging.rs` |
-| `CLAIM_TTL_SECS` | `3600` seconds; integer in `1..86400`. A claim and each heartbeat set the lease expiry to the current time plus this lifetime. Invalid values fail startup. | `src/state.rs`, `src/task.rs` |
+All four application settings are optional and are read at startup. Helper CLI
+settings are listed separately under [Helper and deployment settings](#helper-and-deployment-settings).
+
+| Variable | Default when unset | Purpose / invalid values | Reader |
+| --- | --- | --- | --- |
+| `APP_DATA_DIR` | `data/ledger` | Markdown ledger path, relative to the working directory. Missing directories are created. Blank paths, inaccessible storage or an already-locked ledger fail startup; an empty ledger beside a legacy `task-server.db` requires explicit import. | [`src/state.rs`](src/state.rs), [`src/ledger.rs`](src/ledger.rs) |
+| `PORT` | `3000` | Decimal TCP port from `1` to `65535`. Empty, non-Unicode, signed, whitespace-padded, nonnumeric or out-of-range values fail startup with a `PORT` error. | [`src/port.rs`](src/port.rs) |
+| `LOG_LEVEL` | `info` | Logging verbosity: exactly `off`, `error`, `warn`, `info`, `debug`, or `trace`. Empty, non-Unicode or invalid values (including uppercase and module filters) use `info`. | [`src/logging.rs`](src/logging.rs) |
+| `CLAIM_TTL_SECS` | `3600` seconds | Integer from `1` through `86400`, inclusive. A claim and each heartbeat set expiry to now plus this lifetime. Empty, nonnumeric, whitespace-padded or out-of-range values fail startup. | [`src/state.rs`](src/state.rs), [`src/task.rs`](src/task.rs) |
+
+Non-Unicode `APP_DATA_DIR` and `CLAIM_TTL_SECS` values are treated as unset.
+The former `RUST_LOG` is ignored; use `LOG_LEVEL`. Build-time Cargo/CI variables
+are not runtime application settings.
 
 The server listens on `0.0.0.0:${PORT}` in both native and container runs. Native
 runs therefore accept connections on all IPv4 interfaces. `APP_BIND_ADDR` is no
@@ -238,12 +245,19 @@ is claimed. Configure retention on the backup destination to suit available spac
 
 These settings belong to the helper CLIs; the server does not read them.
 
-| Variable | Default / purpose | Owner |
-|---|---|---|
-| `KNOWLEDGE_REPO` | Unset; optional knowledge checkout included in the fresh agent's task context | `bin/task-loop` |
-| `R2_ENDPOINT`, `R2_BUCKET` | No defaults; required endpoint and bucket for uploads | `bin/task-data` |
-| `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | No defaults; required upload credentials, passed to the AWS CLI | `bin/task-data` |
-| `R2_PREFIX` | `task-server`; uploaded archive key prefix | `bin/task-data` |
+| Variable | Required / default when unset | Purpose / invalid values | Reader |
+| --- | --- | --- | --- |
+| `KNOWLEDGE_REPO` | Optional / unset | Knowledge checkout passed into the fresh agent's context. The loop does not validate the path; empty or nonexistent paths do not fail the loop's startup. | [`bin/task-loop`](bin/task-loop) |
+| `R2_ENDPOINT`, `R2_BUCKET` | Required for upload / no defaults | R2 endpoint and destination bucket. Missing or empty values fail upload before the AWS CLI is called; nonempty invalid values are left to the CLI to reject. | [`bin/task-data`](bin/task-data) |
+| `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | Required for upload / no defaults | Upload credentials passed to the AWS CLI. Missing or empty values fail before upload; invalid credentials fail at the provider. | [`bin/task-data`](bin/task-data) |
+| `R2_PREFIX` | Optional / `task-server` | Archive key prefix. Leading/trailing `/` are stripped; empty or slash-only values place the archive at the bucket root. No further prefix validation is performed. | [`bin/task-data`](bin/task-data) |
+
+For uploads, `PATH` must locate `aws`; the helper has no application default for
+that OS search path and fails explicitly if the executable is missing. It maps
+R2 credentials to `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, sets
+`AWS_DEFAULT_REGION=auto`, and sets both `AWS_REQUEST_CHECKSUM_CALCULATION` and
+`AWS_RESPONSE_CHECKSUM_VALIDATION` to `when_required` in the child process.
+These are generated AWS CLI settings, not additional server configuration.
 
 `import-sqlite` takes its source database and new destination as positional
 arguments. It does not read application storage settings. Loop options and local
