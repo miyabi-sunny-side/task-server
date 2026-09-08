@@ -9,6 +9,7 @@
     items = [],
     drawnElsewhere = [],
     onretry,
+    onupdated,
   }: {
     fetchState: "loading" | "error" | "ready";
     items?: TaskSummary[];
@@ -16,6 +17,7 @@
     // pending reviews and everything stranded in reconciliation.
     drawnElsewhere?: string[];
     onretry?: () => void;
+    onupdated?: (task: TaskSummary) => void;
   } = $props();
 
   let elsewhere = $derived(new Set(drawnElsewhere));
@@ -66,7 +68,7 @@
         <ul class="cards">
           {#each group.items as item (item.id)}
             <li>
-              <TaskRow {item} />
+              <TaskRow {item} {onupdated} />
             </li>
           {/each}
         </ul>

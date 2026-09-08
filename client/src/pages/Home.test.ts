@@ -108,6 +108,7 @@ function jsonResponse(payload: unknown, status = 200): Response {
 interface Scenario {
   control?: () => Response | Promise<Response>;
   tasks?: () => Response | Promise<Response>;
+  status?: () => Response | Promise<Response>;
 }
 
 function stubFetch(scenario: Scenario) {
@@ -119,6 +120,9 @@ function stubFetch(scenario: Scenario) {
     }
     if (url === "/api/tasks" && method === "GET") {
       return (scenario.tasks ?? (() => jsonResponse(TASKS)))();
+    }
+    if (url === "/api/tasks/t-draft/status" && method === "POST") {
+      return scenario.status!();
     }
     // The top page reads the queue and the list, and nothing card by card.
     // A per-card request here is the extra round trip this page must not make.
@@ -361,3 +365,150 @@ describe("Home", () => {
     ).toBe("/tasks/t-ready-1");
   });
 });
+
+describe("list Ready action", () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it("sends once while pending, then moves the returned task and focus to Ready even if reload fails", async () => {
+    let finish!: (response: Response) => void;
+    let reloadFails = false;
+    const fetchMock = stubFetch({
+      tasks: () =>
+        reloadFails
+          ? Promise.reject(new Error("offline"))
+          : jsonResponse(TASKS),
+      status: () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    });
+    render(Home);
+    const row = await screen.findByRole("link", { name: /task t-draft/ });
+    row.focus();
+    await fireEvent.keyDown(row, { key: "F10", shiftKey: true });
+    const ready = await screen.findByRole("menuitem", { name: "Readyにする" });
+    await fireEvent.click(ready);
+    await fireEvent.click(ready);
+    expect(writes(fetchMock)).toHaveLength(1);
+    expect(writes(fetchMock)[0][1]?.body).toBe(
+      JSON.stringify({ status: "ready" }),
+    );
+    expect(row.closest("[data-status]")?.getAttribute("data-status")).toBe(
+      "draft",
+    );
+    await fireEvent.keyDown(window, { key: "Escape" });
+    await fireEvent.contextMenu(row);
+    expect(
+      (
+        screen.getByRole("menuitem", {
+          name: "Readyにする",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    reloadFails = true;
+    finish(jsonResponse(summary("t-draft", "ready")));
+    await waitFor(() =>
+      expect(document.querySelector('[data-status="draft"]')).toBeNull(),
+    );
+    const moved = screen.getByRole("link", { name: /task t-draft/ });
+    expect(moved.closest("[data-status]")?.getAttribute("data-status")).toBe(
+      "ready",
+    );
+    await waitFor(() => expect(document.activeElement).toBe(moved));
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(
+      document.querySelector('[data-status="ready"] [data-count]')?.textContent,
+    ).toBe("3");
+  });
+
+  it("preserves Draft on HTTP refusal, reports in place and allows retry; other statuses offer only detail", async () => {
+    const fetchMock = stubFetch({
+      status: () => jsonResponse({ error: "product_archived" }, 409),
+    });
+    render(Home);
+    const row = await screen.findByRole("link", { name: /task t-draft/ });
+    await fireEvent.contextMenu(row);
+    await fireEvent.click(
+      screen.getByRole("menuitem", { name: "Readyにする" }),
+    );
+    expect(await screen.findByRole("alert")).toHaveProperty(
+      "textContent",
+      "product_archived",
+    );
+    expect(row.closest("[data-status]")?.getAttribute("data-status")).toBe(
+      "draft",
+    );
+    await fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByRole("alert")).toBeTruthy();
+    await fireEvent.contextMenu(row);
+    await fireEvent.click(
+      screen.getByRole("menuitem", { name: "Readyにする" }),
+    );
+    await waitFor(() => expect(writes(fetchMock)).toHaveLength(2));
+    await fireEvent.keyDown(window, { key: "Escape" });
+    for (const name of [/テーマ切替/, /task t-wip/, /task t-blocked/]) {
+      await fireEvent.contextMenu(screen.getByRole("link", { name }));
+      expect(
+        screen.queryByRole("menuitem", { name: "Readyにする" }),
+      ).toBeNull();
+      expect(screen.getByRole("menuitem", { name: "詳細を開く" })).toBeTruthy();
+      await fireEvent.keyDown(window, { key: "Escape" });
+    }
+  });
+});
+
+it.each([false, true])(
+  "preserves pending through refresh and respects dismissed focus (moved: %s)",
+  async (moveFocus) => {
+    let finish!: (response: Response) => void;
+    let tasks = TASKS;
+    stubFetch({
+      tasks: () => jsonResponse(tasks),
+      status: () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    });
+    const { unmount } = render(Home);
+    try {
+      const row = await screen.findByRole("link", { name: /task t-draft/ });
+      await fireEvent.contextMenu(row);
+      await fireEvent.click(
+        screen.getByRole("menuitem", { name: "Readyにする" }),
+      );
+      setVisibility("visible");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(
+        (
+          screen.getByRole("menuitem", {
+            name: "Readyにする",
+          }) as HTMLButtonElement
+        ).disabled,
+      ).toBe(true);
+      await fireEvent.keyDown(window, { key: "Escape" });
+      const opener = screen.getByRole("button", { name: "新規タスク" });
+      if (moveFocus) opener.focus();
+      tasks = tasks.map((task) =>
+        task.id === "t-draft" ? { ...task, status: "ready" } : task,
+      );
+      finish(jsonResponse(summary("t-draft", "ready")));
+      await waitFor(() =>
+        expect(document.querySelector('[data-status="draft"]')).toBeNull(),
+      );
+      await waitFor(() =>
+        expect(document.activeElement).toBe(
+          moveFocus
+            ? opener
+            : screen.getByRole("link", { name: /task t-draft/ }),
+        ),
+      );
+      expect(screen.queryByRole("menu")).toBeNull();
+    } finally {
+      unmount();
+      vi.unstubAllGlobals();
+    }
+  },
+);

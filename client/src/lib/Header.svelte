@@ -132,42 +132,4 @@
     align-items: center
     align-self: stretch
 
-  .menu-overlay
-    position: fixed
-    inset: 0
-    z-index: 19
-    padding: 0
-    border: none
-    background: transparent
-    cursor: default
-
-  .menu
-    position: absolute
-    top: 100%
-    right: 0
-    z-index: 20
-    display: flex
-    flex-direction: column
-    min-width: 180px
-    overflow: hidden
-    border: 1px solid var(--c-border)
-    border-radius: var(--radius-lg)
-    background: var(--c-surface-raised)
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.25)
-
-  .menu-item
-    display: block
-    width: 100%
-    padding: var(--sp-2) var(--sp-3)
-    border: none
-    background: transparent
-    color: var(--c-on-surface)
-    font-size: var(--fs-md)
-    font-weight: 500
-    text-align: left
-    text-decoration: none
-    cursor: pointer
-
-    &:hover
-      background: var(--c-hover-1)
 </style>

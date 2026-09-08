@@ -58,12 +58,15 @@
 
   async function loadList() {
     listController?.abort();
-    listController = new AbortController();
+    const controller = new AbortController();
+    listController = controller;
     if (!listLoaded) {
       listState = "loading";
     }
     try {
-      items = await fetchTasks(listController.signal);
+      const loaded = await fetchTasks(controller.signal);
+      if (controller.signal.aborted) return;
+      items = loaded;
       listState = "ready";
       listLoaded = true;
     } catch (error) {
@@ -114,6 +117,13 @@
   <StatusTaskList
     fetchState={listState}
     {items}
+    onupdated={(task) => {
+      listController?.abort();
+      items = items.map((item) =>
+        item.id === task.id ? { ...item, ...task } : item,
+      );
+      void loadBoth();
+    }}
     drawnElsewhere={drawnByPanel}
     onretry={() => void loadList()}
   />

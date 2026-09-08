@@ -506,7 +506,7 @@ counterpart to carry, so it earns no token pair.
   closes; closing always returns focus to the hamburger, and
   `aria-expanded` mirrors the open state. Items are full-width
   borderless rows — label type, `--sp-2`/`--sp-3` padding, left
-  aligned, transparent background, hover `--c-hover-1`, square corners
+  aligned, transparent background, hover `--c-hover-1`, 36px minimum height, square corners
   clipped by the panel's lg radius. **Item 1 is always テーマ設定**,
   which opens the centered theme settings modal; page-navigation links
   of derived projects follow it. There is no トップ/home item — the
@@ -531,6 +531,35 @@ counterpart to carry, so it earns no token pair.
   product id (body-sm, on-surface), wrapping title (label), then neutral
   outline status badge. Optional legacy kind and blocked-by metadata
   use the same badge recipe. No milestone is used as a current status.
+
+  **Task context menu.** A 500ms stationary touch/pen hold opens the
+  row's custom menu; a normal tap still follows its detail link. Movement
+  beyond 8px, scrolling, pointer leave/cancel or release before the hold
+  cancels it. The release click after a hold never opens detail. Right
+  click, ContextMenu and Shift+F10 on the focused row open the same menu.
+  Row text suppresses native selection/callouts so the hold belongs to
+  the custom menu. Viewport resize also closes the menu.
+  Only a non-archived draft offers Readyにする, using the existing status
+  API without confirmation; every row menu also offers 詳細を開く.
+  Keep the row's single focus stop when closed, expose aria-haspopup and
+  aria-expanded, focus the first menu item on open, support arrow/Home/End
+  keys, and close on outside click, Escape, Tab or scrolling. Closing
+  returns focus to the row; successful regrouping restores it to that
+  task's new row without scrolling, including when a dismissed pending
+  request leaves focus on its row. It must not steal subsequent focus
+  placed elsewhere.
+
+  Reuse the hamburger menu's surface, border, lg radius, shadow and item
+  recipe (neutral, never another primary action), with a 36px minimum
+  item height. Anchor below the row in viewport coordinates, clamp to
+  12px viewport gutters, and scroll internally if height is constrained.
+  No scrim or new dialog. Disable Ready during its request and guard
+  duplicate activation even after closing/reopening. On success use the
+  returned task and reload the list so state, groups and counts agree.
+  A failed request preserves the original task and a persistent in-place
+  error inside the menu, or by the row after closing (also announced);
+  retry remains available. Background
+  refresh preserves the menu and pending state while the row exists.
 
   **Execution waiting.** An optional read-only panel can show server
   `stuck` entries for `blocked` and `lease-expired`. It is independent of

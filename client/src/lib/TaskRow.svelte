@@ -2,17 +2,206 @@
   import type { TaskSummary } from "./api";
   import { blockedByLabel } from "./api";
 
-  // The one task card every list on the top page draws (DESIGN.md, Task
-  // list): the product first, so the reader knows whose task this is before
-  // the title; the title next, wrapping rather than clipping; the status
-  // badge last, with who blocked it and the kind beside it. The whole card is
-  // the link and the only focus stop — plain spans inside, never a nested
-  // anchor. A status group and a readout draw the same card, so a task reads
-  // the same wherever it sits.
-  let { item }: { item: TaskSummary } = $props();
+  import { onMount, tick } from "svelte";
+  import { postTaskStatus } from "./api";
+
+  let {
+    item,
+    onupdated,
+  }: {
+    item: TaskSummary;
+    onupdated?: (task: TaskSummary) => void;
+  } = $props();
+  let row: HTMLAnchorElement;
+  let menu = $state<HTMLElement>();
+  let menuOpen = $state(false);
+  let busy = $state(false);
+  let error = $state("");
+  let x = $state(0);
+  let y = $state(0);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let origin: { x: number; y: number } | undefined;
+  let held = false;
+  let anchorTop = 0;
+  const errorId = $props.id();
+  let canReady = $derived(
+    item.status === "draft" && !item.archived && !!onupdated,
+  );
+
+  function cancelPress() {
+    clearTimeout(timer);
+    origin = undefined;
+  }
+
+  function closeMenu() {
+    if (!menuOpen) return;
+    menuOpen = false;
+    row.focus({ preventScroll: true });
+  }
+
+  function placeMenu() {
+    if (!menu) return;
+    const rect = row.getBoundingClientRect();
+    anchorTop = rect.top;
+    const bounds = menu.getBoundingClientRect();
+    const gutter = parseFloat(
+      getComputedStyle(menu).getPropertyValue("--sp-3"),
+    );
+    x = Math.max(
+      gutter,
+      Math.min(rect.left, innerWidth - bounds.width - gutter),
+    );
+    y = Math.max(
+      gutter,
+      Math.min(rect.bottom, innerHeight - bounds.height - gutter),
+    );
+  }
+
+  async function openMenu() {
+    cancelPress();
+    if (menuOpen) return;
+    menuOpen = true;
+    anchorTop = row.getBoundingClientRect().top;
+    await tick();
+    if (!menuOpen || !menu) return;
+    placeMenu();
+    menu
+      .querySelector<HTMLElement>('[role="menuitem"]:not(:disabled)')
+      ?.focus({ preventScroll: true });
+  }
+
+  function pointerDown(event: PointerEvent) {
+    cancelPress();
+    if (!event.isPrimary || event.button !== 0 || event.pointerType === "mouse")
+      return;
+    origin = { x: event.clientX, y: event.clientY };
+    timer = setTimeout(() => {
+      held = true;
+      void openMenu();
+    }, 500);
+  }
+
+  function pointerMove(event: PointerEvent) {
+    if (
+      origin &&
+      Math.hypot(event.clientX - origin.x, event.clientY - origin.y) > 8
+    )
+      cancelPress();
+  }
+
+  function rowKeydown(event: KeyboardEvent) {
+    if (
+      event.key === "ContextMenu" ||
+      (event.shiftKey && event.key === "F10")
+    ) {
+      event.preventDefault();
+      void openMenu();
+    }
+  }
+
+  function menuKeydown(event: KeyboardEvent) {
+    if (!menuOpen) return;
+    if (event.key === "Escape" || event.key === "Tab") {
+      if (event.key === "Escape") event.preventDefault();
+      closeMenu();
+      return;
+    }
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key) || !menu)
+      return;
+    event.preventDefault();
+    const entries = [
+      ...menu.querySelectorAll<HTMLElement>('[role="menuitem"]:not(:disabled)'),
+    ];
+    const index = entries.indexOf(document.activeElement as HTMLElement);
+    const next =
+      event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? entries.length - 1
+          : (index + (event.key === "ArrowDown" ? 1 : -1) + entries.length) %
+            entries.length;
+    entries[next]?.focus();
+  }
+
+  async function makeReady() {
+    if (busy || !canReady) return;
+    busy = true;
+    error = "";
+    try {
+      const updated = await postTaskStatus(item.id, "ready");
+      const restoreFocus = menuOpen || document.activeElement === row;
+      menuOpen = false;
+      onupdated?.(updated);
+      await tick();
+      if (restoreFocus)
+        document
+          .getElementById(`task-${item.id}`)
+          ?.focus({ preventScroll: true });
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : "操作に失敗しました";
+      await tick();
+      if (menuOpen) placeMenu();
+    } finally {
+      busy = false;
+    }
+  }
+
+  onMount(() => {
+    // Touch browsers can retarget the release click to the new overlay.
+    const resetClick = () => {
+      held = false;
+    };
+    const suppressClick = (event: MouseEvent) => {
+      if (!held) return;
+      if (event.type === "click") held = false;
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    document.addEventListener("pointerdown", resetClick, true);
+    document.addEventListener("mousedown", suppressClick, true);
+    document.addEventListener("click", suppressClick, true);
+    const onscroll = (event: Event) => {
+      cancelPress();
+      // A scroll queued before opening must not dismiss a newly opened menu.
+      if (
+        menuOpen &&
+        !(event.target instanceof Node && menu?.contains(event.target)) &&
+        row.getBoundingClientRect().top !== anchorTop
+      )
+        closeMenu();
+    };
+    document.addEventListener("scroll", onscroll, true);
+    return () => {
+      cancelPress();
+      document.removeEventListener("pointerdown", resetClick, true);
+      document.removeEventListener("mousedown", suppressClick, true);
+      document.removeEventListener("click", suppressClick, true);
+      document.removeEventListener("scroll", onscroll, true);
+    };
+  });
 </script>
 
-<a class="card stack" href={`/tasks/${item.id}`}>
+<svelte:window onkeydown={menuKeydown} onresize={closeMenu} />
+
+<a
+  class="card stack"
+  href={`/tasks/${item.id}`}
+  id={`task-${item.id}`}
+  bind:this={row}
+  aria-haspopup="menu"
+  aria-expanded={menuOpen}
+  aria-describedby={error ? errorId : undefined}
+  onpointerdown={pointerDown}
+  onpointermove={pointerMove}
+  onpointerup={cancelPress}
+  onpointerleave={cancelPress}
+  onpointercancel={cancelPress}
+  onkeydown={rowKeydown}
+  oncontextmenu={(event) => {
+    event.preventDefault();
+    void openMenu();
+  }}
+>
   <span class="head">
     <span class="product product-first">{item.product_id}</span>
   </span>
@@ -40,10 +229,63 @@
   </span>
 </a>
 
+{#if error && !menuOpen}
+  <p id={errorId} class="error-banner" role="alert">{error}</p>
+{/if}
+{#if menuOpen}
+  <button
+    class="menu-overlay"
+    type="button"
+    tabindex="-1"
+    aria-label="タスクメニューを閉じる"
+    onclick={closeMenu}
+  ></button>
+  <div
+    class="menu task-menu"
+    bind:this={menu}
+    style:left={`${x}px`}
+    style:top={`${y}px`}
+  >
+    <div role="menu" aria-label={item.title}>
+      {#if canReady}
+        <button
+          class="menu-item"
+          role="menuitem"
+          type="button"
+          disabled={busy}
+          onclick={makeReady}>Readyにする</button
+        >
+      {/if}
+      <a
+        class="menu-item"
+        role="menuitem"
+        href={`/tasks/${item.id}`}
+        onclick={closeMenu}>詳細を開く</a
+      >
+    </div>
+    {#if error}
+      <p id={errorId} class="error-banner" role="alert">{error}</p>
+    {/if}
+  </div>
+{/if}
+
 <style lang="sass">
+  .error-banner
+    overflow-wrap: anywhere
+
+  .task-menu
+    position: fixed
+    right: auto
+    min-width: min(180px, calc(100vw - var(--sp-5)))
+    max-width: calc(100vw - var(--sp-5))
+    max-height: calc(100dvh - var(--sp-5))
+    overflow: auto
+
   // The family card recipe lays its children out in a row; this card reads
   // top to bottom instead, so it stacks and lets the title wrap.
   .stack
+    -webkit-touch-callout: none
+    user-select: none
     flex-direction: column
     align-items: stretch
     gap: var(--sp-1)
