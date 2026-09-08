@@ -542,10 +542,12 @@ counterpart to carry, so it earns no token pair.
   Only a non-archived draft offers Readyにする, using the existing status
   API without confirmation. Non-archived rows with an update callback offer
   Blockする and Cancelする except when already in that target state.
-  Both open the existing centered Modal naming the task and asking for
-  confirmation; only confirmation posts blocked/cancelled. 取りやめ,
+  Blockする posts blocked directly. Cancelする opens the existing centered
+  Modal naming the task; only confirmation posts cancelled. 取りやめ,
   Escape, close or scrim leave it unchanged. While submitting, dismissal
-  and duplicate submission are guarded. No 詳細を開く menu item remains.
+  and duplicate submission are guarded. Its action buttons retain focus
+  with aria-disabled while pending; Tab stays inside the dialog and Esc
+  cannot dismiss an in-flight cancellation. No 詳細を開く menu item remains.
   Every row offers URLをコピー: copy the row's canonical detail URL with
   its encoded id and current origin, including port. Report success as a
   persistent role=status line and failure as an in-place role=alert;
@@ -707,7 +709,10 @@ counterpart to carry, so it earns no token pair.
   `aria-disabled="true"` rather than the `disabled` attribute — so a
   keyboard reaches it and hears the reason its `aria-describedby` names.
   The `disabled` attribute proper is for the moment an action is in
-  flight, when there is nothing to explain. Disabled text is the one
+  flight, when there is nothing to explain. The task cancellation dialog
+  keeps its pending buttons focusable with aria-disabled plus activation
+  guards so keyboard focus and Tab navigation stay inside the dialog.
+  Disabled text is the one
   exemption from the AA floor, as an inactive component; nothing else
   is.
 - **Inputs:** surface bg (one layer below their container), 1px

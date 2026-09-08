@@ -19,10 +19,7 @@
   let busy = $state(false);
   let error = $state("");
   let notice = $state("");
-  let confirming = $state<"blocked" | "cancelled">();
-  let confirmLabel = $derived(
-    confirming === "blocked" ? "Blockする" : "Cancelする",
-  );
+  let confirming = $state(false);
   let x = $state(0);
   let y = $state(0);
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -38,12 +35,12 @@
     return !item.archived && !!onupdated && item.status !== status;
   }
 
-  function ask(status: "blocked" | "cancelled") {
-    if (busy || !canChange(status)) return;
+  function askCancel() {
+    if (busy || !canChange("cancelled")) return;
     closeMenu();
     error = "";
     notice = "";
-    confirming = status;
+    confirming = true;
   }
 
   async function copyUrl() {
@@ -167,7 +164,7 @@
       const restoreFocus =
         menuOpen || !!confirming || document.activeElement === row;
       menuOpen = false;
-      confirming = undefined;
+      confirming = false;
       await onupdated?.(updated);
       await tick();
       if (
@@ -306,7 +303,8 @@
             role="menuitem"
             type="button"
             disabled={busy}
-            onclick={() => ask(status as "blocked" | "cancelled")}
+            onclick={() =>
+              status === "blocked" ? changeStatus(status) : askCancel()}
             >{status === "blocked" ? "Blockする" : "Cancelする"}</button
           >
         {/if}
@@ -328,36 +326,41 @@
 
 {#if confirming}
   <Modal
-    title={confirmLabel}
+    title="Cancelする"
     onclose={() => {
-      if (!busy) confirming = undefined;
+      if (!busy) confirming = false;
     }}
   >
     <form
       onsubmit={(event) => {
         event.preventDefault();
-        if (confirming) void changeStatus(confirming);
+        if (confirming) void changeStatus("cancelled");
       }}
     >
       <p class="confirmation">
-        「{item.title}」を{confirming === "blocked"
-          ? "blockedに変更"
-          : "キャンセル"}しますか？
+        「{item.title}」をキャンセルしますか？
       </p>
-      {#if error}<p class="error-banner" role="alert">{error}</p>{/if}
+      {#if error}<p id={errorId} class="error-banner" role="alert">
+          {error}
+        </p>{/if}
       <button
         class="btn"
         type="button"
         data-autofocus
-        disabled={busy}
-        onclick={() => (confirming = undefined)}>取りやめ</button
+        aria-disabled={busy}
+        onclick={() => {
+          if (!busy) confirming = false;
+        }}>取りやめ</button
       >
-      <button class="btn" type="submit" disabled={busy}>{confirmLabel}</button>
+      <button class="btn" type="submit" aria-disabled={busy}>Cancelする</button>
     </form>
   </Modal>
 {/if}
 
 <style lang="sass">
+  .task-menu > p
+    padding-inline: var(--sp-3)
+
   .confirmation
     overflow-wrap: anywhere
 

@@ -97,52 +97,47 @@ it("ignores an already queued scroll but closes when its row actually moves", as
   expect(document.activeElement).toBe(row);
 });
 
-it.each(["blocked", "cancelled"])(
-  "confirms %s, cancels without a write and submits only once",
-  async (status) => {
-    let finish!: (response: Response) => void;
-    const fetchMock = vi.fn(
-      (_url: string, _init?: RequestInit) =>
-        new Promise<Response>((resolve) => {
-          finish = resolve;
-        }),
-    );
-    vi.stubGlobal("fetch", fetchMock);
-    const onupdated = vi.fn();
-    render(TaskRow, { item, onupdated });
-    const row = screen.getByRole("link");
-    const label = status === "blocked" ? "Blockする" : "Cancelする";
-    await fireEvent.contextMenu(row);
-    expect(screen.queryByRole("menuitem", { name: "詳細を開く" })).toBeNull();
-    await fireEvent.click(screen.getByRole("menuitem", { name: label }));
-    expect(screen.getByRole("dialog").textContent).toContain(item.title);
-    expect(fetchMock).not.toHaveBeenCalled();
-    await fireEvent.click(screen.getByRole("button", { name: "取りやめ" }));
-    expect(document.activeElement).toBe(row);
-    await fireEvent.contextMenu(row);
-    await fireEvent.click(screen.getByRole("menuitem", { name: label }));
-    await fireEvent.keyDown(window, { key: "Escape" });
-    expect(screen.queryByRole("dialog")).toBeNull();
-    expect(fetchMock).not.toHaveBeenCalled();
-    await fireEvent.contextMenu(row);
-    await fireEvent.click(screen.getByRole("menuitem", { name: label }));
-    const confirm = screen.getByRole("button", { name: label });
-    await fireEvent.click(confirm);
-    await fireEvent.click(confirm);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0]).toEqual([
-      "/api/tasks/artificial/status",
-      expect.objectContaining({ body: JSON.stringify({ status }) }),
-    ]);
-    finish(new Response(JSON.stringify({ ...item, status }), { status: 200 }));
-    await vi.waitFor(() =>
-      expect(onupdated).toHaveBeenCalledWith(
-        expect.objectContaining({ status }),
-      ),
-    );
-    vi.unstubAllGlobals();
-  },
-);
+it("confirms cancellation, cancels without a write and submits only once", async () => {
+  const status = "cancelled";
+  let finish!: (response: Response) => void;
+  const fetchMock = vi.fn(
+    (_url: string, _init?: RequestInit) =>
+      new Promise<Response>((resolve) => {
+        finish = resolve;
+      }),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  const onupdated = vi.fn();
+  render(TaskRow, { item, onupdated });
+  const row = screen.getByRole("link");
+  const label = "Cancelする";
+  await fireEvent.contextMenu(row);
+  expect(screen.queryByRole("menuitem", { name: "詳細を開く" })).toBeNull();
+  await fireEvent.click(screen.getByRole("menuitem", { name: label }));
+  expect(screen.getByRole("dialog").textContent).toContain(item.title);
+  expect(fetchMock).not.toHaveBeenCalled();
+  await fireEvent.click(screen.getByRole("button", { name: "取りやめ" }));
+  expect(document.activeElement).toBe(row);
+  await fireEvent.contextMenu(row);
+  await fireEvent.click(screen.getByRole("menuitem", { name: label }));
+  await fireEvent.keyDown(window, { key: "Escape" });
+  expect(screen.queryByRole("dialog")).toBeNull();
+  expect(fetchMock).not.toHaveBeenCalled();
+  await fireEvent.contextMenu(row);
+  await fireEvent.click(screen.getByRole("menuitem", { name: label }));
+  const confirm = screen.getByRole("button", { name: label });
+  await fireEvent.click(confirm);
+  await fireEvent.click(confirm);
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  expect(fetchMock.mock.calls[0]).toEqual([
+    "/api/tasks/artificial/status",
+    expect.objectContaining({ body: JSON.stringify({ status }) }),
+  ]);
+  finish(new Response(JSON.stringify({ ...item, status }), { status: 200 }));
+  await vi.waitFor(() =>
+    expect(onupdated).toHaveBeenCalledWith(expect.objectContaining({ status })),
+  );
+});
 
 it("keeps a refused confirmation open for retry without updating the row", async () => {
   const fetchMock = vi.fn().mockResolvedValue(
@@ -160,6 +155,11 @@ it("keeps a refused confirmation open for retry without updating the row", async
     "transition refused",
   );
   expect(screen.getByRole("dialog")).toBeTruthy();
+  expect(
+    document.getElementById(
+      screen.getByRole("link").getAttribute("aria-describedby")!,
+    ),
+  ).toBe(screen.getByRole("alert"));
   expect(onupdated).not.toHaveBeenCalled();
   expect(screen.getByRole("link").textContent).toContain("draft");
 });
@@ -215,3 +215,28 @@ it.each(["draft", "ready", "wip", "blocked", "cancelled"])(
     );
   },
 );
+
+it("blocks immediately without a dialog and guards pending duplicates", async () => {
+  let finish!: (value: Response) => void;
+  const fetchMock = vi.fn(
+    () =>
+      new Promise<Response>((resolve) => {
+        finish = resolve;
+      }),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  const onupdated = vi.fn();
+  render(TaskRow, { item, onupdated });
+  await fireEvent.contextMenu(screen.getByRole("link"));
+  const block = screen.getByRole("menuitem", { name: "Blockする" });
+  await fireEvent.click(block);
+  await fireEvent.click(block);
+  expect(screen.queryByRole("dialog")).toBeNull();
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  finish(new Response(JSON.stringify({ ...item, status: "blocked" })));
+  await vi.waitFor(() =>
+    expect(onupdated).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "blocked" }),
+    ),
+  );
+});
