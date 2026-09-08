@@ -42,10 +42,10 @@ fn lease_interruption_and_resume_preserve_evidence() {
         .unwrap();
     task::create(&state, json!({"id":"t","title":"test","product_id":"a/b"})).unwrap();
     task::set_status(&state, "t", "ready").unwrap();
-    let claim = task::claim(&state, "worker").unwrap().unwrap();
-    assert!(task::claim(&state, "other").unwrap().is_none());
+    let claim = task::claim(&state, "worker", None).unwrap().unwrap();
+    assert!(task::claim(&state, "other", None).unwrap().is_none());
     clock.advance_secs(11);
-    assert!(task::claim(&state, "other").unwrap().is_none());
+    assert!(task::claim(&state, "other", None).unwrap().is_none());
     assert_eq!(state.store.get("tasks", "t").unwrap()["status"], "blocked");
     assert!(
         task::report(
@@ -55,7 +55,7 @@ fn lease_interruption_and_resume_preserve_evidence() {
         .is_err()
     );
     task::set_status(&state, "t", "ready").unwrap();
-    let c = task::claim(&state, "worker").unwrap().unwrap();
+    let c = task::claim(&state, "worker", None).unwrap().unwrap();
     task::report(&state,json!({"claim_id":c["claim_id"],"outcome":"done","commit_sha":"abc","milestones":[{"name":"verified","commit_sha":"abc","evidence":"cargo test passed"}]})).unwrap();
     task::patch(&state, "t", json!({"commit_sha":"def"})).unwrap();
     let t = state.store.get("tasks", "t").unwrap();
@@ -101,7 +101,7 @@ fn report_resend_is_idempotent_but_conflicting_outcome_is_rejected() {
         .unwrap();
     task::create(&s, json!({"id":"t","title":"test","product_id":"a/b"})).unwrap();
     task::set_status(&s, "t", "ready").unwrap();
-    let c = task::claim(&s, "w").unwrap().unwrap();
+    let c = task::claim(&s, "w", None).unwrap().unwrap();
     let r = json!({"claim_id":c["claim_id"],"outcome":"done","summary":"finished"});
     let first = task::report(&s, r.clone()).unwrap();
     assert_eq!(task::report(&s, r).unwrap(), first);
@@ -186,7 +186,7 @@ async fn mcp_flat_crud_contract_over_json_rpc() {
         .unwrap();
     task::patch(&state, "mcp-task", json!({"product_id":"a/b"})).unwrap();
     task::set_status(&state, "mcp-task", "ready").unwrap();
-    let claim = task::claim(&state, "test").unwrap().unwrap();
+    let claim = task::claim(&state, "test", None).unwrap().unwrap();
     let payload = json!({"claim_id":claim["claim_id"],"outcome":"done","report_markdown":"# Original\nUnverified idea.","commit_sha":"abc","checks":[{"name":"cargo test","exit_code":0}],"milestones":[{"name":"implemented"}]});
     let (code, reported) = request(app.clone(), "POST", "/worker/report", payload.clone()).await;
     assert_eq!(code, StatusCode::OK);
@@ -270,7 +270,7 @@ fn claim_marks_missing_product_and_dependency_as_visible_blocking() {
     ] {
         s.store.put("tasks",id,json!({"id":id,"status":"ready","kind":"normal","product_id":product,"depends_on":dependency})).unwrap();
     }
-    assert!(task::claim(&s, "worker").unwrap().is_none());
+    assert!(task::claim(&s, "worker", None).unwrap().is_none());
     for id in ["missing-product", "missing-dependency"] {
         let t = s.store.get("tasks", id).unwrap();
         assert_eq!(t["status"], "blocked");
@@ -346,7 +346,7 @@ async fn mcp_checkpoint_round_trip_new_session_and_expired_execution_lookup() {
         .unwrap();
     task::create(&state, json!({"id":"t","title":"test","product_id":"a/b"})).unwrap();
     task::set_status(&state, "t", "ready").unwrap();
-    let claim = task::claim(&state, "worker").unwrap().unwrap()["claim_id"].clone();
+    let claim = task::claim(&state, "worker", None).unwrap().unwrap()["claim_id"].clone();
     let app = task_server::app(state.clone());
     let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"checkpoint-test","version":"1"}}});
     let (_, headers, _) = rpc(app.clone(), None, init.clone()).await;
@@ -816,4 +816,317 @@ async fn browser_writes_preserve_validation_and_state_constraints() {
     assert_eq!(card["status"], "cancelled");
     let (code, _) = request(app, "DELETE", "/api/tasks/browser-write", json!({})).await;
     assert_eq!(code, StatusCode::NO_CONTENT);
+}
+
+fn claim_queue(state: &AppState) {
+    state
+        .store
+        .put("products", "a/b", json!({"id":"a/b"}))
+        .unwrap();
+    for (id, priority, created_at) in [
+        ("older", 10, "2026-09-01T00:00:00Z"),
+        ("newer", 10, "2026-09-02T00:00:00Z"),
+        ("target", 0, "2026-09-01T00:00:00Z"),
+    ] {
+        task::create(
+            state,
+            json!({"id":id,"title":id,"product_id":"a/b","priority":priority}),
+        )
+        .unwrap();
+        task::set_status(state, id, "ready").unwrap();
+        state
+            .store
+            .update("tasks", id, |t| {
+                t["created_at"] = json!(created_at);
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn targeted_claim_reuses_lease_checkpoint_and_report_without_reordering_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(Store::open(dir.path()).unwrap());
+    claim_queue(&state);
+    let app = task_server::app(state.clone());
+    let older = state.store.get("tasks", "older").unwrap();
+    let newer = state.store.get("tasks", "newer").unwrap();
+    let (code, claim) = request(
+        app.clone(),
+        "POST",
+        "/worker/claim",
+        json!({"worker":"handoff","task_id":"target"}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(claim["task"]["id"], "target");
+    assert_eq!(claim["task"]["claimed_by"], "handoff");
+    assert_eq!(state.store.get("tasks", "older").unwrap(), older);
+    assert_eq!(state.store.get("tasks", "newer").unwrap(), newer);
+    let claim_id = claim["claim_id"].as_str().unwrap();
+    assert_eq!(
+        task::heartbeat(&state, claim_id).unwrap()["task"]["id"],
+        "target"
+    );
+    let checkpoint = task_server::checkpoint::update(
+        &state,
+        "target",
+        serde_json::from_value(
+            json!({"claim_id":claim_id,"expected_revision":0,"set":{"next":"report"}}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(checkpoint["revision"], 1);
+    let report = task::report(
+        &state,
+        json!({"claim_id":claim_id,"outcome":"done","report_markdown":"Target completed"}),
+    )
+    .unwrap();
+    assert_eq!(report["status"], "done");
+    for id in ["older", "newer"] {
+        let (code, claim) = request(
+            app.clone(),
+            "POST",
+            "/worker/claim",
+            json!({"worker":"queue"}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(claim["task"]["id"], id);
+    }
+    assert_eq!(
+        request(app, "POST", "/worker/claim", json!({"worker":"queue"}))
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn targeted_claim_errors_never_fall_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(Store::open(dir.path()).unwrap());
+    claim_queue(&state);
+    let app = task_server::app(state.clone());
+    let target = state.store.get("tasks", "target").unwrap();
+    let cases = [
+        (
+            "missing",
+            json!({}),
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "task_not_found",
+        ),
+        (
+            "target",
+            json!({"status":"draft"}),
+            StatusCode::CONFLICT,
+            "conflict",
+            "task_not_ready",
+        ),
+        (
+            "target",
+            json!({"status":"blocked"}),
+            StatusCode::CONFLICT,
+            "conflict",
+            "task_not_ready",
+        ),
+        (
+            "target",
+            json!({"archived":true}),
+            StatusCode::CONFLICT,
+            "conflict",
+            "task_not_active",
+        ),
+        (
+            "target",
+            json!({"kind":"review"}),
+            StatusCode::CONFLICT,
+            "conflict",
+            "task_not_active",
+        ),
+        (
+            "target",
+            json!({"depends_on":"older"}),
+            StatusCode::CONFLICT,
+            "conflict",
+            "dependency_not_done",
+        ),
+        (
+            "target",
+            json!({"depends_on":"absent"}),
+            StatusCode::CONFLICT,
+            "conflict",
+            "dependency_missing",
+        ),
+        (
+            "target",
+            json!({"status":"wip","claim_id":"live","lease_expires_at":"2099-01-01T00:00:00Z"}),
+            StatusCode::CONFLICT,
+            "conflict",
+            "task_claimed",
+        ),
+        (
+            "target",
+            json!({"claim_id":"live","lease_expires_at":"2099-01-01T00:00:00Z"}),
+            StatusCode::CONFLICT,
+            "conflict",
+            "task_claimed",
+        ),
+        (
+            "target",
+            json!({"product_id":"missing/product"}),
+            StatusCode::CONFLICT,
+            "conflict",
+            "product_not_catalogued",
+        ),
+    ];
+    for (id, patch, expected_status, expected_code, expected_error) in cases {
+        let mut record = target.clone();
+        record
+            .as_object_mut()
+            .unwrap()
+            .extend(patch.as_object().unwrap().clone());
+        state.store.put("tasks", "target", record.clone()).unwrap();
+        let before = state.store.list("tasks").unwrap();
+        let (status, body) = request(
+            app.clone(),
+            "POST",
+            "/worker/claim",
+            json!({"worker":"handoff","task_id":id}),
+        )
+        .await;
+        assert_eq!(status, expected_status, "{patch}");
+        assert_eq!(body["code"], expected_code, "{patch}");
+        assert_eq!(body["error"], expected_error, "{patch}");
+        assert_eq!(state.store.list("tasks").unwrap(), before);
+    }
+}
+
+#[tokio::test]
+async fn targeted_claim_rejects_invalid_ids_without_claiming() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(Store::open(dir.path()).unwrap());
+    claim_queue(&state);
+    let app = task_server::app(state.clone());
+    for id in [
+        json!(null),
+        json!(3),
+        json!([]),
+        json!({}),
+        json!(""),
+        json!(" "),
+        json!("../target"),
+        json!("."),
+    ] {
+        let (code, body) = request(
+            app.clone(),
+            "POST",
+            "/worker/claim",
+            json!({"worker":"handoff","task_id":id}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{id}");
+        assert_eq!(body["code"], "invalid");
+    }
+    assert!(
+        state
+            .store
+            .list("tasks")
+            .unwrap()
+            .iter()
+            .all(|t| t["status"] == "ready")
+    );
+}
+
+#[test]
+fn concurrent_targeted_claim_has_exactly_one_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(Store::open(dir.path()).unwrap());
+    claim_queue(&state);
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2)
+            .map(|i| {
+                let state = state.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    let app = task_server::app(state);
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    barrier.wait();
+                    runtime.block_on(request(
+                        app,
+                        "POST",
+                        "/worker/claim",
+                        json!({"worker":format!("worker-{i}"),"task_id":"target"}),
+                    ))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let winner: Vec<_> = results
+        .iter()
+        .filter(|(status, _)| *status == StatusCode::OK)
+        .collect();
+    assert_eq!(winner.len(), 1);
+    let loser = results
+        .iter()
+        .find(|(status, _)| *status == StatusCode::CONFLICT)
+        .unwrap();
+    assert_eq!(loser.1["error"], "task_claimed");
+    let target = state.store.get("tasks", "target").unwrap();
+    assert_eq!(target["claim_id"], winner[0].1["claim_id"]);
+    assert_eq!(target["execution_checkpoints"].as_array().unwrap().len(), 1);
+    for id in ["older", "newer"] {
+        assert_eq!(state.store.get("tasks", id).unwrap()["status"], "ready");
+    }
+}
+
+#[tokio::test]
+async fn targeted_claim_requires_ready_after_expiry_and_allows_done_dependency() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = SharedClock::at(datetime!(2026-09-05 00:00 UTC));
+    let state = AppState::new(Store::open(dir.path()).unwrap())
+        .with_clock(Arc::new(clock.clone()))
+        .with_ttl(10);
+    claim_queue(&state);
+    task::patch(&state, "target", json!({"depends_on":"older"})).unwrap();
+    task::set_status(&state, "older", "done").unwrap();
+    let app = task_server::app(state.clone());
+    let payload = json!({"worker":"handoff","task_id":"target"});
+    let (code, first) = request(app.clone(), "POST", "/worker/claim", payload.clone()).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(first["task"]["id"], "target");
+    clock.advance_secs(11);
+    let (code, error) = request(app.clone(), "POST", "/worker/claim", payload.clone()).await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert_eq!(error["error"], "task_not_ready");
+    assert_eq!(
+        state.store.get("tasks", "target").unwrap()["status"],
+        "blocked"
+    );
+    task::set_status(&state, "target", "ready").unwrap();
+    let (code, second) = request(app, "POST", "/worker/claim", payload).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_ne!(first["claim_id"], second["claim_id"]);
+    assert_eq!(
+        second["task"]["execution_checkpoints"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        state.store.get("tasks", "newer").unwrap()["status"],
+        "ready"
+    );
 }

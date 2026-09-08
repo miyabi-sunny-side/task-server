@@ -315,6 +315,55 @@ docker buildx build --load -t task-server:test .
 bash .github/smoke-image.sh task-server:test
 ```
 
+### Claim a ready task
+
+`POST /worker/claim` accepts `{"worker":"task-work:<run-id>"}` and an
+optional `task_id` string:
+
+```json
+{"worker":"task-work:handoff", "task_id":"the-task-to-resume"}
+```
+
+Without `task_id`, the existing queue selects eligible ready tasks by priority
+(descending), then creation time (oldest first); ties retain ledger filename order.
+An empty eligible queue returns **204**. With `task_id`, only that task is
+considered: failure never falls back to another ready task or returns 204.
+`worker` must be nonblank. A supplied `task_id` must be a nonblank task ID (one
+path segment, excluding `.` and `..`); null and non-string values are **400**.
+Omit the field to use queue selection.
+
+Success is **200** with the existing `{claim_id, lease_expires_at, task}` envelope.
+Selection, eligibility checks and lease creation share the ledger writer lock,
+so concurrent claims on the same task have exactly one winner. The same claim
+UUID controls heartbeat, checkpoint and report; no second ownership mechanism
+is introduced.
+
+Failures use the existing JSON `{code, error}` shape:
+
+| HTTP | `code` | `error` for target selection |
+| --- | --- | --- |
+| 404 | `not_found` | `task_not_found` |
+| 409 | `conflict` | `task_claimed` (existing claim; checked before readiness) |
+| 409 | `conflict` | `task_not_active` (archived or historical control task) |
+| 409 | `conflict` | `task_not_ready` |
+| 409 | `conflict` | `dependency_not_done` or `dependency_missing` |
+| 409 | `conflict` | `product_not_catalogued` or `product_archived` |
+| 400 | `invalid` | Input validation message, including missing product metadata |
+
+Target rejection does not block or reprioritize tasks. Existing accepted-report
+recovery and expired-lease sweeping still run before selection: expired work
+becomes blocked and must explicitly return to ready before being claimed again.
+Queue mode retains its existing blocking of missing products/dependencies.
+It skips records that still carry a claim ID, including hand-edited ready records,
+so an existing claim is never overwritten.
+
+For a bounded handoff, `task-work` consumers should send the authorized target as
+`task_id`, check the returned task ID, and handle 400/404/409 without retrying an
+unscoped claim. Update the consumer's queue instructions that previously said
+ID selection was unavailable after deploying a server with this contract.
+Existing callers, including `bin/task-loop`, may keep omitting the field;
+`--once` still means one queue attempt, not selection of a particular ID.
+
 ### One original completion report
 
 New workers submit one free-form Markdown original. Structured fields identify

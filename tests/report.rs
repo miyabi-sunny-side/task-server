@@ -19,7 +19,7 @@ fn setup() -> (tempfile::TempDir, AppState, SharedClock, serde_json::Value) {
     )
     .unwrap();
     task::set_status(&state, "t", "ready").unwrap();
-    let claim = task::claim(&state, "worker").unwrap().unwrap();
+    let claim = task::claim(&state, "worker", None).unwrap().unwrap();
     (dir, state, clock, claim)
 }
 
@@ -59,7 +59,7 @@ fn both_report_formats_preserve_lifecycle_across_reopened_executions() {
             assert_eq!(task::report(&state, payload).unwrap(), record);
             assert!(task::heartbeat(&state, claim["claim_id"].as_str().unwrap()).is_err());
             task::set_status(&state, "t", "ready").unwrap();
-            claim = task::claim(&state, "worker").unwrap().unwrap();
+            claim = task::claim(&state, "worker", None).unwrap().unwrap();
         }
     }
 }
@@ -120,7 +120,7 @@ fn old_report_retry_after_another_claim_does_not_duplicate_or_revert_progress() 
     let record = task::report(&state, first.clone()).unwrap();
     let first_id = record["report_id"].clone();
     task::set_status(&state, "t", "ready").unwrap();
-    let claim = task::claim(&state, "second").unwrap().unwrap();
+    let claim = task::claim(&state, "second", None).unwrap().unwrap();
     task::report(&state,json!({"claim_id":claim["claim_id"],"outcome":"done","report_markdown":"finished","commit_sha":"def"})).unwrap();
     let record = task::report(&state, first).unwrap();
     assert_eq!(record["status"], "done");
@@ -153,7 +153,7 @@ fn old_completion_prose_remains_readable_without_becoming_the_new_stop_reason() 
     let (_dir, state, clock, claim) = setup();
     task::report(&state,json!({"claim_id":claim["claim_id"],"outcome":"blocked","summary":"old summary","verification":"old reason","checks":["old evidence"]})).unwrap();
     task::set_status(&state, "t", "ready").unwrap();
-    let claim = task::claim(&state, "next").unwrap().unwrap();
+    let claim = task::claim(&state, "next", None).unwrap().unwrap();
     let report = task::report(
         &state,
         json!({"claim_id":claim["claim_id"],"outcome":"blocked","report_markdown":"new reason"}),
@@ -163,7 +163,7 @@ fn old_completion_prose_remains_readable_without_becoming_the_new_stop_reason() 
     assert_eq!(report["legacy_completion"][0]["checks"][0], "old evidence");
     assert!(report["verification"].is_null());
     task::set_status(&state, "t", "ready").unwrap();
-    task::claim(&state, "interrupted").unwrap().unwrap();
+    task::claim(&state, "interrupted", None).unwrap().unwrap();
     clock.advance_secs(11);
     let task = task::card(&state, "t").unwrap();
     assert_eq!(task["verification"], "interrupted: execution lease expired");
@@ -174,7 +174,7 @@ fn legacy_report_after_new_report_selects_current_legacy_result() {
     let (_dir, state, _, claim) = setup();
     let first=task::report(&state,json!({"claim_id":claim["claim_id"],"outcome":"blocked","report_markdown":"earlier original"})).unwrap();
     task::set_status(&state, "t", "ready").unwrap();
-    let claim = task::claim(&state, "legacy").unwrap().unwrap();
+    let claim = task::claim(&state, "legacy", None).unwrap().unwrap();
     let current=task::report(&state,json!({"claim_id":claim["claim_id"],"outcome":"done","summary":"latest legacy result","verification":"latest legacy evidence"})).unwrap();
     assert!(current["report_id"].is_null());
     assert_eq!(current["report_ids"][0], first["report_id"]);

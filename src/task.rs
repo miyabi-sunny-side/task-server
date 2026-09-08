@@ -290,14 +290,24 @@ pub fn card(s: &AppState, id: &str) -> Result<Value, Error> {
 fn envelope(t: Value) -> Value {
     json!({"claim_id":t["claim_id"],"lease_expires_at":t["lease_expires_at"],"task":t})
 }
-pub fn claim(s: &AppState, worker: &str) -> Result<Option<Value>, Error> {
+pub fn claim(s: &AppState, worker: &str, task_id: Option<&str>) -> Result<Option<Value>, Error> {
     if worker.trim().is_empty() {
         return Err(Error::Invalid("worker is required".into()));
+    }
+    if task_id.is_some_and(|id| id.trim().is_empty() || id.contains('/') || id == "." || id == "..")
+    {
+        return Err(Error::Invalid("task_id must be one path segment".into()));
     }
     s.store.transaction(|a| {
         let now = format_z(s.clock.now());
         expire(a, &now)?;
-        let mut ts = a.list("tasks")?;
+        let mut ts = match task_id {
+            Some(id) => vec![a.get("tasks", id).map_err(|error| match error {
+                Error::NotFound(_) => Error::NotFound("task_not_found".into()),
+                error => error,
+            })?],
+            None => a.list("tasks")?,
+        };
         ts.sort_by(|a, b| {
             b["priority"]
                 .as_i64()
@@ -306,10 +316,25 @@ pub fn claim(s: &AppState, worker: &str) -> Result<Option<Value>, Error> {
                 .then_with(|| string(a, "created_at").cmp(string(b, "created_at")))
         });
         for mut t in ts {
-            if !active(&t) || t["status"] != "ready" {
+            let rejection = if t["claim_id"].is_string() {
+                Some("task_claimed")
+            } else if !active(&t) {
+                Some("task_not_active")
+            } else if t["status"] != "ready" {
+                Some("task_not_ready")
+            } else {
+                None
+            };
+            if let Some(reason) = rejection {
+                if task_id.is_some() {
+                    return Err(Error::Conflict(reason.into()));
+                }
                 continue;
             }
             if let Err(error) = ready_gate(a, &t) {
+                if task_id.is_some() {
+                    return Err(error);
+                }
                 match error {
                     Error::Conflict(_) | Error::Invalid(_) => {
                         block_unclaimable(a, &mut t, &now, &error.to_string())?;
@@ -321,8 +346,16 @@ pub fn claim(s: &AppState, worker: &str) -> Result<Option<Value>, Error> {
             if let Some(dep) = t["depends_on"].as_str() {
                 match a.get("tasks", dep) {
                     Ok(dependency) if dependency["status"] == "done" => {}
-                    Ok(_) => continue,
+                    Ok(_) => {
+                        if task_id.is_some() {
+                            return Err(Error::Conflict("dependency_not_done".into()));
+                        }
+                        continue;
+                    }
                     Err(Error::NotFound(_)) => {
+                        if task_id.is_some() {
+                            return Err(Error::Conflict("dependency_missing".into()));
+                        }
                         let reason = format!("dependency {dep} is missing");
                         block_unclaimable(a, &mut t, &now, &reason)?;
                         continue;

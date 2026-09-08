@@ -139,10 +139,19 @@ pub async fn worker_claim(
     State(s): State<AppState>,
     Json(v): Json<Value>,
 ) -> Result<Response, Error> {
-    Ok(match task::claim(&s, task::string(&v, "worker"))? {
-        Some(v) => Json(v).into_response(),
-        None => StatusCode::NO_CONTENT.into_response(),
-    })
+    let task_id = v
+        .get("task_id")
+        .map(|id| {
+            id.as_str()
+                .ok_or_else(|| Error::Invalid("task_id must be a string".into()))
+        })
+        .transpose()?;
+    Ok(
+        match task::claim(&s, task::string(&v, "worker"), task_id)? {
+            Some(v) => Json(v).into_response(),
+            None => StatusCode::NO_CONTENT.into_response(),
+        },
+    )
 }
 pub async fn worker_heartbeat(
     State(s): State<AppState>,
