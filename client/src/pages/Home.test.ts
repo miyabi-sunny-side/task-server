@@ -424,7 +424,7 @@ describe("list Ready action", () => {
     ).toBe("3");
   });
 
-  it("preserves Draft on HTTP refusal, reports in place and allows retry; other statuses offer only detail", async () => {
+  it("preserves Draft on HTTP refusal, reports in place and allows retry; other statuses offer copy without Ready", async () => {
     const fetchMock = stubFetch({
       status: () => jsonResponse({ error: "product_archived" }, 409),
     });
@@ -454,7 +454,9 @@ describe("list Ready action", () => {
       expect(
         screen.queryByRole("menuitem", { name: "Readyにする" }),
       ).toBeNull();
-      expect(screen.getByRole("menuitem", { name: "詳細を開く" })).toBeTruthy();
+      expect(
+        screen.getByRole("menuitem", { name: "URLをコピー" }),
+      ).toBeTruthy();
       await fireEvent.keyDown(window, { key: "Escape" });
     }
   });

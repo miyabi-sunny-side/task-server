@@ -7,11 +7,13 @@
     plane,
     tasks = [],
     onretry,
+    onupdated,
   }: {
     fetchState: "loading" | "error" | "ready";
     plane?: ControlPlane;
     tasks?: TaskSummary[];
     onretry?: () => void;
+    onupdated?: (task: TaskSummary) => void | Promise<void>;
   } = $props();
   let stuck = $derived(
     (plane?.stuck ?? []).filter(
@@ -36,7 +38,7 @@
       >
     </div>
   {:else if panelState === "success"}
-    <Reconciliation {stuck} {tasks} />
+    <Reconciliation {stuck} {tasks} {onupdated} />
   {/if}
 </section>
 

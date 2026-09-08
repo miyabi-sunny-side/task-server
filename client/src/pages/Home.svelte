@@ -38,12 +38,15 @@
 
   async function loadControl() {
     controlController?.abort();
-    controlController = new AbortController();
+    const controller = new AbortController();
+    controlController = controller;
     if (!controlLoaded) {
       controlState = "loading";
     }
     try {
-      plane = await fetchControl(controlController.signal);
+      const loaded = await fetchControl(controller.signal);
+      if (controller.signal.aborted) return;
+      plane = loaded;
       controlState = "ready";
       controlLoaded = true;
     } catch (error) {
@@ -81,6 +84,20 @@
     return Promise.all([loadControl(), loadList()]);
   }
 
+  async function onupdated(task: TaskSummary) {
+    listController?.abort();
+    controlController?.abort();
+    items = items.map((item) =>
+      item.id === task.id ? { ...item, ...task } : item,
+    );
+    if (plane)
+      plane = {
+        ...plane,
+        stuck: plane.stuck.filter((row) => row.task_id !== task.id),
+      };
+    await loadBoth();
+  }
+
   $effect(() => {
     void loadBoth();
     const stopAutoReload = startAutoReload(() => void loadBoth());
@@ -112,18 +129,13 @@
     fetchState={controlState}
     {plane}
     tasks={items}
+    {onupdated}
     onretry={() => void loadControl()}
   />
   <StatusTaskList
     fetchState={listState}
     {items}
-    onupdated={(task) => {
-      listController?.abort();
-      items = items.map((item) =>
-        item.id === task.id ? { ...item, ...task } : item,
-      );
-      void loadBoth();
-    }}
+    {onupdated}
     drawnElsewhere={drawnByPanel}
     onretry={() => void loadList()}
   />

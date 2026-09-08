@@ -2,8 +2,15 @@
   import type { Stuck, TaskSummary } from "./api";
   import TaskRow from "./TaskRow.svelte";
 
-  let { stuck = [], tasks = [] }: { stuck?: Stuck[]; tasks?: TaskSummary[] } =
-    $props();
+  let {
+    stuck = [],
+    tasks = [],
+    onupdated,
+  }: {
+    stuck?: Stuck[];
+    tasks?: TaskSummary[];
+    onupdated?: (task: TaskSummary) => void | Promise<void>;
+  } = $props();
   const captions: Record<string, string> = {
     blocked: "実行が止まっています",
     "lease-expired": "実行の期限が切れています",
@@ -48,7 +55,7 @@
         </p>
         <ul class="cards">
           {#each group.rows as row (row.task_id)}
-            <li><TaskRow item={asCard(row)} /></li>
+            <li><TaskRow item={asCard(row)} {onupdated} /></li>
           {/each}
         </ul>
       </div>

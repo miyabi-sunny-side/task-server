@@ -540,12 +540,22 @@ counterpart to carry, so it earns no token pair.
   Row text suppresses native selection/callouts so the hold belongs to
   the custom menu. Viewport resize also closes the menu.
   Only a non-archived draft offers Readyにする, using the existing status
-  API without confirmation; every row menu also offers 詳細を開く.
+  API without confirmation. Non-archived rows with an update callback offer
+  Blockする and Cancelする except when already in that target state.
+  Both open the existing centered Modal naming the task and asking for
+  confirmation; only confirmation posts blocked/cancelled. 取りやめ,
+  Escape, close or scrim leave it unchanged. While submitting, dismissal
+  and duplicate submission are guarded. No 詳細を開く menu item remains.
+  Every row offers URLをコピー: copy the row's canonical detail URL with
+  its encoded id and current origin, including port. Report success as a
+  persistent role=status line and failure as an in-place role=alert;
+  never show success before the clipboard promise resolves.
   Keep the row's single focus stop when closed, expose aria-haspopup and
   aria-expanded, focus the first menu item on open, support arrow/Home/End
   keys, and close on outside click, Escape, Tab or scrolling. Closing
   returns focus to the row; successful regrouping restores it to that
-  task's new row without scrolling, including when a dismissed pending
+  task's new row without scrolling (or the header closed link when the task
+  leaves the page), including when a dismissed pending
   request leaves focus on its row. It must not steal subsequent focus
   placed elsewhere.
 
@@ -553,7 +563,8 @@ counterpart to carry, so it earns no token pair.
   recipe (neutral, never another primary action), with a 36px minimum
   item height. Anchor below the row in viewport coordinates, clamp to
   12px viewport gutters, and scroll internally if height is constrained.
-  No scrim or new dialog. Disable Ready during its request and guard
+  The menu has no scrim; confirmations reuse the existing Modal. Disable
+  all menu actions during a request and guard
   duplicate activation even after closing/reopening. On success use the
   returned task and reload the list so state, groups and counts agree.
   A failed request preserves the original task and a persistent in-place
@@ -561,10 +572,10 @@ counterpart to carry, so it earns no token pair.
   retry remains available. Background
   refresh preserves the menu and pending state while the row exists.
 
-  **Execution waiting.** An optional read-only panel can show server
+  **Execution waiting.** An optional panel can show server
   `stuck` entries for `blocked` and `lease-expired`. It is independent of
   the list's fetch state and uses info-banner `role="status"`, ordinary
-  card links, a caption and count per non-empty reason. It names the
+  card links with the shared task context menu, a caption and count per non-empty reason. It names the
   fact (`実行が止まっています` / `実行の期限が切れています`), with no
   pipeline procedure or missing-subtask alarm. If a task is drawn there,
   omit it from the status groups so it appears once on the page. With

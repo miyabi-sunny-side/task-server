@@ -15,6 +15,7 @@ const item = {
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+  vi.unstubAllGlobals();
 });
 
 function pointer(row: HTMLElement, type: string, x = 20) {
@@ -95,3 +96,122 @@ it("ignores an already queued scroll but closes when its row actually moves", as
   expect(screen.queryByRole("menu")).toBeNull();
   expect(document.activeElement).toBe(row);
 });
+
+it.each(["blocked", "cancelled"])(
+  "confirms %s, cancels without a write and submits only once",
+  async (status) => {
+    let finish!: (response: Response) => void;
+    const fetchMock = vi.fn(
+      (_url: string, _init?: RequestInit) =>
+        new Promise<Response>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const onupdated = vi.fn();
+    render(TaskRow, { item, onupdated });
+    const row = screen.getByRole("link");
+    const label = status === "blocked" ? "Blockする" : "Cancelする";
+    await fireEvent.contextMenu(row);
+    expect(screen.queryByRole("menuitem", { name: "詳細を開く" })).toBeNull();
+    await fireEvent.click(screen.getByRole("menuitem", { name: label }));
+    expect(screen.getByRole("dialog").textContent).toContain(item.title);
+    expect(fetchMock).not.toHaveBeenCalled();
+    await fireEvent.click(screen.getByRole("button", { name: "取りやめ" }));
+    expect(document.activeElement).toBe(row);
+    await fireEvent.contextMenu(row);
+    await fireEvent.click(screen.getByRole("menuitem", { name: label }));
+    await fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+    await fireEvent.contextMenu(row);
+    await fireEvent.click(screen.getByRole("menuitem", { name: label }));
+    const confirm = screen.getByRole("button", { name: label });
+    await fireEvent.click(confirm);
+    await fireEvent.click(confirm);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]).toEqual([
+      "/api/tasks/artificial/status",
+      expect.objectContaining({ body: JSON.stringify({ status }) }),
+    ]);
+    finish(new Response(JSON.stringify({ ...item, status }), { status: 200 }));
+    await vi.waitFor(() =>
+      expect(onupdated).toHaveBeenCalledWith(
+        expect.objectContaining({ status }),
+      ),
+    );
+    vi.unstubAllGlobals();
+  },
+);
+
+it("keeps a refused confirmation open for retry without updating the row", async () => {
+  const fetchMock = vi.fn().mockResolvedValue(
+    new Response(JSON.stringify({ error: "transition refused" }), {
+      status: 409,
+    }),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  const onupdated = vi.fn();
+  render(TaskRow, { item, onupdated });
+  await fireEvent.contextMenu(screen.getByRole("link"));
+  await fireEvent.click(screen.getByRole("menuitem", { name: "Cancelする" }));
+  await fireEvent.click(screen.getByRole("button", { name: "Cancelする" }));
+  expect((await screen.findByRole("alert")).textContent).toBe(
+    "transition refused",
+  );
+  expect(screen.getByRole("dialog")).toBeTruthy();
+  expect(onupdated).not.toHaveBeenCalled();
+  expect(screen.getByRole("link").textContent).toContain("draft");
+});
+
+it("copies the encoded detail URL and announces success only after clipboard completion", async () => {
+  let finish!: () => void;
+  const writeText = vi.fn(
+    () =>
+      new Promise<void>((resolve) => {
+        finish = resolve;
+      }),
+  );
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: { writeText },
+  });
+  render(TaskRow, { item: { ...item, id: "a #日本" } });
+  await fireEvent.contextMenu(screen.getByRole("link"));
+  await fireEvent.click(screen.getByRole("menuitem", { name: "URLをコピー" }));
+  expect(writeText).toHaveBeenCalledWith(
+    `${window.location.origin}/tasks/a%20%23%E6%97%A5%E6%9C%AC`,
+  );
+  expect(screen.queryByRole("status")).toBeNull();
+  finish();
+  expect((await screen.findByRole("status")).textContent).toBe(
+    "URLをコピーしました",
+  );
+  writeText.mockRejectedValueOnce(new Error("denied"));
+  await fireEvent.click(screen.getByRole("menuitem", { name: "URLをコピー" }));
+  expect((await screen.findByRole("alert")).textContent).toBe(
+    "URLのコピーに失敗しました",
+  );
+  expect(screen.queryByRole("status")).toBeNull();
+});
+
+it.each(["draft", "ready", "wip", "blocked", "cancelled"])(
+  "omits same-state actions for %s and all mutations when archived",
+  async (status) => {
+    const { rerender } = render(TaskRow, {
+      item: { ...item, status },
+      onupdated: vi.fn(),
+    });
+    await fireEvent.contextMenu(screen.getByRole("link"));
+    expect(!!screen.queryByRole("menuitem", { name: "Blockする" })).toBe(
+      status !== "blocked",
+    );
+    expect(!!screen.queryByRole("menuitem", { name: "Cancelする" })).toBe(
+      status !== "cancelled",
+    );
+    await rerender({ item: { ...item, status, archived: true } });
+    expect(screen.getAllByRole("menuitem").map((el) => el.textContent)).toEqual(
+      ["URLをコピー"],
+    );
+  },
+);

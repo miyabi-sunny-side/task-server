@@ -4,19 +4,25 @@
 
   import { onMount, tick } from "svelte";
   import { postTaskStatus } from "./api";
+  import Modal from "./Modal.svelte";
 
   let {
     item,
     onupdated,
   }: {
     item: TaskSummary;
-    onupdated?: (task: TaskSummary) => void;
+    onupdated?: (task: TaskSummary) => void | Promise<void>;
   } = $props();
   let row: HTMLAnchorElement;
   let menu = $state<HTMLElement>();
   let menuOpen = $state(false);
   let busy = $state(false);
   let error = $state("");
+  let notice = $state("");
+  let confirming = $state<"blocked" | "cancelled">();
+  let confirmLabel = $derived(
+    confirming === "blocked" ? "Blockする" : "Cancelする",
+  );
   let x = $state(0);
   let y = $state(0);
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -27,6 +33,35 @@
   let canReady = $derived(
     item.status === "draft" && !item.archived && !!onupdated,
   );
+
+  function canChange(status: string) {
+    return !item.archived && !!onupdated && item.status !== status;
+  }
+
+  function ask(status: "blocked" | "cancelled") {
+    if (busy || !canChange(status)) return;
+    closeMenu();
+    error = "";
+    notice = "";
+    confirming = status;
+  }
+
+  async function copyUrl() {
+    if (busy) return;
+    busy = true;
+    error = "";
+    notice = "";
+    try {
+      await navigator.clipboard.writeText(row.href);
+      notice = "URLをコピーしました";
+    } catch {
+      error = "URLのコピーに失敗しました";
+    } finally {
+      busy = false;
+      await tick();
+      if (menuOpen) placeMenu();
+    }
+  }
 
   function cancelPress() {
     clearTimeout(timer);
@@ -123,20 +158,27 @@
     entries[next]?.focus();
   }
 
-  async function makeReady() {
-    if (busy || !canReady) return;
+  async function changeStatus(status: string) {
+    if (busy || !canChange(status) || (status === "ready" && !canReady)) return;
     busy = true;
     error = "";
     try {
-      const updated = await postTaskStatus(item.id, "ready");
-      const restoreFocus = menuOpen || document.activeElement === row;
+      const updated = await postTaskStatus(item.id, status);
+      const restoreFocus =
+        menuOpen || !!confirming || document.activeElement === row;
       menuOpen = false;
-      onupdated?.(updated);
+      confirming = undefined;
+      await onupdated?.(updated);
       await tick();
-      if (restoreFocus)
-        document
-          .getElementById(`task-${item.id}`)
-          ?.focus({ preventScroll: true });
+      if (
+        restoreFocus &&
+        (document.activeElement === document.body ||
+          document.activeElement === row)
+      )
+        (
+          document.getElementById(`task-${item.id}`) ??
+          document.querySelector<HTMLElement>('header a[href="/closed"]')
+        )?.focus({ preventScroll: true });
     } catch (cause) {
       error = cause instanceof Error ? cause.message : "操作に失敗しました";
       await tick();
@@ -185,7 +227,7 @@
 
 <a
   class="card stack"
-  href={`/tasks/${item.id}`}
+  href={`/tasks/${encodeURIComponent(item.id)}`}
   id={`task-${item.id}`}
   bind:this={row}
   aria-haspopup="menu"
@@ -229,7 +271,8 @@
   </span>
 </a>
 
-{#if error && !menuOpen}
+{#if notice && !menuOpen}<p role="status">{notice}</p>{/if}
+{#if error && !menuOpen && !confirming}
   <p id={errorId} class="error-banner" role="alert">{error}</p>
 {/if}
 {#if menuOpen}
@@ -253,23 +296,71 @@
           role="menuitem"
           type="button"
           disabled={busy}
-          onclick={makeReady}>Readyにする</button
+          onclick={() => changeStatus("ready")}>Readyにする</button
         >
       {/if}
-      <a
+      {#each ["blocked", "cancelled"] as status}
+        {#if canChange(status)}
+          <button
+            class="menu-item"
+            role="menuitem"
+            type="button"
+            disabled={busy}
+            onclick={() => ask(status as "blocked" | "cancelled")}
+            >{status === "blocked" ? "Blockする" : "Cancelする"}</button
+          >
+        {/if}
+      {/each}
+      <button
         class="menu-item"
         role="menuitem"
-        href={`/tasks/${item.id}`}
-        onclick={closeMenu}>詳細を開く</a
+        type="button"
+        disabled={busy}
+        onclick={copyUrl}>URLをコピー</button
       >
     </div>
+    {#if notice}<p role="status">{notice}</p>{/if}
     {#if error}
       <p id={errorId} class="error-banner" role="alert">{error}</p>
     {/if}
   </div>
 {/if}
 
+{#if confirming}
+  <Modal
+    title={confirmLabel}
+    onclose={() => {
+      if (!busy) confirming = undefined;
+    }}
+  >
+    <form
+      onsubmit={(event) => {
+        event.preventDefault();
+        if (confirming) void changeStatus(confirming);
+      }}
+    >
+      <p class="confirmation">
+        「{item.title}」を{confirming === "blocked"
+          ? "blockedに変更"
+          : "キャンセル"}しますか？
+      </p>
+      {#if error}<p class="error-banner" role="alert">{error}</p>{/if}
+      <button
+        class="btn"
+        type="button"
+        data-autofocus
+        disabled={busy}
+        onclick={() => (confirming = undefined)}>取りやめ</button
+      >
+      <button class="btn" type="submit" disabled={busy}>{confirmLabel}</button>
+    </form>
+  </Modal>
+{/if}
+
 <style lang="sass">
+  .confirmation
+    overflow-wrap: anywhere
+
   .error-banner
     overflow-wrap: anywhere
 

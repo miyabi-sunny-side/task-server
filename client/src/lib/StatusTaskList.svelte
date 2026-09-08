@@ -17,7 +17,7 @@
     // pending reviews and everything stranded in reconciliation.
     drawnElsewhere?: string[];
     onretry?: () => void;
-    onupdated?: (task: TaskSummary) => void;
+    onupdated?: (task: TaskSummary) => void | Promise<void>;
   } = $props();
 
   let elsewhere = $derived(new Set(drawnElsewhere));
