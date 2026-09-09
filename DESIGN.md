@@ -519,7 +519,10 @@ counterpart to carry, so it earns no token pair.
   theme change live. Close via ×, Esc, or scrim; focus returns to the
   hamburger.
 - **Top page — active task ledger.** The first content block offers
-  新規タスク, the page's one primary action. The task list follows,
+  新規タスク, the page's one primary action, and a labelled native select
+  実行先で絞り込み with すべて (default), sandbox and homeserver. It filters both
+  status groups and the blocked-work panel, preserving selection during reloads.
+  Controls wrap with existing spacing and input/button tokens. The task list follows,
   grouped in `draft`, `ready`, `wip`, `blocked` order. Empty groups are
   absent, including their heading and count. `done`, `cancelled` and
   `dropped` belong to the closed page; `archived: true` records belong
@@ -529,7 +532,12 @@ counterpart to carry, so it earns no token pair.
   recipe (surface-raised, 1px border, 8px radius, 10px padding, 8px gaps).
   Each row is one link to `/tasks/<id>` with exactly one focus stop:
   product id (body-sm, on-surface), wrapping title (label), then neutral
-  outline status badge. Optional legacy kind and blocked-by metadata
+  outline status badge. A muted caption beside the product shows the execution
+  target: sandbox or homeserver; absent legacy values display sandbox. Task detail
+  shows a labelled 実行先 caption, and closed rows show the target in their tail. Create/edit forms offer a labelled 実行先 native
+  select with sandbox (new-task default) and homeserver. Failed saves and background
+  refreshes preserve this selection alongside the other form fields.
+  Optional legacy kind and blocked-by metadata
   use the same badge recipe. No milestone is used as a current status.
 
   **Task context menu.** A 500ms stationary touch/pen hold opens the

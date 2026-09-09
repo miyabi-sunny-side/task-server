@@ -29,6 +29,9 @@ it("keeps invalid save focusable, submits source text, and preserves it on a ref
   await fireEvent.input(screen.getByLabelText("body"), {
     target: { value: "## 指示\n変更内容" },
   });
+  await fireEvent.change(screen.getByLabelText("実行先"), {
+    target: { value: "homeserver" },
+  });
   await fireEvent.submit(document.querySelector("form")!);
   await screen.findByRole("alert");
   expect((screen.getByLabelText("body") as HTMLTextAreaElement).value).toBe(
@@ -38,13 +41,19 @@ it("keeps invalid save focusable, submits source text, and preserves it on a ref
   await fireEvent.submit(document.querySelector("form")!);
   await waitFor(() => expect(onclose).toHaveBeenCalledOnce());
   expect(onsave).toHaveBeenLastCalledWith({
+    execution_target: "homeserver",
     product_id: "sunny-side/task-server",
     title: "新しい作業",
     body: "## 指示\n変更内容",
   });
 });
 it("does not replace an edit draft when background data changes", async () => {
-  const initial = { product_id: "org/repo", title: "元の題名", body: "本文" };
+  const initial = {
+    product_id: "org/repo",
+    title: "元の題名",
+    body: "本文",
+    execution_target: "homeserver" as const,
+  };
   const props = {
     title: "タスクを編集",
     initial,
@@ -55,7 +64,13 @@ it("does not replace an edit draft when background data changes", async () => {
   await fireEvent.input(screen.getByLabelText("title"), {
     target: { value: "入力途中" },
   });
+  await fireEvent.change(screen.getByLabelText("実行先"), {
+    target: { value: "sandbox" },
+  });
   await rerender({ ...props, initial: { ...initial, title: "server 更新" } });
+  expect((screen.getByLabelText("実行先") as HTMLSelectElement).value).toBe(
+    "sandbox",
+  );
   expect((screen.getByLabelText("title") as HTMLInputElement).value).toBe(
     "入力途中",
   );

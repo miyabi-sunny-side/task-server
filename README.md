@@ -115,9 +115,9 @@ Stop the old service, snapshot/back up the ledger, remove the obsolete projects
 mount/configuration, and start the new version. Existing IDs, metadata, tasks,
 archive history and unknown fields remain unchanged. Missing `local_path` and
 `releases` remain unknown rather than being inferred from repository contents.
-Explicitly set each active product's placement and release policy through MCP
-before execution, checking that the chosen checkout belongs to its canonical
-repository. This is an operator-owned migration of already registered records,
+Set each active product's canonical repository and release policy through MCP
+before execution. Placement is an optional hint; check that any local checkout
+belongs to the canonical repository. This is an operator-owned migration of already registered records,
 not a recurring discovery or registration process. SQLite imports still use
 `bin/task-data import-sqlite` and retain original columns in `legacy`.
 
@@ -128,12 +128,17 @@ resolves a task worktree, starts a fresh `codex exec`, renews the lease, records
 result and appends a haystack note. The agent uses the installed development skills;
 review and fixes are part of that delivery, not additional server-generated tasks.
 Use `--once` for a single attempt and `--loop` for continuous execution.
-The loop fetches fresh product metadata using its task's stable ID and selects
-`local_path` as the Git repository. No `--projects-root` or ID-to-path convention
-is used. An archived product, an unset placement or a missing local directory
-becomes blocked with an explicit reason; the loop does not clone or register a
-replacement. It saves `product.json` beside `task.json` and includes the product
-metadata and three-state release policy in the fresh agent prompt.
+`--execution-target sandbox|homeserver` selects the worker queue (default: sandbox).
+This is independent of where task-server is hosted; each machine runs its own
+loop/state directory and explicitly chooses its execution target.
+The loop fetches fresh product metadata using its task's stable ID. If `local_path`
+exists on this machine, it verifies that checkout's origin against `repository`.
+Otherwise it clones the registered canonical repository into its own
+`--state-dir/repositories/` directory and creates the normal per-task worktree.
+It never derives placement from product ID, replicates another machine's absolute
+path, or changes shared product metadata. A mismatched origin or archived product
+fails before agent launch. It saves `product.json` beside `task.json` and includes
+product metadata, execution target and release policy in the fresh agent prompt.
 
 Agent failure, malformed output and timeout become blocked work with saved logs.
 An expired lease is visible as interrupted work. Resuming a task retains its known
@@ -143,6 +148,15 @@ Unsent results are journaled and retried before another task is taken.
 The loop does not grant release or deployment authority. Put the intended outcome
 and relevant authorization in the task. It must report incomplete work as blocked,
 even when an earlier implementation step succeeded.
+
+For requests requiring development and real-machine checks, create a sandbox
+development task and a homeserver deployment/check task whose single `depends_on`
+is the development task ID. Development finishes on reproduction, fixes and
+sandbox regression checks; pending real-machine work remains visible in the
+successor rather than blocking completed development. Hand off the artifact/version,
+application procedure, concrete operations, and observable success criteria (logs,
+DB records, etc.). Ready homeserver work becomes claimable only after its dependency
+is done. This split is explicit; releases do not automatically generate deployments.
 
 ## Execution handoff
 
@@ -317,20 +331,34 @@ bash .github/smoke-image.sh task-server:test
 
 ### Claim a ready task
 
-`POST /worker/claim` accepts `{"worker":"task-work:<run-id>"}` and an
-optional `task_id` string:
+Tasks own one `execution_target`: `sandbox` or `homeserver`. HTTP create/patch
+(`/api/tasks`, `/api/tasks/:id`) and MCP `task_create`/`task_update` accept it;
+detail/list responses expose it. `GET /api/tasks?execution_target=homeserver` and
+MCP `task_list(execution_target: "homeserver")` filter by it. Omit the list filter
+to see both destinations. The UI displays it on task rows/cards, edits it in the
+create/edit form, and filters the common active list with a native select.
+
+Existing task documents without the field read as `sandbox` without a bulk
+rewrite. New tasks default to and persist `sandbox`. Updates that omit the field
+preserve its value. Explicit null, empty, unknown and multiple values are invalid.
+No generic labels or separate development/deployment field are added.
+
+`POST /worker/claim` accepts a nonblank `worker`, optional `execution_target`
+(default: `sandbox`), and optional nonblank `task_id` (one path segment excluding
+`.` and `..`; null and non-string IDs are **400**):
 
 ```json
-{"worker":"task-work:handoff", "task_id":"the-task-to-resume"}
+{"worker":"task-work:handoff", "execution_target":"homeserver", "task_id":"the-task-to-resume"}
 ```
 
-Without `task_id`, the existing queue selects eligible ready tasks by priority
+The server atomically considers only tasks matching the execution target, even
+with `task_id`. Omitting `task_id` selects eligible ready tasks by priority
 (descending), then creation time (oldest first); ties retain ledger filename order.
-An empty eligible queue returns **204**. With `task_id`, only that task is
-considered: failure never falls back to another ready task or returns 204.
-`worker` must be nonblank. A supplied `task_id` must be a nonblank task ID (one
-path segment, excluding `.` and `..`); null and non-string values are **400**.
-Omit the field to use queue selection.
+An empty eligible queue, execution-target mismatch, or unfinished dependency
+returns **204**, including ID selection. These conditions leave tasks waiting
+without marking them blocked. ID selection never falls back to another task.
+Old claim clients always use the sandbox queue and cannot take homeserver work.
+Deploy the server contract before enabling homeserver clients.
 
 Success is **200** with the existing `{claim_id, lease_expires_at, task}` envelope.
 Selection, eligibility checks and lease creation share the ledger writer lock,
@@ -346,7 +374,7 @@ Failures use the existing JSON `{code, error}` shape:
 | 409 | `conflict` | `task_claimed` (existing claim; checked before readiness) |
 | 409 | `conflict` | `task_not_active` (archived or historical control task) |
 | 409 | `conflict` | `task_not_ready` |
-| 409 | `conflict` | `dependency_not_done` or `dependency_missing` |
+| 409 | `conflict` | `dependency_missing` |
 | 409 | `conflict` | `product_not_catalogued` or `product_archived` |
 | 400 | `invalid` | Input validation message, including missing product metadata |
 
@@ -361,7 +389,7 @@ For a bounded handoff, `task-work` consumers should send the authorized target a
 `task_id`, check the returned task ID, and handle 400/404/409 without retrying an
 unscoped claim. Update the consumer's queue instructions that previously said
 ID selection was unavailable after deploying a server with this contract.
-Existing callers, including `bin/task-loop`, may keep omitting the field;
+Callers may omit `task_id`; `bin/task-loop` explicitly sends its execution target;
 `--once` still means one queue attempt, not selection of a particular ID.
 
 ### One original completion report
@@ -422,7 +450,7 @@ No ledger migration or rewriting is required.
 
 | Tool | Response and explicit follow-up |
 | --- | --- |
-| `task_list(status?, product_id?, limit?, offset?)` | `tasks` with ID, product, title, status, priority, dependency/status and blocker; no prose or evidence. Default excludes closed tasks; supply one lifecycle status to include that status. |
+| `task_list(status?, product_id?, execution_target?, limit?, offset?)` | `tasks` with ID, product, execution target, title, status, priority, dependency/status and blocker; no prose or evidence. Default excludes closed tasks; supply one lifecycle status to include that status. |
 | `task_get(id)` | Task body and current lifecycle, claim, commit, report ID, timestamps, transitions and run counts. It does not expand completion prose, milestones, history or checkpoint values. |
 | `task_history(id, limit?, offset?)` | `entries` tagged by source field: `current_completion` (summary/verification/checks), `last_report`, `milestones`, `milestone_history`, `legacy_completion`, `report_ids`, `legacy`. Array entries retain their original index; historical values retain their original provenance, including overlapping legacy evidence. |
 | `run_list(task_id?, product_id?, source?, unread?, limit?, offset?)` | `runs` with metadata and IDs, without original body/notes/tails/checks. `unread:true` selects unread; `false` selects read. |

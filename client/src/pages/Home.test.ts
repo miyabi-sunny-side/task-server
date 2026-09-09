@@ -514,3 +514,54 @@ it.each([false, true])(
     }
   },
 );
+
+it("filters both the common list and blocked panel by execution destination", async () => {
+  const items = [
+    summary("legacy", "ready"),
+    { ...summary("remote", "ready"), execution_target: "homeserver" },
+    { ...summary("stopped", "blocked"), execution_target: "homeserver" },
+  ];
+  stubFetch({
+    tasks: () => jsonResponse(items),
+    control: () =>
+      jsonResponse(
+        plane({
+          stuck: [
+            {
+              task_id: "stopped",
+              status: "blocked",
+              kind: "normal",
+              since: "2026-09-09",
+              reason: "blocked",
+            },
+          ],
+        }),
+      ),
+  });
+  render(Home);
+  const rows = () =>
+    [...document.querySelectorAll<HTMLAnchorElement>('a[href^="/tasks/"]')]
+      .map((a) => a.getAttribute("href"))
+      .sort();
+  await waitFor(() =>
+    expect(rows()).toEqual([
+      "/tasks/legacy",
+      "/tasks/remote",
+      "/tasks/stopped",
+    ]),
+  );
+  await fireEvent.change(screen.getByLabelText("実行先で絞り込み"), {
+    target: { value: "sandbox" },
+  });
+  expect(rows()).toEqual(["/tasks/legacy"]);
+  expect(region("control").dataset.state).toBe("empty");
+  await fireEvent.change(screen.getByLabelText("実行先で絞り込み"), {
+    target: { value: "homeserver" },
+  });
+  expect(rows()).toEqual(["/tasks/remote", "/tasks/stopped"]);
+  expect(region("control").dataset.state).toBe("success");
+  await fireEvent.change(screen.getByLabelText("実行先で絞り込み"), {
+    target: { value: "" },
+  });
+  expect(rows()).toEqual(["/tasks/legacy", "/tasks/remote", "/tasks/stopped"]);
+});

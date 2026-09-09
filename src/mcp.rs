@@ -28,6 +28,9 @@ pub struct Status {
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TaskList {
+    /// Filter by sandbox or homeserver; omission includes both destinations.
+    #[serde(default, deserialize_with = "non_null")]
+    pub execution_target: Option<String>,
     #[serde(default, deserialize_with = "non_null")]
     pub status: Option<String>,
     #[serde(default, deserialize_with = "non_null")]
@@ -75,6 +78,13 @@ pub struct History {
 #[derive(Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TaskCreate {
+    /// One execution destination; omitted values keep the sandbox default.
+    #[serde(
+        default,
+        deserialize_with = "non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub execution_target: Option<String>,
     #[serde(
         default,
         deserialize_with = "non_null",
@@ -116,6 +126,13 @@ pub struct TaskCreate {
 #[derive(Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TaskUpdate {
+    /// sandbox or homeserver; omission preserves the current destination.
+    #[serde(
+        default,
+        deserialize_with = "non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub execution_target: Option<String>,
     pub id: String,
     #[serde(
         default,
@@ -252,6 +269,7 @@ fn brief_task(t: &Value) -> Value {
         &[
             "id",
             "product_id",
+            "execution_target",
             "title",
             "status",
             "priority",
@@ -329,13 +347,15 @@ impl Admin {
         }
     }
     #[tool(
-        description = "List compact tasks filtered by status/product_id. Default excludes closed tasks. Stable priority descending then id order; limit 1..200 (default 50), offset default 0. Follow next_offset until null; pages reflect current state."
+        description = "List compact tasks filtered by status/product_id/execution_target (sandbox or homeserver). Default excludes closed tasks. Stable priority descending then id order; limit 1..200 (default 50), offset default 0. Follow next_offset until null; pages reflect current state."
     )]
     fn task_list(&self, Parameters(a): Parameters<TaskList>) -> CallToolResult {
         answer((|| {
             validate_product(a.product_id.as_deref())?;
             validate_page(a.limit)?;
-            let tasks = task::list(&self.state, a.status.as_deref())?
+            let mut tasks = task::list(&self.state, a.status.as_deref())?;
+            task::filter_target(&mut tasks, a.execution_target.as_deref())?;
+            let tasks = tasks
                 .into_iter()
                 .filter(|t| a.product_id.as_ref().is_none_or(|p| t["product_id"] == *p))
                 .map(|t| brief_task(&t))
@@ -355,6 +375,7 @@ impl Admin {
                     "title",
                     "body",
                     "product_id",
+                    "execution_target",
                     "status",
                     "priority",
                     "kind",
@@ -423,7 +444,7 @@ impl Admin {
         })())
     }
     #[tool(
-        description = "Create a draft task with title, body, product_id, optional id/priority/dependency/release_level. Returns compact receipt; task_get reads the body."
+        description = "Create a draft task with title, body, product_id, optional id/priority/dependency/release_level/execution_target (sandbox default, or homeserver). Returns compact receipt; task_get reads the body."
     )]
     fn task_create(&self, Parameters(a): Parameters<TaskCreate>) -> CallToolResult {
         let fields = fields(&a);
@@ -481,6 +502,7 @@ impl Admin {
                                 "id",
                                 "task_id",
                                 "product_id",
+                                "execution_target",
                                 "source",
                                 "at",
                                 "outcome",

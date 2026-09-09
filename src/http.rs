@@ -26,6 +26,7 @@ pub async fn api_tasks(
     } else {
         task::list(&s, q.get("status").map(String::as_str))?
     };
+    task::filter_target(&mut ts, q.get("execution_target").map(String::as_str))?;
     if let Some(p) = q.get("product_id") {
         ts.retain(|t| t["product_id"] == *p);
     }
@@ -147,7 +148,12 @@ pub async fn worker_claim(
         })
         .transpose()?;
     Ok(
-        match task::claim(&s, task::string(&v, "worker"), task_id)? {
+        match task::claim(
+            &s,
+            task::string(&v, "worker"),
+            task_id,
+            task::execution_target(&v)?,
+        )? {
             Some(v) => Json(v).into_response(),
             None => StatusCode::NO_CONTENT.into_response(),
         },

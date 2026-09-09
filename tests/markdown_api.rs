@@ -42,10 +42,20 @@ fn lease_interruption_and_resume_preserve_evidence() {
         .unwrap();
     task::create(&state, json!({"id":"t","title":"test","product_id":"a/b"})).unwrap();
     task::set_status(&state, "t", "ready").unwrap();
-    let claim = task::claim(&state, "worker", None).unwrap().unwrap();
-    assert!(task::claim(&state, "other", None).unwrap().is_none());
+    let claim = task::claim(&state, "worker", None, "sandbox")
+        .unwrap()
+        .unwrap();
+    assert!(
+        task::claim(&state, "other", None, "sandbox")
+            .unwrap()
+            .is_none()
+    );
     clock.advance_secs(11);
-    assert!(task::claim(&state, "other", None).unwrap().is_none());
+    assert!(
+        task::claim(&state, "other", None, "sandbox")
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(state.store.get("tasks", "t").unwrap()["status"], "blocked");
     assert!(
         task::report(
@@ -55,7 +65,9 @@ fn lease_interruption_and_resume_preserve_evidence() {
         .is_err()
     );
     task::set_status(&state, "t", "ready").unwrap();
-    let c = task::claim(&state, "worker", None).unwrap().unwrap();
+    let c = task::claim(&state, "worker", None, "sandbox")
+        .unwrap()
+        .unwrap();
     task::report(&state,json!({"claim_id":c["claim_id"],"outcome":"done","commit_sha":"abc","milestones":[{"name":"verified","commit_sha":"abc","evidence":"cargo test passed"}]})).unwrap();
     task::patch(&state, "t", json!({"commit_sha":"def"})).unwrap();
     let t = state.store.get("tasks", "t").unwrap();
@@ -101,7 +113,7 @@ fn report_resend_is_idempotent_but_conflicting_outcome_is_rejected() {
         .unwrap();
     task::create(&s, json!({"id":"t","title":"test","product_id":"a/b"})).unwrap();
     task::set_status(&s, "t", "ready").unwrap();
-    let c = task::claim(&s, "w", None).unwrap().unwrap();
+    let c = task::claim(&s, "w", None, "sandbox").unwrap().unwrap();
     let r = json!({"claim_id":c["claim_id"],"outcome":"done","summary":"finished"});
     let first = task::report(&s, r.clone()).unwrap();
     assert_eq!(task::report(&s, r).unwrap(), first);
@@ -171,22 +183,42 @@ async fn mcp_flat_crud_contract_over_json_rpc() {
             .iter()
             .any(|t| t["name"] == "task_create")
     );
-    let (_,_,created)=rpc(app.clone(),Some(session),json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"task_create","arguments":{"id":"mcp-task","title":"flat arguments","body":"markdown"}}})).await;
+    let (_,_,created)=rpc(app.clone(),Some(session),json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"task_create","arguments":{"id":"mcp-task","title":"flat arguments","body":"markdown","execution_target":"homeserver"}}})).await;
+    assert_eq!(
+        created["result"]["structuredContent"]["execution_target"],
+        "homeserver"
+    );
     assert_eq!(
         created["result"]["structuredContent"]["title"],
         "flat arguments"
     );
-    let (_,_,updated)=rpc(app.clone(),Some(session),json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"task_update","arguments":{"id":"mcp-task","title":"updated"}}})).await;
+    let (_,_,updated)=rpc(app.clone(),Some(session),json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"task_update","arguments":{"id":"mcp-task","title":"updated","execution_target":"sandbox"}}})).await;
     assert_eq!(updated["result"]["structuredContent"]["title"], "updated");
     let (_,_,got)=rpc(app.clone(),Some(session),json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"task_get","arguments":{"id":"mcp-task"}}})).await;
     assert_eq!(got["result"]["structuredContent"]["body"], "markdown");
+    assert_eq!(
+        got["result"]["structuredContent"]["execution_target"],
+        "sandbox"
+    );
+    for (target, count) in [("sandbox", 1), ("homeserver", 0)] {
+        let (_, _, result) = rpc(app.clone(), Some(session), json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"task_list","arguments":{"execution_target":target}}})).await;
+        let tasks = result["result"]["structuredContent"]["tasks"]
+            .as_array()
+            .unwrap();
+        assert_eq!(tasks.len(), count);
+        if count > 0 {
+            assert_eq!(tasks[0]["execution_target"], target);
+        }
+    }
     state
         .store
         .put("products", "a/b", json!({"id":"a/b"}))
         .unwrap();
     task::patch(&state, "mcp-task", json!({"product_id":"a/b"})).unwrap();
     task::set_status(&state, "mcp-task", "ready").unwrap();
-    let claim = task::claim(&state, "test", None).unwrap().unwrap();
+    let claim = task::claim(&state, "test", None, "sandbox")
+        .unwrap()
+        .unwrap();
     let payload = json!({"claim_id":claim["claim_id"],"outcome":"done","report_markdown":"# Original\nUnverified idea.","commit_sha":"abc","checks":[{"name":"cargo test","exit_code":0}],"milestones":[{"name":"implemented"}]});
     let (code, reported) = request(app.clone(), "POST", "/worker/report", payload.clone()).await;
     assert_eq!(code, StatusCode::OK);
@@ -270,7 +302,11 @@ fn claim_marks_missing_product_and_dependency_as_visible_blocking() {
     ] {
         s.store.put("tasks",id,json!({"id":id,"status":"ready","kind":"normal","product_id":product,"depends_on":dependency})).unwrap();
     }
-    assert!(task::claim(&s, "worker", None).unwrap().is_none());
+    assert!(
+        task::claim(&s, "worker", None, "sandbox")
+            .unwrap()
+            .is_none()
+    );
     for id in ["missing-product", "missing-dependency"] {
         let t = s.store.get("tasks", id).unwrap();
         assert_eq!(t["status"], "blocked");
@@ -346,7 +382,10 @@ async fn mcp_checkpoint_round_trip_new_session_and_expired_execution_lookup() {
         .unwrap();
     task::create(&state, json!({"id":"t","title":"test","product_id":"a/b"})).unwrap();
     task::set_status(&state, "t", "ready").unwrap();
-    let claim = task::claim(&state, "worker", None).unwrap().unwrap()["claim_id"].clone();
+    let claim = task::claim(&state, "worker", None, "sandbox")
+        .unwrap()
+        .unwrap()["claim_id"]
+        .clone();
     let app = task_server::app(state.clone());
     let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"checkpoint-test","version":"1"}}});
     let (_, headers, _) = rpc(app.clone(), None, init.clone()).await;
@@ -741,6 +780,17 @@ async fn mcp_tool_schemas_reject_ignored_arguments() {
         session,
         vec![
             ("task_list", json!({"title":"ignored"})),
+            ("task_list", json!({"execution_target":"both"})),
+            (
+                "task_create",
+                json!({"title":"x","execution_target":"both"}),
+            ),
+            ("task_update", json!({"id":"a","execution_target":"both"})),
+            ("task_create", json!({"title":"x","execution_target":null})),
+            (
+                "task_update",
+                json!({"id":"a","execution_target":["sandbox","homeserver"]}),
+            ),
             ("task_list", json!({"status":"bogus"})),
             ("task_list", json!({"product_id":"invalid"})),
             ("task_list", json!({"limit":0})),
@@ -949,13 +999,6 @@ async fn targeted_claim_errors_never_fall_back() {
         ),
         (
             "target",
-            json!({"depends_on":"older"}),
-            StatusCode::CONFLICT,
-            "conflict",
-            "dependency_not_done",
-        ),
-        (
-            "target",
             json!({"depends_on":"absent"}),
             StatusCode::CONFLICT,
             "conflict",
@@ -1129,4 +1172,209 @@ async fn targeted_claim_requires_ready_after_expiry_and_allows_done_dependency()
         state.store.get("tasks", "newer").unwrap()["status"],
         "ready"
     );
+}
+
+#[tokio::test]
+async fn execution_targets_route_legacy_and_dependent_tasks() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(Store::open(dir.path()).unwrap());
+    state
+        .store
+        .put("products", "a/b", json!({"id":"a/b"}))
+        .unwrap();
+    let app = task_server::app(state.clone());
+    let (_, home) = request(app.clone(), "POST", "/api/tasks", json!({"id":"home","title":"deploy","product_id":"a/b","execution_target":"homeserver","depends_on":"dev"})).await;
+    assert_eq!(home["execution_target"], "homeserver");
+    state
+        .store
+        .put(
+            "tasks",
+            "dev",
+            json!({"id":"dev","title":"legacy","status":"ready","product_id":"a/b"}),
+        )
+        .unwrap();
+    task::set_status(&state, "home", "ready").unwrap();
+    for payload in [
+        json!({"worker":"old","task_id":"home"}),
+        json!({"worker":"home","execution_target":"homeserver"}),
+        json!({"worker":"home","execution_target":"homeserver","task_id":"home"}),
+    ] {
+        assert_eq!(
+            request(app.clone(), "POST", "/worker/claim", payload)
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+    }
+    assert_eq!(state.store.get("tasks", "home").unwrap()["status"], "ready");
+    let (_, legacy) = request(app.clone(), "GET", "/api/tasks/dev", json!(null)).await;
+    assert_eq!(legacy["execution_target"], "sandbox");
+    let (_, listed) = request(
+        app.clone(),
+        "GET",
+        "/api/tasks?execution_target=homeserver",
+        json!(null),
+    )
+    .await;
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["id"], "home");
+    let (code, dev) = request(
+        app.clone(),
+        "POST",
+        "/worker/claim",
+        json!({"worker":"legacy"}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(dev["task"]["id"], "dev");
+    assert_eq!(dev["task"]["execution_target"], "sandbox");
+    request(
+        app.clone(),
+        "POST",
+        "/worker/report",
+        json!({"claim_id":dev["claim_id"],"outcome":"done"}),
+    )
+    .await;
+    assert_eq!(
+        request(
+            app.clone(),
+            "POST",
+            "/worker/claim",
+            json!({"worker":"legacy"})
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    let (code, home) = request(
+        app.clone(),
+        "POST",
+        "/worker/claim",
+        json!({"worker":"home","execution_target":"homeserver"}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(home["task"]["id"], "home");
+    assert_eq!(
+        request(
+            app.clone(),
+            "POST",
+            "/worker/claim",
+            json!({"worker":"other","execution_target":"homeserver"})
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn execution_target_validation_and_updates_survive_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(Store::open(dir.path()).unwrap());
+    let app = task_server::app(state.clone());
+    let (_, created) = request(
+        app.clone(),
+        "POST",
+        "/api/tasks",
+        json!({"id":"dev","title":"default"}),
+    )
+    .await;
+    assert_eq!(created["execution_target"], "sandbox");
+    for bad in [
+        json!(""),
+        json!("both"),
+        json!(null),
+        json!(["sandbox", "homeserver"]),
+        json!(1),
+    ] {
+        for (method, path, payload) in [
+            (
+                "POST",
+                "/api/tasks",
+                json!({"title":"bad","execution_target":bad}),
+            ),
+            ("PATCH", "/api/tasks/dev", json!({"execution_target":bad})),
+            (
+                "POST",
+                "/worker/claim",
+                json!({"worker":"bad","execution_target":bad}),
+            ),
+        ] {
+            assert_eq!(
+                request(app.clone(), method, path, payload).await.0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
+    assert_eq!(
+        request(
+            app.clone(),
+            "GET",
+            "/api/tasks?execution_target=both",
+            json!(null)
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    let (_, changed) = request(
+        app.clone(),
+        "PATCH",
+        "/api/tasks/dev",
+        json!({"execution_target":"homeserver"}),
+    )
+    .await;
+    assert_eq!(changed["execution_target"], "homeserver");
+    drop(app);
+    drop(state);
+    assert_eq!(
+        Store::open(dir.path())
+            .unwrap()
+            .get("tasks", "dev")
+            .unwrap()["execution_target"],
+        "homeserver"
+    );
+}
+
+#[test]
+fn concurrent_executors_claim_only_their_own_target_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(Store::open(dir.path()).unwrap());
+    state
+        .store
+        .put("products", "a/b", json!({"id":"a/b"}))
+        .unwrap();
+    for target in ["sandbox", "homeserver"] {
+        task::create(
+            &state,
+            json!({"id":target,"title":target,"product_id":"a/b","execution_target":target}),
+        )
+        .unwrap();
+        task::set_status(&state, target, "ready").unwrap();
+    }
+    let barrier = Arc::new(std::sync::Barrier::new(4));
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = ["sandbox", "homeserver", "sandbox", "homeserver"]
+            .into_iter()
+            .map(|target| {
+                let state = state.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    let result = task::claim(&state, target, None, target).unwrap();
+                    if let Some(claim) = &result {
+                        assert_eq!(claim["task"]["execution_target"], target);
+                    }
+                    result
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(results.len(), 2);
+    assert_ne!(results[0]["task"]["id"], results[1]["task"]["id"]);
 }

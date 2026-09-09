@@ -36,7 +36,27 @@ fn required(v: &Value, k: &str) -> Result<String, Error> {
         Ok(s.into())
     }
 }
+/// Missing targets preserve the original sandbox queue; explicit values are strict.
+pub fn execution_target(v: &Value) -> Result<&str, Error> {
+    match v.get("execution_target") {
+        None => Ok("sandbox"),
+        Some(Value::String(target)) if matches!(target.as_str(), "sandbox" | "homeserver") => {
+            Ok(target)
+        }
+        _ => Err(Error::Invalid(
+            "execution_target must be sandbox or homeserver".into(),
+        )),
+    }
+}
+pub fn filter_target(tasks: &mut Vec<Value>, target: Option<&str>) -> Result<(), Error> {
+    if let Some(target) = target {
+        execution_target(&json!({"execution_target":target}))?;
+        tasks.retain(|t| execution_target(t).ok() == Some(target));
+    }
+    Ok(())
+}
 pub fn create(s: &AppState, v: Value) -> Result<Value, Error> {
+    let target = execution_target(&v)?;
     let id = v["id"]
         .as_str()
         .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
@@ -48,7 +68,7 @@ pub fn create(s: &AppState, v: Value) -> Result<Value, Error> {
         crate::product::check_product_id("product_id", p)?;
     }
     let now = format_z(s.clock.now());
-    let mut t = json!({"id":id,"title":title,"body":"","status":"draft","kind":"normal","priority":0,"product_id":null,"depends_on":null,"blocked_by":null,"branch":null,"commit_sha":null,"verification":null,"summary":null,"checks":[],"milestones":[],"milestone_history":[],"claim_id":null,"claimed_by":null,"lease_expires_at":null,"created_at":now,"updated_at":now,"done_at":null,"closed_at":null});
+    let mut t = json!({"id":id,"title":title,"body":"","status":"draft","execution_target":target,"kind":"normal","priority":0,"product_id":null,"depends_on":null,"blocked_by":null,"branch":null,"commit_sha":null,"verification":null,"summary":null,"checks":[],"milestones":[],"milestone_history":[],"claim_id":null,"claimed_by":null,"lease_expires_at":null,"created_at":now,"updated_at":now,"done_at":null,"closed_at":null});
     for k in [
         "body",
         "product_id",
@@ -119,6 +139,7 @@ pub(crate) fn milestones(
     Ok(())
 }
 pub fn patch(s: &AppState, id: &str, v: Value) -> Result<Value, Error> {
+    execution_target(&v)?;
     s.store.transaction(|a| {
         expire(a, &format_z(s.clock.now()))?;
         a.update("tasks", id, |t| {
@@ -142,6 +163,7 @@ pub fn patch(s: &AppState, id: &str, v: Value) -> Result<Value, Error> {
                 "body",
                 "product_id",
                 "priority",
+                "execution_target",
                 "depends_on",
                 "branch",
                 "verification",
@@ -245,6 +267,7 @@ pub fn list(s: &AppState, status: Option<&str>) -> Result<Vec<Value>, Error> {
     let mut ts = s.store.list("tasks")?;
     ts.retain(|t| active(t) && status.map_or(!closed(string(t, "status")), |x| t["status"] == x));
     for t in &mut ts {
+        t["execution_target"] = json!(execution_target(t)?);
         if let Some(dependency) = t["depends_on"].as_str() {
             match s.store.get("tasks", dependency) {
                 Ok(dep) if dep["status"] != "done" => {
@@ -267,6 +290,7 @@ pub fn list(s: &AppState, status: Option<&str>) -> Result<Vec<Value>, Error> {
 pub fn card(s: &AppState, id: &str) -> Result<Value, Error> {
     sweep(s)?;
     let mut t = s.store.get("tasks", id)?;
+    t["execution_target"] = json!(execution_target(&t)?);
     t["available_transitions"] = if active(&t) {
         json!(
             STATUSES
@@ -290,7 +314,13 @@ pub fn card(s: &AppState, id: &str) -> Result<Value, Error> {
 fn envelope(t: Value) -> Value {
     json!({"claim_id":t["claim_id"],"lease_expires_at":t["lease_expires_at"],"task":t})
 }
-pub fn claim(s: &AppState, worker: &str, task_id: Option<&str>) -> Result<Option<Value>, Error> {
+pub fn claim(
+    s: &AppState,
+    worker: &str,
+    task_id: Option<&str>,
+    target: &str,
+) -> Result<Option<Value>, Error> {
+    execution_target(&json!({"execution_target":target}))?;
     if worker.trim().is_empty() {
         return Err(Error::Invalid("worker is required".into()));
     }
@@ -316,6 +346,9 @@ pub fn claim(s: &AppState, worker: &str, task_id: Option<&str>) -> Result<Option
                 .then_with(|| string(a, "created_at").cmp(string(b, "created_at")))
         });
         for mut t in ts {
+            if execution_target(&t)? != target {
+                continue;
+            }
             let rejection = if t["claim_id"].is_string() {
                 Some("task_claimed")
             } else if !active(&t) {
@@ -346,12 +379,7 @@ pub fn claim(s: &AppState, worker: &str, task_id: Option<&str>) -> Result<Option
             if let Some(dep) = t["depends_on"].as_str() {
                 match a.get("tasks", dep) {
                     Ok(dependency) if dependency["status"] == "done" => {}
-                    Ok(_) => {
-                        if task_id.is_some() {
-                            return Err(Error::Conflict("dependency_not_done".into()));
-                        }
-                        continue;
-                    }
+                    Ok(_) => continue,
                     Err(Error::NotFound(_)) => {
                         if task_id.is_some() {
                             return Err(Error::Conflict("dependency_missing".into()));
@@ -363,6 +391,7 @@ pub fn claim(s: &AppState, worker: &str, task_id: Option<&str>) -> Result<Option
                     Err(error) => return Err(error),
                 }
             }
+            t["execution_target"] = json!(target);
             t["status"] = json!("wip");
             t["claim_id"] = json!(uuid::Uuid::new_v4().to_string());
             crate::checkpoint::begin(&mut t, &now)?;
@@ -488,11 +517,16 @@ pub fn summary(t: &Value) -> Value {
         "release_tag",
         "release_level",
     ];
-    Value::Object(
+    let mut result = Value::Object(
         keys.into_iter()
             .filter_map(|k| t.get(k).map(|v| (k.into(), v.clone())))
             .collect(),
-    )
+    );
+    result["execution_target"] = t
+        .get("execution_target")
+        .cloned()
+        .unwrap_or(json!("sandbox"));
+    result
 }
 
 fn block_unclaimable(

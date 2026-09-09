@@ -16,7 +16,7 @@ import sys
 import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 
 def object_schema(properties):
@@ -84,18 +84,36 @@ def git(path, *args):
     return subprocess.run(['git', '-C', str(path), *args], check=True, capture_output=True, text=True).stdout.strip()
 
 
+def repository_identity(address):
+    if '://' not in address and ':' in address and not address.startswith('/'):
+        host, path = address.split(':', 1)
+        address = 'ssh://' + host + '/' + path
+    parsed = urlsplit(address)
+    if parsed.hostname:
+        port = None if parsed.port == {'http': 80, 'https': 443, 'ssh': 22}.get(parsed.scheme) else parsed.port
+        return parsed.hostname.lower(), port, parsed.path.strip('/').removesuffix('.git')
+    return str(Path(parsed.path).expanduser().resolve())
+
+
 def workspace(args, task, metadata):
     product = task.get('product_id') or ''
     if metadata.get('id') != product:
         raise ValueError('product metadata does not match task product_id')
     if metadata.get('archived') or metadata.get('archived_at'):
         raise ValueError('product is archived')
+    repository = metadata.get('repository')
+    if not isinstance(repository, str) or not repository.strip():
+        raise ValueError('product repository is not configured')
     placement = metadata.get('local_path')
-    if not isinstance(placement, str) or not Path(placement).is_absolute():
-        raise ValueError('product local_path is not configured; update product metadata explicitly')
-    repo = Path(placement).resolve()
-    if not repo.is_dir():
-        raise ValueError('registered product local_path is absent on this machine')
+    repo = Path(placement).resolve() if isinstance(placement, str) and Path(placement).is_absolute() else None
+    if repo is None or not repo.is_dir():
+        # A shared ledger's local_path can belong to another machine.
+        repo = args.state_dir / 'repositories' / hashlib.sha256(repository.encode()).hexdigest()
+        if not repo.exists():
+            repo.parent.mkdir(parents=True, exist_ok=True)
+            git(repo.parent, 'clone', '--', repository, str(repo))
+    if repository_identity(git(repo, 'remote', 'get-url', 'origin')) != repository_identity(repository):
+        raise ValueError('repository origin does not match product repository')
     key = hashlib.sha256((product + '\0' + task['id']).encode()).hexdigest()
     ownership = args.state_dir / 'workspaces' / (key + '.json')
     entries = []
@@ -285,7 +303,7 @@ def execute(args, claim, folder):
         request(args, endpoint, {'claim_id': claim['claim_id'], 'expected_revision': current['revision'] if current else 0,
                                 'set': {'worktree': str(path), 'branch': git(path, 'branch', '--show-current'),
                                         'machine': socket.gethostname(), 'logs_path': str(folder), 'next_step': 'execute_agent'}})
-        context = {key: task.get(key) for key in ('id', 'title', 'body', 'product_id', 'branch', 'commit_sha', 'milestones', 'summary', 'verification', 'report_id', 'execution_checkpoints')}
+        context = {key: task.get(key) for key in ('id', 'title', 'body', 'product_id', 'execution_target', 'branch', 'commit_sha', 'milestones', 'summary', 'verification', 'report_id', 'execution_checkpoints')}
         if isinstance(context['verification'], str):
             context['verification'] = context['verification'].encode()[-8192:].decode('utf-8', errors='ignore')
         prompt = ('このタスクだけを新しい文脈で実行する。AGENTS.md と knowledge-read を読み、'
@@ -418,7 +436,7 @@ def tick(args):
             flush(args, folder)
     if pending:
         return True
-    claim = request(args, '/worker/claim', {'worker': args.worker})
+    claim = request(args, '/worker/claim', {'worker': args.worker, 'execution_target': args.execution_target})
     if claim is None:
         return False
     key = hashlib.sha256(claim['claim_id'].encode()).hexdigest()
@@ -437,6 +455,7 @@ def main():
     mode.add_argument('--loop', action='store_true', help='keep claiming, sleeping when idle')
     parser.add_argument('--url', default='http://127.0.0.1:5004')
     parser.add_argument('--worker', default='task-loop')
+    parser.add_argument('--execution-target', choices=('sandbox', 'homeserver'), default='sandbox')
     parser.add_argument('--state-dir', type=Path, default=Path.home() / '.local/state/task-loop')
     parser.add_argument('--agent-command', default='codex exec', help='Codex-compatible command argv, parsed without a shell')
     parser.add_argument('--idle-seconds', type=float, default=10)

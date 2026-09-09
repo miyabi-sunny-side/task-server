@@ -38,6 +38,9 @@
      page): product first, then the state. The title is the page's h1 above. -->
 <div class="meta">
   <p class="product">{task.product_id}</p>
+  <p class="caption" data-field="execution-target">
+    実行先: {task.execution_target ?? "sandbox"}
+  </p>
   <p class="caption">現在の状態</p>
   <p class="badges" data-field="current-status">
     <span class="badge">{task.status}</span>

@@ -9,10 +9,12 @@
     fetchTasks,
     type ControlPlane,
     type TaskSummary,
+    type ExecutionTarget,
   } from "../lib/api";
 
   type FetchState = "loading" | "error" | "ready";
 
+  let target = $state<ExecutionTarget | "">("");
   let creating = $state(false);
   let plane = $state<ControlPlane | undefined>();
   let controlState = $state<FetchState>("loading");
@@ -24,8 +26,24 @@
   let controlLoaded = false;
   let listLoaded = false;
 
+  let visibleItems = $derived(
+    items.filter(
+      (item) => !target || (item.execution_target ?? "sandbox") === target,
+    ),
+  );
+  let visiblePlane = $derived(
+    plane && target
+      ? {
+          ...plane,
+          stuck: plane.stuck.filter((row) =>
+            visibleItems.some((item) => item.id === row.task_id),
+          ),
+        }
+      : plane,
+  );
+
   let drawnByPanel = $derived(
-    (plane?.stuck ?? [])
+    (visiblePlane?.stuck ?? [])
       .filter(
         (row) => row.reason === "blocked" || row.reason === "lease-expired",
       )
@@ -114,6 +132,14 @@
     <button class="btn primary" type="button" onclick={() => (creating = true)}
       >新規タスク</button
     >
+    <div class="target-filter">
+      <label for="execution-target-filter">実行先で絞り込み</label>
+      <select id="execution-target-filter" class="btn" bind:value={target}>
+        <option value="">すべて</option>
+        <option value="sandbox">sandbox</option>
+        <option value="homeserver">homeserver</option>
+      </select>
+    </div>
   </div>
   {#if creating}
     <TaskForm
@@ -127,14 +153,14 @@
   {/if}
   <ControlPanel
     fetchState={controlState}
-    {plane}
-    tasks={items}
+    plane={visiblePlane}
+    tasks={visibleItems}
     {onupdated}
     onretry={() => void loadControl()}
   />
   <StatusTaskList
     fetchState={listState}
-    {items}
+    items={visibleItems}
     {onupdated}
     drawnElsewhere={drawnByPanel}
     onretry={() => void loadList()}
@@ -143,5 +169,16 @@
 
 <style lang="sass">
   .actions
+    display: flex
+    flex-wrap: wrap
+    align-items: center
+    gap: var(--sp-3)
     margin-bottom: var(--sp-4)
+  .target-filter
+    display: flex
+    align-items: center
+    flex-wrap: wrap
+    gap: var(--sp-2)
+    font-size: var(--fs-xs)
+    color: var(--c-muted)
 </style>

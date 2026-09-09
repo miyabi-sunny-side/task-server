@@ -1,3 +1,5 @@
+export type ExecutionTarget = "sandbox" | "homeserver";
+
 export interface Milestone {
   report_id?: number;
   name: "implemented" | "verified" | "reviewed" | "merged" | "released";
@@ -7,6 +9,7 @@ export interface Milestone {
 }
 
 export interface TaskSummary {
+  execution_target?: ExecutionTarget;
   archived?: boolean;
   id: string;
   title: string;
@@ -61,6 +64,7 @@ export interface ExecutionCheckpoint {
 }
 
 export interface TaskCard {
+  execution_target?: ExecutionTarget;
   execution_checkpoints?: ExecutionCheckpoint[];
   report_id?: number;
   report_ids?: number[];
@@ -169,6 +173,7 @@ export function fetchTasks(
 // `done_at` is the moment this task first reached `done` — not `updated_at`,
 // which keeps moving through approval, landing, and release.
 export interface DoneTask {
+  execution_target?: ExecutionTarget;
   id: string;
   title: string;
   status: string;
@@ -253,6 +258,7 @@ export function fetchControl(signal?: AbortSignal): Promise<ControlPlane> {
 }
 
 export interface TaskFields {
+  execution_target?: ExecutionTarget;
   title: string;
   product_id: string;
   body: string;

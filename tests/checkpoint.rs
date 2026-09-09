@@ -19,7 +19,7 @@ fn seed(s: &AppState) {
 }
 fn claim(s: &AppState) -> String {
     task::set_status(s, "t", "ready").unwrap();
-    task::claim(s, "test", None).unwrap().unwrap()["claim_id"]
+    task::claim(s, "test", None, "sandbox").unwrap().unwrap()["claim_id"]
         .as_str()
         .unwrap()
         .into()
@@ -177,7 +177,7 @@ async fn invalid_patches_are_atomic_and_cannot_write_through_other_claims() {
     let id = claim(&s);
     task::create(&s, json!({"id":"other","title":"other","product_id":"a/b"})).unwrap();
     task::set_status(&s, "other", "ready").unwrap();
-    let other = task::claim(&s, "other", None).unwrap().unwrap()["claim_id"]
+    let other = task::claim(&s, "other", None, "sandbox").unwrap().unwrap()["claim_id"]
         .as_str()
         .unwrap()
         .to_owned();

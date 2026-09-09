@@ -93,6 +93,9 @@
               {/if}
               <span class="tail">
                 <span class="done-at">{item.closed_at}</span>
+                <span class="done-at" data-field="execution-target"
+                  >{item.execution_target ?? "sandbox"}</span
+                >
                 <span class="badge">{item.status}</span>
                 {#if item.archived}<span class="badge">履歴</span>{/if}
                 {#if item.release_tag}

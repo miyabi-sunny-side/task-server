@@ -243,6 +243,9 @@
 >
   <span class="head">
     <span class="product product-first">{item.product_id}</span>
+    <span class="product" data-field="execution-target"
+      >{item.execution_target ?? "sandbox"}</span
+    >
   </span>
   <span class="name">{item.title}</span>
   {#if item.status === "ready" && item.depends_on && item.dependency_status}

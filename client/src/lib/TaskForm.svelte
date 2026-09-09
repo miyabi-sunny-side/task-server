@@ -17,6 +17,7 @@
   // A form owns its draft for its lifetime; background card refreshes do not.
   let product = $state(untrack(() => initial?.product_id ?? ""));
   let taskTitle = $state(untrack(() => initial?.title ?? ""));
+  let target = $state(untrack(() => initial?.execution_target ?? "sandbox"));
   let body = $state(untrack(() => initial?.body ?? ""));
   let busy = $state(false);
   let error = $state("");
@@ -32,6 +33,7 @@
         product_id: product.trim(),
         title: taskTitle.trim(),
         body,
+        execution_target: target,
       });
       onclose();
     } catch (cause) {
@@ -56,6 +58,13 @@
         disabled={busy}
       /></label
     >
+    <div class="field">
+      <label for="task-execution-target">実行先</label>
+      <select id="task-execution-target" bind:value={target} disabled={busy}>
+        <option value="sandbox">sandbox</option>
+        <option value="homeserver">homeserver</option>
+      </select>
+    </div>
     <label>title<input bind:value={taskTitle} disabled={busy} /></label>
     <label
       >body<textarea rows="8" bind:value={body} disabled={busy}
@@ -77,7 +86,7 @@
 </Modal>
 
 <style lang="sass">
-  form, label
+  form, label, .field
     display: flex
     flex-direction: column
     gap: var(--sp-2)
@@ -93,7 +102,7 @@
   .hint
     margin: 0
 
-  input, textarea
+  input, textarea, select
     width: 100%
     min-width: 0
     padding: var(--sp-2)
@@ -107,6 +116,6 @@
   textarea
     resize: vertical
 
-  input:focus, textarea:focus
+  input:focus, textarea:focus, select:focus
     border-color: var(--c-accent)
 </style>

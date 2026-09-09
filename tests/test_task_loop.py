@@ -2,6 +2,7 @@
 import json
 import os
 import signal
+import runpy
 import socket
 import time
 from pathlib import Path
@@ -22,6 +23,7 @@ class LoopTests(unittest.TestCase):
         self.repo.mkdir(parents=True)
         for args in [('init', '-b', 'main'), ('-c', 'user.name=Test', '-c', 'user.email=t@x', 'commit', '--allow-empty', '-m', 'initial')]:
             subprocess.run(['git', '-C', str(self.repo), *args], check=True, capture_output=True)
+        subprocess.run(['git', '-C', str(self.repo), 'remote', 'add', 'origin', 'https://example/canonical/project'], check=True, capture_output=True)
         self.calls = []
         self.product = {'id': 'org/repo', 'repository': 'https://example/canonical/project', 'local_path': str(self.repo), 'releases': False, 'archived': False}
         self.fail_report = False
@@ -84,6 +86,24 @@ class LoopTests(unittest.TestCase):
     def reports(self):
         return [body for path, body in self.calls if path == '/worker/report']
 
+    def test_execution_target_reaches_claim_and_prompt(self):
+        self.task['execution_target'] = 'homeserver'
+        result = self.run_loop('--execution-target', 'homeserver')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(next(body for path, body in self.calls if path == '/worker/claim')['execution_target'], 'homeserver')
+        context = json.loads(next((self.root/'state').glob('claims/*/prompt.txt')).read_text().split('\n', 1)[1])
+        self.assertEqual(context['task']['execution_target'], 'homeserver')
+
+    def test_foreign_placement_uses_canonical_repository_without_changing_registry(self):
+        self.product.update(local_path='/absent/other-machine/repo', repository=str(self.repo))
+        result = self.run_loop('--execution-target', 'homeserver')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.reports()[0]['outcome'], 'done')
+        record = json.loads(next((self.root/'state/workspaces').glob('*.json')).read_text())
+        origin = subprocess.check_output(['git', '-C', record['path'], 'remote', 'get-url', 'origin'], text=True).strip()
+        self.assertEqual(origin, str(self.repo))
+        self.assertEqual(self.product['local_path'], '/absent/other-machine/repo')
+
     def test_success_and_durable_logs(self):
         result = self.run_loop()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -109,7 +129,7 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(context['product'], self.product)
 
     def test_missing_placement_and_archived_product_do_not_launch(self):
-        for index, patch in enumerate(({'local_path': None}, {'archived': True})):
+        for index, patch in enumerate(({'local_path': None, 'repository': None}, {'archived': True})):
             with self.subTest(patch=patch):
                 self.calls.clear()
                 self.product.update(local_path=str(self.repo), archived=False)
@@ -438,6 +458,16 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(run['outcome'], 'blocked')
         self.assertEqual(run['body'], self.report_markdown)
         self.assertIn('409', run['note'])
+
+
+class RepositoryIdentityTests(unittest.TestCase):
+    def test_git_transports_match_but_hosts_and_nonstandard_ports_do_not(self):
+        identity = runpy.run_path(str(SCRIPT))['repository_identity']
+        expected = identity('https://example.test/org/repo')
+        for address in ['git@example.test:org/repo.git', 'ssh://git@example.test:22/org/repo.git', 'https://example.test:443/org/repo.git']:
+            self.assertEqual(identity(address), expected)
+        for address in ['https://other.test/org/repo', 'https://example.test:444/org/repo', 'ssh://git@example.test:2222/org/repo.git']:
+            self.assertNotEqual(identity(address), expected)
 
 
 if __name__ == '__main__':
