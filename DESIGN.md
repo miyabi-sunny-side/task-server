@@ -680,9 +680,14 @@ counterpart to carry, so it earns no token pair.
   a flat list of every registered product in server order, including
   archived records. No sub-header, detail route or mutation controls.
 
-  Each non-interactive card reuses the surface-raised, 1px border,
+  Each product starts collapsed in native `details`/`summary`. Its name is
+  the only visible row content; click, Enter or Space toggles its metadata.
+  Multiple rows may open independently, with no persisted open state.
+  The row reuses the surface-raised, 1px border,
   8px radius, 10px padding and 8px list-gap recipe. Product `id` is its
-  wrapping label-type heading. Below it, labelled definition-list
+  wrapping label-type summary with a visible native disclosure marker.
+  The summary has a minimum 36px hit target and the shared focus ring.
+  When expanded, labelled definition-list
   entries show `repository` (リポジトリ), `description` (説明),
   `local_path` (ローカルパス), `releases` (リリース), `archived`
   (アーカイブ), and `archived_at` (アーカイブ日時). Labels are muted
@@ -693,6 +698,14 @@ counterpart to carry, so it earns no token pair.
   (true) or 有効 (false). Show supplied archive time even if archived
   is false. No color alone communicates these values. Long values
   wrap with `overflow-wrap: anywhere`; no truncation or sideways table.
+
+  Above the list, a caption label プロダクト名で検索 names a native search input.
+  Input immediately filters the fetched full list by case-insensitive id substring;
+  no submit button or Enter is needed. Its left `search` dictionary icon is muted,
+  decorative, aria-hidden and unfocusable, with no click action. The input remains
+  enabled and uses the shared input recipe. Clearing restores all records;
+  no matches reads 一致するプロダクトがありません, distinct from an empty registry.
+  Background reloads preserve the query and open state of surviving visible rows.
 
   The list exposes `data-state="loading|empty|error|success"` and uses
   the existing spinner and state recipes. Empty reads
@@ -887,9 +900,12 @@ counterpart to carry, so it earns no token pair.
       item 1 remains テーマ設定 and the product link reaches `/products`
       by click or Enter. Esc closes the menu and returns hamburger
       focus; every reached control keeps the shared 2px focus outline.
-      Every product, including archived records, shows all registry
-      fields and the three distinct release values. Cards have no
-      focus stop. Long ids, descriptions, repositories and paths never
+      Every product, including archived records, starts with only its name
+      visible; its summary toggles all registry fields and three release values
+      by click/Enter/Space. Live name search filters without submitting, clears
+      to all records and distinguishes no matches from an empty registry.
+      The left search icon has no action or focus stop. Successful and failed
+      background refreshes preserve input, focus and surviving open rows. Long ids, descriptions, repositories and paths never
       make the document wider than the viewport. At 900px the column
       is 720px and its children 696px, with existing card geometry.
       Loading, empty, error/retry and success are observable; retry

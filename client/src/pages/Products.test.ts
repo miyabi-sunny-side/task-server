@@ -93,3 +93,32 @@ it("retains drawn metadata during failed background reloads and stops on unmount
   refresh();
   expect(fetchMock).toHaveBeenCalledTimes(2);
 });
+
+it("filters by name as input changes and preserves query and open rows on refresh", async () => {
+  const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(response(products));
+  vi.stubGlobal("fetch", fetchMock);
+  render(Products);
+  await waitFor(() => expect(region().dataset.state).toBe("success"));
+  const details = region().querySelectorAll("details");
+  expect(details).toHaveLength(3);
+  expect([...details].every((row) => !row.open)).toBe(true);
+  details[1].open = true;
+  const input = screen.getByRole("searchbox", { name: "プロダクト名で検索" });
+  await fireEvent.input(input, { target: { value: "PRODUCT-1" } });
+  expect(screen.getAllByRole("listitem")).toHaveLength(1);
+  expect(region().querySelector("summary")?.textContent).toBe("org/product-1");
+  fetchMock.mockResolvedValue(
+    response(products.map((p) => ({ ...p, description: "更新された説明" }))),
+  );
+  refresh();
+  await waitFor(() => expect(region().textContent).toContain("更新された説明"));
+  expect((input as HTMLInputElement).value).toBe("PRODUCT-1");
+  expect(region().querySelector("details")).toBe(details[1]);
+  expect(details[1].open).toBe(true);
+  await fireEvent.input(input, { target: { value: "更新された説明" } });
+  expect(screen.queryAllByRole("listitem")).toHaveLength(0);
+  expect(screen.getByText("一致するプロダクトがありません")).toBeTruthy();
+  expect(screen.queryByText("登録済みのプロダクトがありません")).toBeNull();
+  await fireEvent.input(input, { target: { value: "" } });
+  expect(screen.getAllByRole("listitem")).toHaveLength(3);
+});
