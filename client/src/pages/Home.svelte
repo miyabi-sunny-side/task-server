@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from "svelte";
   import TaskForm from "../lib/TaskForm.svelte";
   import ControlPanel from "../lib/ControlPanel.svelte";
   import StatusTaskList from "../lib/StatusTaskList.svelte";
@@ -14,8 +15,14 @@
 
   type FetchState = "loading" | "error" | "ready";
 
+  let {
+    creating = false,
+    onclose = () => {},
+  }: { creating?: boolean; onclose?: () => void } = $props();
+
+  onDestroy(() => onclose());
+
   let target = $state<ExecutionTarget | "">("");
-  let creating = $state(false);
   let plane = $state<ControlPlane | undefined>();
   let controlState = $state<FetchState>("loading");
   let items = $state<TaskSummary[]>([]);
@@ -129,9 +136,6 @@
 
 <div class="content">
   <div class="actions">
-    <button class="btn primary" type="button" onclick={() => (creating = true)}
-      >新規タスク</button
-    >
     <div class="target-filter">
       <label for="execution-target-filter">実行先で絞り込み</label>
       <select id="execution-target-filter" class="btn" bind:value={target}>
@@ -144,7 +148,7 @@
   {#if creating}
     <TaskForm
       title="新規タスク"
-      onclose={() => (creating = false)}
+      {onclose}
       onsave={async (fields) => {
         await createTask(fields);
         await loadList();

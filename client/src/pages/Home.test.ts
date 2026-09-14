@@ -178,7 +178,7 @@ describe("Home", () => {
     vi.unstubAllGlobals();
   });
 
-  it("only reads on load and keeps creation available with legacy queues", async () => {
+  it("only reads on load with legacy queues", async () => {
     const fetchMock = stubFetch({
       control: () =>
         jsonResponse(
@@ -190,7 +190,6 @@ describe("Home", () => {
     });
     render(Home);
     await waitFor(() => expect(region("tasks").dataset.state).toBe("success"));
-    expect(screen.getByRole("button", { name: "新規タスク" })).toBeTruthy();
     expect(region("control").dataset.state).toBe("empty");
     expect(writes(fetchMock)).toHaveLength(0);
     expect(
@@ -491,7 +490,7 @@ it.each([false, true])(
         ).disabled,
       ).toBe(true);
       await fireEvent.keyDown(window, { key: "Escape" });
-      const opener = screen.getByRole("button", { name: "新規タスク" });
+      const opener = screen.getByLabelText("実行先で絞り込み");
       if (moveFocus) opener.focus();
       tasks = tasks.map((task) =>
         task.id === "t-draft" ? { ...task, status: "ready" } : task,

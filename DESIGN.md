@@ -289,12 +289,16 @@ If a new size feels needed, use weight or muted color instead.
 
 The shell stacks three rows:
 
-1. **App header — invariant on every page.** Sticky, 48px, full width,
-   `--c-wash-base` background, 1px bottom hairline. Contents are exactly
-   three, left to right: the app title as a home link (`<a href="/">`,
+1. **App header.** Sticky, 48px, full width,
+   `--c-wash-base` background, 1px bottom hairline. Every page keeps
+   three controls, left to right: the app title as a home link (`<a href="/">`,
    label type, on-surface ink, no underline), the closed link
    (`<a href="/closed">`, label type, same ink, grouped beside the title
    with `--sp-2` gap), and the hamburger icon-button (right, unchanged).
+   The top page adds a fourth control: the existing text-only 新規タスク
+   primary button immediately before the hamburger, with `--sp-2` gap.
+   Other pages omit this button. It stays directly visible, outside the menu.
+   At narrow widths the title may ellipsize; the controls remain tappable.
    **The title and the closed link are the header's only navigation
    links**; every other destination lives inside the menu, so phone
    widths never crowd. The closed link is a plain page-navigation link,
@@ -308,10 +312,12 @@ The shell stacks three rows:
    title link or the browser itself.
 3. **Main content**, the only scrolling region.
 
-**Screen-level controls are content, not chrome.** A screen that offers
+**Screen-level controls.** A screen that offers
 actions on the whole screen's subject places them as the **first block
-inside the content column** (the new-task action on the top page sits
-there). It is never a third band, never sticky, and never full-width: the two bands above stay the only bands, and
+inside the content column**. The top page's 新規タスク is the exception:
+it lives in the header's right slot. The execution-target filter stays
+first in the content column. Content controls are never a third band,
+never sticky, and never full-width: the two bands above stay the only bands, and
 main content stays the only scrolling region, so the controls scroll away
 with the work they act on.
 
@@ -495,7 +501,9 @@ counterpart to carry, so it earns no token pair.
   never a solid accent fill, because the header is chrome present on
   every page and a nav link is not the primary action a page's one
   accent fill marks. The hamburger stays a 36px quiet icon-button with
-  `aria-label` and `aria-expanded`, unchanged.
+  `aria-label` and `aria-expanded`, unchanged. On the top page only,
+  新規タスク sits beside it as the page's one accent-filled `.btn.primary`.
+  It retains its text label and shared focus ring, with no added icon.
 - **Menu (from the hamburger):** a dropdown panel spatially anchored to
   the hamburger, not a modal — absolutely positioned at `top: 100%` /
   `right: 0` within the header's positioned right slot, `min-width`
@@ -518,8 +526,9 @@ counterpart to carry, so it earns no token pair.
   storage) and **does not close the modal** — the user watches the
   theme change live. Close via ×, Esc, or scrim; focus returns to the
   hamburger.
-- **Top page — active task ledger.** The first content block offers
-  新規タスク, the page's one primary action, and a labelled native select
+- **Top page — active task ledger.** 新規タスク opens the existing create
+  modal from the header's right slot; closing returns focus to that button.
+  The first content block offers a labelled native select
   実行先で絞り込み with すべて (default), sandbox and homeserver. It filters both
   status groups and the blocked-work panel, preserving selection during reloads.
   Controls wrap with existing spacing and input/button tokens. The task list follows,
@@ -775,9 +784,11 @@ counterpart to carry, so it earns no token pair.
   2. Choosing ライト in the theme modal sets `data-theme="light"`,
      turns the body `rgb(250, 246, 239)`, writes the storage key, and
      leaves the modal open.
-  3. At 375px the header contains exactly three interactive elements —
+  3. At 375px the closed header menu leaves three interactive elements —
      the title `<a href="/">`, the closed link `<a href="/closed">`, and
-     the hamburger `<button>` — and
+     the hamburger `<button>` — plus 新規タスク on `/` only, for four.
+     The creation button is absent on other pages and from the content column.
+     Header controls never overlap and
      `document.documentElement.scrollWidth` never exceeds the
      viewport, with the menu closed or open, on both `/` and `/closed`.
   4. Cards compute to 1px border / 8px radius / 10px padding / 8px gap;
@@ -865,10 +876,10 @@ counterpart to carry, so it earns no token pair.
       `--c-accent-subtle` (`rgba(94, 184, 199, 0.15)` in Sumi,
       `rgba(47, 111, 126, 0.1)` in Kinari), its computed `color` equals
       `--c-accent`, and its computed `border-radius` equals 6px. On no
-      page does the header itself contain a solid-accent-background
-      element — the closed link never computes a solid `--c-accent`
-      background in either state, so it never becomes a second
-      accent-filled control alongside a page's own primary button.
+      page does the closed link compute a solid `--c-accent` background
+      in either state. The top page's 新規タスク button is the header's
+      only solid-accent exception and the page's only primary action;
+      other pages have no solid-accent header control.
       `:focus-visible` on the closed link shows the same 2px accent
       outline as every other control, and clicking it or activating it
       with Enter navigates to `/closed` without a full page reload.

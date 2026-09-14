@@ -3,6 +3,8 @@
   import ThemeModal from "./ThemeModal.svelte";
   import { router } from "./router.svelte";
 
+  let { oncreate }: { oncreate?: () => void } = $props();
+
   let menuOpen = $state(false);
   let themeOpen = $state(false);
   let menuButton = $state<HTMLButtonElement | undefined>();
@@ -47,6 +49,11 @@
     </a>
   </div>
   <div class="menu-wrapper">
+    {#if oncreate}
+      <button class="btn primary" type="button" onclick={oncreate}
+        >新規タスク</button
+      >
+    {/if}
     <button
       class="icon-btn"
       type="button"
@@ -92,6 +99,7 @@
     display: flex
     align-items: center
     justify-content: space-between
+    gap: var(--sp-2)
     height: var(--header-h)
     padding: 0 var(--sp-3)
     background: var(--c-wash-base)
@@ -101,14 +109,19 @@
     display: flex
     align-items: center
     gap: var(--sp-2)
+    min-width: 0
 
   .title
+    overflow: hidden
+    text-overflow: ellipsis
+    white-space: nowrap
     font-size: var(--fs-md)
     font-weight: 500
     color: var(--c-on-surface)
     text-decoration: none
 
   .done-link
+    flex-shrink: 0
     display: inline-flex
     align-items: center
     min-height: 36px
@@ -131,5 +144,7 @@
     display: flex
     align-items: center
     align-self: stretch
+    flex-shrink: 0
+    gap: var(--sp-2)
 
 </style>

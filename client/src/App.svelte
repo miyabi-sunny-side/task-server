@@ -6,6 +6,8 @@
   import Home from "./pages/Home.svelte";
   import Products from "./pages/Products.svelte";
 
+  let creating = $state(false);
+
   $effect(() => {
     initRouter();
   });
@@ -15,7 +17,7 @@
   <title>Task Server</title>
 </svelte:head>
 
-<Header />
+<Header oncreate={router.index === 0 ? () => (creating = true) : undefined} />
 
 <main>
   {#if router.index === 1}
@@ -25,6 +27,6 @@
   {:else if router.index === 3}
     <Products />
   {:else}
-    <Home />
+    <Home {creating} onclose={() => (creating = false)} />
   {/if}
 </main>

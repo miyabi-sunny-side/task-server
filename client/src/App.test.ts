@@ -37,6 +37,57 @@ describe("App", () => {
     window.history.replaceState(null, "", "/");
   });
 
+  it("creates from the home header, preserves failed input and returns focus after closing", async () => {
+    let tasks: (typeof TASK)[] = [];
+    let failSave = true;
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(input);
+      if (url === "/api/tasks" && init?.method === "POST") {
+        if (failSave)
+          return new Response(JSON.stringify({ error: "save refused" }), {
+            status: 409,
+          });
+        tasks = [{ ...TASK, ...JSON.parse(String(init.body)) }];
+        return new Response(JSON.stringify(tasks[0]));
+      }
+      return new Response(
+        JSON.stringify(url === "/api/control" ? { stuck: [] } : tasks),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(App);
+    const opener = screen.getByRole("button", { name: "新規タスク" });
+    expect(screen.getByRole("banner").contains(opener)).toBe(true);
+    expect(screen.getAllByRole("button", { name: "新規タスク" })).toHaveLength(
+      1,
+    );
+    opener.focus();
+    await fireEvent.click(opener);
+    await fireEvent.input(screen.getByLabelText("product"), {
+      target: { value: TASK.product_id },
+    });
+    await fireEvent.input(screen.getByLabelText("title"), {
+      target: { value: TASK.title },
+    });
+    await fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    expect((await screen.findByRole("alert")).textContent).toBe("save refused");
+    expect(screen.getByLabelText("title")).toHaveProperty("value", TASK.title);
+    failSave = false;
+    await fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await screen.findByRole("link", { name: new RegExp(TASK.title) });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(document.activeElement).toBe(opener);
+    await fireEvent.click(opener);
+    await fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(opener);
+    await fireEvent.click(screen.getByRole("link", { name: "closed" }));
+    expect(screen.queryByRole("button", { name: "新規タスク" })).toBeNull();
+    await fireEvent.click(screen.getByRole("link", { name: "Task Server" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByRole("button", { name: "新規タスク" })).toBeTruthy();
+  });
+
   it("restores the products URL and reaches it from the menu", async () => {
     vi.stubGlobal(
       "fetch",
