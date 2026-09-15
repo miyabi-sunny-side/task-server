@@ -1,10 +1,11 @@
+mod common;
 use serde_json::json;
-use task_server::{AppState, ledger::Store, product, task};
+use task_server::{ledger::Store, product, task};
 
 #[test]
 fn explicit_registration_patch_archive_preserve_identity_and_metadata() {
     let dir = tempfile::tempdir().unwrap();
-    let s = AppState::new(Store::open(dir.path()).unwrap());
+    let s = common::state(Store::open(dir.path()).unwrap());
     let registered = product::put(
         &s,
         "old/name",
@@ -55,7 +56,7 @@ fn explicit_registration_patch_archive_preserve_identity_and_metadata() {
 #[test]
 fn product_fields_are_validated_before_writing() {
     let dir = tempfile::tempdir().unwrap();
-    let s = AppState::new(Store::open(dir.path()).unwrap());
+    let s = common::state(Store::open(dir.path()).unwrap());
     product::put(
         &s,
         "org/repo",

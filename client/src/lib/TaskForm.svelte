@@ -1,7 +1,11 @@
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { onMount, untrack } from "svelte";
   import Modal from "./Modal.svelte";
-  import type { TaskFields } from "./api";
+  import {
+    fetchExecutionTargets,
+    type ExecutionTargets,
+    type TaskFields,
+  } from "./api";
 
   let {
     initial,
@@ -17,11 +21,39 @@
   // A form owns its draft for its lifetime; background card refreshes do not.
   let product = $state(untrack(() => initial?.product_id ?? ""));
   let taskTitle = $state(untrack(() => initial?.title ?? ""));
-  let target = $state(untrack(() => initial?.execution_target ?? "sandbox"));
+  const originalTarget = untrack(() => initial?.execution_target ?? undefined);
+  let target = $state<string | undefined>(originalTarget);
+  let targets = $state<ExecutionTargets>();
+  let configError = $state(false);
   let body = $state(untrack(() => initial?.body ?? ""));
   let busy = $state(false);
   let error = $state("");
-  let invalid = $derived(!product.trim() || !taskTitle.trim());
+  let invalid = $derived(
+    !product.trim() || !taskTitle.trim()
+      ? "product と title を入力してください"
+      : (!initial || target !== originalTarget) &&
+          (!target || !targets?.labels.includes(target))
+        ? "実行先を選択してください"
+        : "",
+  );
+
+  const controller = new AbortController();
+  async function loadTargets() {
+    configError = false;
+    try {
+      const loaded = await fetchExecutionTargets(controller.signal);
+      if (controller.signal.aborted) return;
+      targets = loaded;
+      if (!initial && target === undefined)
+        target = loaded.default ?? undefined;
+    } catch {
+      if (!controller.signal.aborted) configError = true;
+    }
+  }
+  onMount(() => {
+    void loadTargets();
+    return () => controller.abort();
+  });
 
   async function save(event: SubmitEvent) {
     event.preventDefault();
@@ -33,7 +65,9 @@
         product_id: product.trim(),
         title: taskTitle.trim(),
         body,
-        execution_target: target,
+        ...(!initial || target !== originalTarget
+          ? { execution_target: target }
+          : {}),
       });
       onclose();
     } catch (cause) {
@@ -60,10 +94,38 @@
     >
     <div class="field">
       <label for="task-execution-target">実行先</label>
-      <select id="task-execution-target" bind:value={target} disabled={busy}>
-        <option value="sandbox">sandbox</option>
-        <option value="homeserver">homeserver</option>
+      <select
+        id="task-execution-target"
+        bind:value={target}
+        disabled={busy || !targets?.labels.length}
+      >
+        <option value={undefined} disabled
+          >{initial ? "未設定" : "実行先を選択"}</option
+        >
+        {#if originalTarget && !targets?.labels.includes(originalTarget)}
+          <option value={originalTarget}
+            >{originalTarget}{targets
+              ? "（現在の設定にありません）"
+              : ""}</option
+          >
+        {/if}
+        {#each targets?.labels ?? [] as name}
+          <option value={name}>{name}</option>
+        {/each}
       </select>
+      {#if configError}
+        <p class="hint" role="alert">実行先の設定を読み込めませんでした</p>
+        <button
+          class="btn"
+          type="button"
+          disabled={busy}
+          onclick={() => void loadTargets()}>実行先を再読み込み</button
+        >
+      {:else if !targets}
+        <p class="hint" role="status">実行先を読み込み中…</p>
+      {:else if targets.labels.length === 0}
+        <p class="hint">実行先が設定されていません</p>
+      {/if}
     </div>
     <label>title<input bind:value={taskTitle} disabled={busy} /></label>
     <label
@@ -71,7 +133,7 @@
       ></textarea></label
     >
     {#if invalid}<p class="hint" id="task-form-required">
-        product と title を入力してください
+        {invalid}
       </p>{/if}
     {#if error}<p class="state error" role="alert">{error}</p>{/if}
     <button
@@ -79,7 +141,7 @@
       class:primary={!invalid && !busy}
       type="submit"
       disabled={busy}
-      aria-disabled={invalid}
+      aria-disabled={!!invalid}
       aria-describedby={invalid ? "task-form-required" : undefined}>保存</button
     >
   </form>

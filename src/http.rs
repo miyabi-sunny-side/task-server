@@ -13,6 +13,9 @@ pub async fn healthz() -> &'static str {
 pub async fn api_health() -> Json<Value> {
     Json(json!({"status":"ok"}))
 }
+pub async fn api_execution_targets(State(s): State<AppState>) -> Json<Value> {
+    Json(json!(s.execution_targets))
+}
 pub async fn api_tasks(
     State(s): State<AppState>,
     Query(q): Query<BTreeMap<String, String>>,
@@ -26,6 +29,9 @@ pub async fn api_tasks(
     } else {
         task::list(&s, q.get("status").map(String::as_str))?
     };
+    for t in &mut ts {
+        task::project_target(&s, t);
+    }
     task::filter_target(&mut ts, q.get("execution_target").map(String::as_str))?;
     if let Some(p) = q.get("product_id") {
         ts.retain(|t| t["product_id"] == *p);
@@ -80,6 +86,9 @@ fn history(s: &AppState, done: bool) -> Result<Value, Error> {
         }
     });
     ts.sort_by(|a, b| task::string(b, "closed_at").cmp(task::string(a, "closed_at")));
+    for t in &mut ts {
+        task::project_target(s, t);
+    }
     Ok(json!(ts.iter().map(task::summary).collect::<Vec<_>>()))
 }
 pub async fn api_done(State(s): State<AppState>) -> Result<Json<Value>, Error> {
@@ -152,7 +161,7 @@ pub async fn worker_claim(
             &s,
             task::string(&v, "worker"),
             task_id,
-            task::execution_target(&v)?,
+            task::execution_target(&s, &v)?,
         )? {
             Some(v) => Json(v).into_response(),
             None => StatusCode::NO_CONTENT.into_response(),

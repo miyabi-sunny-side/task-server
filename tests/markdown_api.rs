@@ -1,3 +1,4 @@
+mod common;
 use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
@@ -29,7 +30,7 @@ use time::macros::datetime;
 fn lease_interruption_and_resume_preserve_evidence() {
     let dir = tempfile::tempdir().unwrap();
     let clock = SharedClock::at(datetime!(2026-09-05 00:00 UTC));
-    let state = AppState::new(Store::open(dir.path()).unwrap())
+    let state = common::state(Store::open(dir.path()).unwrap())
         .with_clock(Arc::new(clock.clone()))
         .with_ttl(10);
     state
@@ -42,17 +43,17 @@ fn lease_interruption_and_resume_preserve_evidence() {
         .unwrap();
     task::create(&state, json!({"id":"t","title":"test","product_id":"a/b"})).unwrap();
     task::set_status(&state, "t", "ready").unwrap();
-    let claim = task::claim(&state, "worker", None, "sandbox")
+    let claim = task::claim(&state, "worker", None, "forge")
         .unwrap()
         .unwrap();
     assert!(
-        task::claim(&state, "other", None, "sandbox")
+        task::claim(&state, "other", None, "forge")
             .unwrap()
             .is_none()
     );
     clock.advance_secs(11);
     assert!(
-        task::claim(&state, "other", None, "sandbox")
+        task::claim(&state, "other", None, "forge")
             .unwrap()
             .is_none()
     );
@@ -65,7 +66,7 @@ fn lease_interruption_and_resume_preserve_evidence() {
         .is_err()
     );
     task::set_status(&state, "t", "ready").unwrap();
-    let c = task::claim(&state, "worker", None, "sandbox")
+    let c = task::claim(&state, "worker", None, "forge")
         .unwrap()
         .unwrap();
     task::report(&state,json!({"claim_id":c["claim_id"],"outcome":"done","commit_sha":"abc","milestones":[{"name":"verified","commit_sha":"abc","evidence":"cargo test passed"}]})).unwrap();
@@ -78,7 +79,7 @@ fn lease_interruption_and_resume_preserve_evidence() {
 #[tokio::test]
 async fn http_without_identity_retirement_snapshot_and_run_receipts() {
     let dir = tempfile::tempdir().unwrap();
-    let state = AppState::new(Store::open(dir.path()).unwrap());
+    let state = common::state(Store::open(dir.path()).unwrap());
     let app = task_server::app(state.clone());
 
     let (code, t) = request(app.clone(), "POST", "/api/tasks", json!({"title":"new"})).await;
@@ -107,13 +108,13 @@ async fn http_without_identity_retirement_snapshot_and_run_receipts() {
 #[test]
 fn report_resend_is_idempotent_but_conflicting_outcome_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
-    let s = AppState::new(Store::open(dir.path()).unwrap());
+    let s = common::state(Store::open(dir.path()).unwrap());
     s.store
         .put("products", "a/b", json!({"id":"a/b","repository":"x"}))
         .unwrap();
     task::create(&s, json!({"id":"t","title":"test","product_id":"a/b"})).unwrap();
     task::set_status(&s, "t", "ready").unwrap();
-    let c = task::claim(&s, "w", None, "sandbox").unwrap().unwrap();
+    let c = task::claim(&s, "w", None, "forge").unwrap().unwrap();
     let r = json!({"claim_id":c["claim_id"],"outcome":"done","summary":"finished"});
     let first = task::report(&s, r.clone()).unwrap();
     assert_eq!(task::report(&s, r).unwrap(), first);
@@ -158,7 +159,7 @@ async fn rpc(
 #[tokio::test]
 async fn mcp_flat_crud_contract_over_json_rpc() {
     let dir = tempfile::tempdir().unwrap();
-    let state = AppState::new(Store::open(dir.path()).unwrap());
+    let state = common::state(Store::open(dir.path()).unwrap());
     let app = task_server::app(state.clone());
     let (code, headers, initialized)=rpc(app.clone(),None,json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"contract-test","version":"1"}}})).await;
     assert_eq!(code, StatusCode::OK);
@@ -183,24 +184,24 @@ async fn mcp_flat_crud_contract_over_json_rpc() {
             .iter()
             .any(|t| t["name"] == "task_create")
     );
-    let (_,_,created)=rpc(app.clone(),Some(session),json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"task_create","arguments":{"id":"mcp-task","title":"flat arguments","body":"markdown","execution_target":"homeserver"}}})).await;
+    let (_,_,created)=rpc(app.clone(),Some(session),json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"task_create","arguments":{"id":"mcp-task","title":"flat arguments","body":"markdown","execution_target":"field"}}})).await;
     assert_eq!(
         created["result"]["structuredContent"]["execution_target"],
-        "homeserver"
+        "field"
     );
     assert_eq!(
         created["result"]["structuredContent"]["title"],
         "flat arguments"
     );
-    let (_,_,updated)=rpc(app.clone(),Some(session),json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"task_update","arguments":{"id":"mcp-task","title":"updated","execution_target":"sandbox"}}})).await;
+    let (_,_,updated)=rpc(app.clone(),Some(session),json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"task_update","arguments":{"id":"mcp-task","title":"updated","execution_target":"forge"}}})).await;
     assert_eq!(updated["result"]["structuredContent"]["title"], "updated");
     let (_,_,got)=rpc(app.clone(),Some(session),json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"task_get","arguments":{"id":"mcp-task"}}})).await;
     assert_eq!(got["result"]["structuredContent"]["body"], "markdown");
     assert_eq!(
         got["result"]["structuredContent"]["execution_target"],
-        "sandbox"
+        "forge"
     );
-    for (target, count) in [("sandbox", 1), ("homeserver", 0)] {
+    for (target, count) in [("forge", 1), ("field", 0)] {
         let (_, _, result) = rpc(app.clone(), Some(session), json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"task_list","arguments":{"execution_target":target}}})).await;
         let tasks = result["result"]["structuredContent"]["tasks"]
             .as_array()
@@ -216,9 +217,7 @@ async fn mcp_flat_crud_contract_over_json_rpc() {
         .unwrap();
     task::patch(&state, "mcp-task", json!({"product_id":"a/b"})).unwrap();
     task::set_status(&state, "mcp-task", "ready").unwrap();
-    let claim = task::claim(&state, "test", None, "sandbox")
-        .unwrap()
-        .unwrap();
+    let claim = task::claim(&state, "test", None, "forge").unwrap().unwrap();
     let payload = json!({"claim_id":claim["claim_id"],"outcome":"done","report_markdown":"# Original\nUnverified idea.","commit_sha":"abc","checks":[{"name":"cargo test","exit_code":0}],"milestones":[{"name":"implemented"}]});
     let (code, reported) = request(app.clone(), "POST", "/worker/report", payload.clone()).await;
     assert_eq!(code, StatusCode::OK);
@@ -240,6 +239,109 @@ async fn mcp_flat_crud_contract_over_json_rpc() {
     let (_, repeated) = request(app, "POST", "/worker/report", payload).await;
     assert_eq!(repeated["report_id"], reported["report_id"]);
     assert_eq!(state.store.list("runs").unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn mcp_external_targets_and_historical_receipts_share_the_http_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("targets.yaml");
+    std::fs::write(
+        &path,
+        "labels: [forge, field, '研究 / 試行']\ndefault: forge",
+    )
+    .unwrap();
+    let state = AppState::from_vars(|key| match key {
+        "APP_DATA_DIR" => Some(dir.path().join("ledger").to_string_lossy().into_owned()),
+        "EXECUTION_TARGETS_FILE" => Some(path.to_string_lossy().into_owned()),
+        _ => None,
+    })
+    .unwrap();
+    let app = task_server::app(state.clone());
+    let (_, headers, _) = rpc(app.clone(),None,json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"external-target-test","version":"1"}}})).await;
+    let session = headers["mcp-session-id"].to_str().unwrap();
+    let config = mcp_call(&app, session, "execution_targets_get", json!({})).await;
+    assert_eq!(
+        config["result"]["structuredContent"],
+        request(app.clone(), "GET", "/api/execution-targets", json!(null))
+            .await
+            .1
+    );
+    for (id, target) in [("a", "forge"), ("b", "field"), ("c", "研究 / 試行")] {
+        let created = mcp_call(
+            &app,
+            session,
+            "task_create",
+            json!({"id":id,"title":target,"execution_target":target}),
+        )
+        .await;
+        assert_eq!(
+            created["result"]["structuredContent"]["execution_target"],
+            target
+        );
+        let updated = mcp_call(
+            &app,
+            session,
+            "task_update",
+            json!({"id":id,"execution_target":target}),
+        )
+        .await;
+        assert_eq!(
+            updated["result"]["structuredContent"]["execution_target"],
+            target
+        );
+        let listed = mcp_call(
+            &app,
+            session,
+            "task_list",
+            json!({"execution_target":target}),
+        )
+        .await;
+        assert_eq!(listed["result"]["structuredContent"]["tasks"][0]["id"], id);
+    }
+    for (id, target) in [("legacy", None), ("removed", Some("old queue"))] {
+        let mut original = json!({"id":id,"title":"old","status":"draft"});
+        if let Some(target) = target {
+            original["execution_target"] = json!(target);
+        }
+        state.store.put("tasks", id, original.clone()).unwrap();
+        let patched = mcp_call(
+            &app,
+            session,
+            "task_update",
+            json!({"id":id,"body":"edited"}),
+        )
+        .await;
+        let receipt = &patched["result"]["structuredContent"];
+        assert_eq!(receipt["execution_target"], target.unwrap_or("forge"));
+        assert_eq!(receipt["execution_target_configured"], target.is_none());
+        assert_eq!(
+            state
+                .store
+                .get("tasks", id)
+                .unwrap()
+                .get("execution_target"),
+            original.get("execution_target")
+        );
+        assert!(
+            state
+                .store
+                .get("tasks", id)
+                .unwrap()
+                .get("execution_target_configured")
+                .is_none()
+        );
+    }
+    let listed = mcp_call(
+        &app,
+        session,
+        "task_list",
+        json!({"execution_target":"old queue"}),
+    )
+    .await;
+    assert_eq!(
+        listed["result"]["structuredContent"]["tasks"][0]["id"],
+        "removed"
+    );
 }
 
 #[test]
@@ -292,7 +394,7 @@ fn adjacent_legacy_database_requires_explicit_migration() {
 #[test]
 fn claim_marks_missing_product_and_dependency_as_visible_blocking() {
     let dir = tempfile::tempdir().unwrap();
-    let s = AppState::new(Store::open(dir.path()).unwrap());
+    let s = common::state(Store::open(dir.path()).unwrap());
     s.store
         .put("products", "a/b", json!({"id":"a/b","repository":"url"}))
         .unwrap();
@@ -302,11 +404,7 @@ fn claim_marks_missing_product_and_dependency_as_visible_blocking() {
     ] {
         s.store.put("tasks",id,json!({"id":id,"status":"ready","kind":"normal","product_id":product,"depends_on":dependency})).unwrap();
     }
-    assert!(
-        task::claim(&s, "worker", None, "sandbox")
-            .unwrap()
-            .is_none()
-    );
+    assert!(task::claim(&s, "worker", None, "forge").unwrap().is_none());
     for id in ["missing-product", "missing-dependency"] {
         let t = s.store.get("tasks", id).unwrap();
         assert_eq!(t["status"], "blocked");
@@ -317,7 +415,7 @@ fn claim_marks_missing_product_and_dependency_as_visible_blocking() {
 #[tokio::test]
 async fn list_shapes_summary_projection_and_haystack_cursor_contract() {
     let dir = tempfile::tempdir().unwrap();
-    let s = AppState::new(Store::open(dir.path()).unwrap());
+    let s = common::state(Store::open(dir.path()).unwrap());
     s.store.put("tasks","draft",json!({"id":"draft","title":"draft","status":"draft","kind":"normal","body":"large body","legacy":{"huge":"record"},"last_report":{"huge":"record"}})).unwrap();
     s.store.put("tasks","done",json!({"id":"done","title":"done","status":"done","kind":"normal","milestones":[],"closed_at":"2026","summary":"finished","legacy":{}})).unwrap();
     s.store
@@ -373,7 +471,7 @@ async fn list_shapes_summary_projection_and_haystack_cursor_contract() {
 async fn mcp_checkpoint_round_trip_new_session_and_expired_execution_lookup() {
     let dir = tempfile::tempdir().unwrap();
     let clock = SharedClock::at(datetime!(2026-09-05 00:00 UTC));
-    let state = AppState::new(Store::open(dir.path()).unwrap())
+    let state = common::state(Store::open(dir.path()).unwrap())
         .with_clock(Arc::new(clock.clone()))
         .with_ttl(10);
     state
@@ -382,7 +480,7 @@ async fn mcp_checkpoint_round_trip_new_session_and_expired_execution_lookup() {
         .unwrap();
     task::create(&state, json!({"id":"t","title":"test","product_id":"a/b"})).unwrap();
     task::set_status(&state, "t", "ready").unwrap();
-    let claim = task::claim(&state, "worker", None, "sandbox")
+    let claim = task::claim(&state, "worker", None, "forge")
         .unwrap()
         .unwrap()["claim_id"]
         .clone();
@@ -438,7 +536,7 @@ async fn mcp_checkpoint_round_trip_new_session_and_expired_execution_lookup() {
 #[tokio::test]
 async fn explicit_product_mcp_updates_reach_http_and_worker_without_rescan() {
     let dir = tempfile::tempdir().unwrap();
-    let state = AppState::new(Store::open(dir.path()).unwrap());
+    let state = common::state(Store::open(dir.path()).unwrap());
     let app = task_server::app(state.clone());
     let (_, headers, _) = rpc(app.clone(), None, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"products-test","version":"1"}}})).await;
     let session = headers.get("mcp-session-id").unwrap().to_str().unwrap();
@@ -546,7 +644,7 @@ async fn rejects_arguments(
 #[tokio::test]
 async fn mcp_compact_reads_paginate_filter_and_reject_ignored_arguments() {
     let dir = tempfile::tempdir().unwrap();
-    let state = AppState::new(Store::open(dir.path()).unwrap());
+    let state = common::state(Store::open(dir.path()).unwrap());
     for (id, product, priority) in [("a", "a/b", 2), ("b", "a/b", 2), ("c", "c/d", 1)] {
         task::create(&state, json!({"id":id,"title":id,"body":"original task body","product_id":product,"priority":priority})).unwrap();
     }
@@ -634,7 +732,7 @@ async fn mcp_compact_reads_paginate_filter_and_reject_ignored_arguments() {
 #[tokio::test]
 async fn mcp_product_run_and_checkpoint_pages_preserve_originals() {
     let dir = tempfile::tempdir().unwrap();
-    let state = AppState::new(Store::open(dir.path()).unwrap());
+    let state = common::state(Store::open(dir.path()).unwrap());
     for (id, archived) in [("a/one", false), ("a/two", false), ("z/old", true)] {
         state.store.put("products",id,json!({"id":id,"repository":"https://example.test/repo","description":id,"archived":archived})).unwrap();
     }
@@ -737,7 +835,7 @@ async fn mcp_product_run_and_checkpoint_pages_preserve_originals() {
 #[tokio::test]
 async fn mcp_execution_filter_finds_checkpoints_beyond_default_page() {
     let dir = tempfile::tempdir().unwrap();
-    let state = AppState::new(Store::open(dir.path()).unwrap());
+    let state = common::state(Store::open(dir.path()).unwrap());
     task::create(&state, json!({"id":"t","title":"long execution history"})).unwrap();
     state.store.update("tasks","t",|t| {
         t["execution_checkpoints"] = json!((0..55).map(|i| json!({"execution_id":format!("execution-{i}"),"revision":i,"values":{"next_step":format!("step-{i}")}})).collect::<Vec<_>>());
@@ -772,7 +870,7 @@ async fn mcp_execution_filter_finds_checkpoints_beyond_default_page() {
 #[tokio::test]
 async fn mcp_tool_schemas_reject_ignored_arguments() {
     let dir = tempfile::tempdir().unwrap();
-    let app = task_server::app(AppState::new(Store::open(dir.path()).unwrap()));
+    let app = task_server::app(common::state(Store::open(dir.path()).unwrap()));
     let (_, headers, _) = rpc(app.clone(),None,json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"validation-test","version":"1"}}})).await;
     let session = headers["mcp-session-id"].to_str().unwrap();
     rejects_arguments(
@@ -780,7 +878,7 @@ async fn mcp_tool_schemas_reject_ignored_arguments() {
         session,
         vec![
             ("task_list", json!({"title":"ignored"})),
-            ("task_list", json!({"execution_target":"both"})),
+            ("task_list", json!({"execution_target":""})),
             (
                 "task_create",
                 json!({"title":"x","execution_target":"both"}),
@@ -789,7 +887,7 @@ async fn mcp_tool_schemas_reject_ignored_arguments() {
             ("task_create", json!({"title":"x","execution_target":null})),
             (
                 "task_update",
-                json!({"id":"a","execution_target":["sandbox","homeserver"]}),
+                json!({"id":"a","execution_target":["forge","field"]}),
             ),
             ("task_list", json!({"status":"bogus"})),
             ("task_list", json!({"product_id":"invalid"})),
@@ -823,7 +921,7 @@ fn starts_without_environment_mode_or_identity_configuration() {
 #[tokio::test]
 async fn browser_writes_preserve_validation_and_state_constraints() {
     let dir = tempfile::tempdir().unwrap();
-    let app = task_server::app(AppState::new(Store::open(dir.path()).unwrap()));
+    let app = task_server::app(common::state(Store::open(dir.path()).unwrap()));
     let (code, _) = request(app.clone(), "GET", "/api/session", json!({})).await;
     assert_eq!(code, StatusCode::NOT_FOUND);
     let (code, _) = request(app.clone(), "POST", "/api/tasks", json!({"title":""})).await;
@@ -897,7 +995,7 @@ fn claim_queue(state: &AppState) {
 #[tokio::test]
 async fn targeted_claim_reuses_lease_checkpoint_and_report_without_reordering_queue() {
     let dir = tempfile::tempdir().unwrap();
-    let state = AppState::new(Store::open(dir.path()).unwrap());
+    let state = common::state(Store::open(dir.path()).unwrap());
     claim_queue(&state);
     let app = task_server::app(state.clone());
     let older = state.store.get("tasks", "older").unwrap();
@@ -957,7 +1055,7 @@ async fn targeted_claim_reuses_lease_checkpoint_and_report_without_reordering_qu
 #[tokio::test]
 async fn targeted_claim_errors_never_fall_back() {
     let dir = tempfile::tempdir().unwrap();
-    let state = AppState::new(Store::open(dir.path()).unwrap());
+    let state = common::state(Store::open(dir.path()).unwrap());
     claim_queue(&state);
     let app = task_server::app(state.clone());
     let target = state.store.get("tasks", "target").unwrap();
@@ -1051,7 +1149,7 @@ async fn targeted_claim_errors_never_fall_back() {
 #[tokio::test]
 async fn targeted_claim_rejects_invalid_ids_without_claiming() {
     let dir = tempfile::tempdir().unwrap();
-    let state = AppState::new(Store::open(dir.path()).unwrap());
+    let state = common::state(Store::open(dir.path()).unwrap());
     claim_queue(&state);
     let app = task_server::app(state.clone());
     for id in [
@@ -1087,7 +1185,7 @@ async fn targeted_claim_rejects_invalid_ids_without_claiming() {
 #[test]
 fn concurrent_targeted_claim_has_exactly_one_owner() {
     let dir = tempfile::tempdir().unwrap();
-    let state = AppState::new(Store::open(dir.path()).unwrap());
+    let state = common::state(Store::open(dir.path()).unwrap());
     claim_queue(&state);
     let barrier = Arc::new(std::sync::Barrier::new(2));
     let results = std::thread::scope(|scope| {
@@ -1138,7 +1236,7 @@ fn concurrent_targeted_claim_has_exactly_one_owner() {
 async fn targeted_claim_requires_ready_after_expiry_and_allows_done_dependency() {
     let dir = tempfile::tempdir().unwrap();
     let clock = SharedClock::at(datetime!(2026-09-05 00:00 UTC));
-    let state = AppState::new(Store::open(dir.path()).unwrap())
+    let state = common::state(Store::open(dir.path()).unwrap())
         .with_clock(Arc::new(clock.clone()))
         .with_ttl(10);
     claim_queue(&state);
@@ -1177,14 +1275,14 @@ async fn targeted_claim_requires_ready_after_expiry_and_allows_done_dependency()
 #[tokio::test]
 async fn execution_targets_route_legacy_and_dependent_tasks() {
     let dir = tempfile::tempdir().unwrap();
-    let state = AppState::new(Store::open(dir.path()).unwrap());
+    let state = common::state(Store::open(dir.path()).unwrap());
     state
         .store
         .put("products", "a/b", json!({"id":"a/b"}))
         .unwrap();
     let app = task_server::app(state.clone());
-    let (_, home) = request(app.clone(), "POST", "/api/tasks", json!({"id":"home","title":"deploy","product_id":"a/b","execution_target":"homeserver","depends_on":"dev"})).await;
-    assert_eq!(home["execution_target"], "homeserver");
+    let (_, home) = request(app.clone(), "POST", "/api/tasks", json!({"id":"home","title":"deploy","product_id":"a/b","execution_target":"field","depends_on":"dev"})).await;
+    assert_eq!(home["execution_target"], "field");
     state
         .store
         .put(
@@ -1196,8 +1294,8 @@ async fn execution_targets_route_legacy_and_dependent_tasks() {
     task::set_status(&state, "home", "ready").unwrap();
     for payload in [
         json!({"worker":"old","task_id":"home"}),
-        json!({"worker":"home","execution_target":"homeserver"}),
-        json!({"worker":"home","execution_target":"homeserver","task_id":"home"}),
+        json!({"worker":"home","execution_target":"field"}),
+        json!({"worker":"home","execution_target":"field","task_id":"home"}),
     ] {
         assert_eq!(
             request(app.clone(), "POST", "/worker/claim", payload)
@@ -1208,11 +1306,11 @@ async fn execution_targets_route_legacy_and_dependent_tasks() {
     }
     assert_eq!(state.store.get("tasks", "home").unwrap()["status"], "ready");
     let (_, legacy) = request(app.clone(), "GET", "/api/tasks/dev", json!(null)).await;
-    assert_eq!(legacy["execution_target"], "sandbox");
+    assert_eq!(legacy["execution_target"], "forge");
     let (_, listed) = request(
         app.clone(),
         "GET",
-        "/api/tasks?execution_target=homeserver",
+        "/api/tasks?execution_target=field",
         json!(null),
     )
     .await;
@@ -1227,7 +1325,7 @@ async fn execution_targets_route_legacy_and_dependent_tasks() {
     .await;
     assert_eq!(code, StatusCode::OK);
     assert_eq!(dev["task"]["id"], "dev");
-    assert_eq!(dev["task"]["execution_target"], "sandbox");
+    assert_eq!(dev["task"]["execution_target"], "forge");
     request(
         app.clone(),
         "POST",
@@ -1250,7 +1348,7 @@ async fn execution_targets_route_legacy_and_dependent_tasks() {
         app.clone(),
         "POST",
         "/worker/claim",
-        json!({"worker":"home","execution_target":"homeserver"}),
+        json!({"worker":"home","execution_target":"field"}),
     )
     .await;
     assert_eq!(code, StatusCode::OK);
@@ -1260,7 +1358,7 @@ async fn execution_targets_route_legacy_and_dependent_tasks() {
             app.clone(),
             "POST",
             "/worker/claim",
-            json!({"worker":"other","execution_target":"homeserver"})
+            json!({"worker":"other","execution_target":"field"})
         )
         .await
         .0,
@@ -1271,7 +1369,7 @@ async fn execution_targets_route_legacy_and_dependent_tasks() {
 #[tokio::test]
 async fn execution_target_validation_and_updates_survive_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let state = AppState::new(Store::open(dir.path()).unwrap());
+    let state = common::state(Store::open(dir.path()).unwrap());
     let app = task_server::app(state.clone());
     let (_, created) = request(
         app.clone(),
@@ -1280,12 +1378,12 @@ async fn execution_target_validation_and_updates_survive_restart() {
         json!({"id":"dev","title":"default"}),
     )
     .await;
-    assert_eq!(created["execution_target"], "sandbox");
+    assert_eq!(created["execution_target"], "forge");
     for bad in [
         json!(""),
         json!("both"),
         json!(null),
-        json!(["sandbox", "homeserver"]),
+        json!(["forge", "field"]),
         json!(1),
     ] {
         for (method, path, payload) in [
@@ -1311,7 +1409,7 @@ async fn execution_target_validation_and_updates_survive_restart() {
         request(
             app.clone(),
             "GET",
-            "/api/tasks?execution_target=both",
+            "/api/tasks?execution_target=",
             json!(null)
         )
         .await
@@ -1322,10 +1420,10 @@ async fn execution_target_validation_and_updates_survive_restart() {
         app.clone(),
         "PATCH",
         "/api/tasks/dev",
-        json!({"execution_target":"homeserver"}),
+        json!({"execution_target":"field"}),
     )
     .await;
-    assert_eq!(changed["execution_target"], "homeserver");
+    assert_eq!(changed["execution_target"], "field");
     drop(app);
     drop(state);
     assert_eq!(
@@ -1333,19 +1431,19 @@ async fn execution_target_validation_and_updates_survive_restart() {
             .unwrap()
             .get("tasks", "dev")
             .unwrap()["execution_target"],
-        "homeserver"
+        "field"
     );
 }
 
 #[test]
 fn concurrent_executors_claim_only_their_own_target_once() {
     let dir = tempfile::tempdir().unwrap();
-    let state = AppState::new(Store::open(dir.path()).unwrap());
+    let state = common::state(Store::open(dir.path()).unwrap());
     state
         .store
         .put("products", "a/b", json!({"id":"a/b"}))
         .unwrap();
-    for target in ["sandbox", "homeserver"] {
+    for target in ["forge", "field"] {
         task::create(
             &state,
             json!({"id":target,"title":target,"product_id":"a/b","execution_target":target}),
@@ -1355,7 +1453,7 @@ fn concurrent_executors_claim_only_their_own_target_once() {
     }
     let barrier = Arc::new(std::sync::Barrier::new(4));
     let results = std::thread::scope(|scope| {
-        let handles: Vec<_> = ["sandbox", "homeserver", "sandbox", "homeserver"]
+        let handles: Vec<_> = ["forge", "field", "forge", "field"]
             .into_iter()
             .map(|target| {
                 let state = state.clone();

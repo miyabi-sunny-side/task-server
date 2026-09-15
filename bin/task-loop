@@ -436,7 +436,10 @@ def tick(args):
             flush(args, folder)
     if pending:
         return True
-    claim = request(args, '/worker/claim', {'worker': args.worker, 'execution_target': args.execution_target})
+    payload = {'worker': args.worker}
+    if args.execution_target is not None:
+        payload['execution_target'] = args.execution_target
+    claim = request(args, '/worker/claim', payload)
     if claim is None:
         return False
     key = hashlib.sha256(claim['claim_id'].encode()).hexdigest()
@@ -455,7 +458,7 @@ def main():
     mode.add_argument('--loop', action='store_true', help='keep claiming, sleeping when idle')
     parser.add_argument('--url', default='http://127.0.0.1:5004')
     parser.add_argument('--worker', default='task-loop')
-    parser.add_argument('--execution-target', choices=('sandbox', 'homeserver'), default='sandbox')
+    parser.add_argument('--execution-target', help='external execution target; omitted uses the server-configured default')
     parser.add_argument('--state-dir', type=Path, default=Path.home() / '.local/state/task-loop')
     parser.add_argument('--agent-command', default='codex exec', help='Codex-compatible command argv, parsed without a shell')
     parser.add_argument('--idle-seconds', type=float, default=10)
@@ -463,6 +466,8 @@ def main():
     parser.add_argument('--timeout-seconds', type=float, default=3600)
     parser.add_argument('--http-timeout', type=float, default=10)
     args = parser.parse_args()
+    if args.execution_target is not None and not args.execution_target.strip():
+        parser.error('execution target must be nonblank')
     if any(getattr(args, key) <= 0 for key in ('idle_seconds', 'heartbeat_seconds', 'timeout_seconds', 'http_timeout')):
         parser.error('timeouts and intervals must be positive')
     args.state_dir = args.state_dir.expanduser().resolve()

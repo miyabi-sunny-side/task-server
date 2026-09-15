@@ -1,5 +1,9 @@
 <script lang="ts">
-  import { fetchClosed, type ClosedTask } from "../lib/api";
+  import {
+    fetchClosed,
+    executionTargetLabel,
+    type ClosedTask,
+  } from "../lib/api";
   import { startAutoReload } from "../lib/auto-reload";
 
   type FetchState = "loading" | "error" | "ready";
@@ -93,8 +97,10 @@
               {/if}
               <span class="tail">
                 <span class="done-at">{item.closed_at}</span>
-                <span class="done-at" data-field="execution-target"
-                  >{item.execution_target ?? "sandbox"}</span
+                <span
+                  class="done-at execution-target"
+                  data-field="execution-target"
+                  >{executionTargetLabel(item)}</span
                 >
                 <span class="badge">{item.status}</span>
                 {#if item.archived}<span class="badge">履歴</span>{/if}

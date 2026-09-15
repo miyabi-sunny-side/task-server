@@ -36,27 +36,52 @@ fn required(v: &Value, k: &str) -> Result<String, Error> {
         Ok(s.into())
     }
 }
-/// Missing targets preserve the original sandbox queue; explicit values are strict.
-pub fn execution_target(v: &Value) -> Result<&str, Error> {
+/// New assignments use only the operator's configured names and default.
+pub fn execution_target<'a>(s: &'a AppState, v: &'a Value) -> Result<&'a str, Error> {
     match v.get("execution_target") {
-        None => Ok("sandbox"),
-        Some(Value::String(target)) if matches!(target.as_str(), "sandbox" | "homeserver") => {
-            Ok(target)
-        }
+        None => s.execution_targets.default.as_deref().ok_or_else(|| {
+            Error::Invalid("execution_target is required; no external default is configured".into())
+        }),
+        Some(Value::String(target)) if s.execution_targets.labels.contains(target) => Ok(target),
         _ => Err(Error::Invalid(
-            "execution_target must be sandbox or homeserver".into(),
+            "execution_target must name a configured execution target".into(),
         )),
     }
 }
+
+/// Reads preserve historical references, including names removed from configuration.
+fn stored_target<'a>(s: &'a AppState, v: &'a Value) -> Option<&'a str> {
+    match v.get("execution_target") {
+        None | Some(Value::Null) => s.execution_targets.default.as_deref(),
+        Some(value) => value.as_str(),
+    }
+}
+
+pub fn project_target(s: &AppState, t: &mut Value) {
+    let target = stored_target(s, t);
+    let configured = target.is_some_and(|target| {
+        s.execution_targets
+            .labels
+            .iter()
+            .any(|label| label == target)
+    });
+    t["execution_target"] = json!(target);
+    t["execution_target_configured"] = json!(configured);
+}
+
 pub fn filter_target(tasks: &mut Vec<Value>, target: Option<&str>) -> Result<(), Error> {
     if let Some(target) = target {
-        execution_target(&json!({"execution_target":target}))?;
-        tasks.retain(|t| execution_target(t).ok() == Some(target));
+        if target.trim().is_empty() {
+            return Err(Error::Invalid(
+                "execution_target filter must be nonblank".into(),
+            ));
+        }
+        tasks.retain(|t| t["execution_target"].as_str() == Some(target));
     }
     Ok(())
 }
 pub fn create(s: &AppState, v: Value) -> Result<Value, Error> {
-    let target = execution_target(&v)?;
+    let target = execution_target(s, &v)?;
     let id = v["id"]
         .as_str()
         .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
@@ -139,7 +164,9 @@ pub(crate) fn milestones(
     Ok(())
 }
 pub fn patch(s: &AppState, id: &str, v: Value) -> Result<Value, Error> {
-    execution_target(&v)?;
+    if v.get("execution_target").is_some() {
+        execution_target(s, &v)?;
+    }
     s.store.transaction(|a| {
         expire(a, &format_z(s.clock.now()))?;
         a.update("tasks", id, |t| {
@@ -267,7 +294,7 @@ pub fn list(s: &AppState, status: Option<&str>) -> Result<Vec<Value>, Error> {
     let mut ts = s.store.list("tasks")?;
     ts.retain(|t| active(t) && status.map_or(!closed(string(t, "status")), |x| t["status"] == x));
     for t in &mut ts {
-        t["execution_target"] = json!(execution_target(t)?);
+        project_target(s, t);
         if let Some(dependency) = t["depends_on"].as_str() {
             match s.store.get("tasks", dependency) {
                 Ok(dep) if dep["status"] != "done" => {
@@ -290,7 +317,7 @@ pub fn list(s: &AppState, status: Option<&str>) -> Result<Vec<Value>, Error> {
 pub fn card(s: &AppState, id: &str) -> Result<Value, Error> {
     sweep(s)?;
     let mut t = s.store.get("tasks", id)?;
-    t["execution_target"] = json!(execution_target(&t)?);
+    project_target(s, &mut t);
     t["available_transitions"] = if active(&t) {
         json!(
             STATUSES
@@ -320,7 +347,7 @@ pub fn claim(
     task_id: Option<&str>,
     target: &str,
 ) -> Result<Option<Value>, Error> {
-    execution_target(&json!({"execution_target":target}))?;
+    execution_target(s, &json!({"execution_target":target}))?;
     if worker.trim().is_empty() {
         return Err(Error::Invalid("worker is required".into()));
     }
@@ -346,7 +373,7 @@ pub fn claim(
                 .then_with(|| string(a, "created_at").cmp(string(b, "created_at")))
         });
         for mut t in ts {
-            if execution_target(&t)? != target {
+            if stored_target(s, &t) != Some(target) {
                 continue;
             }
             let rejection = if t["claim_id"].is_string() {
@@ -516,17 +543,14 @@ pub fn summary(t: &Value) -> Value {
         "commit_sha",
         "release_tag",
         "release_level",
+        "execution_target",
+        "execution_target_configured",
     ];
-    let mut result = Value::Object(
+    Value::Object(
         keys.into_iter()
             .filter_map(|k| t.get(k).map(|v| (k.into(), v.clone())))
             .collect(),
-    );
-    result["execution_target"] = t
-        .get("execution_target")
-        .cloned()
-        .unwrap_or(json!("sandbox"));
-    result
+    )
 }
 
 fn block_unclaimable(

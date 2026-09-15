@@ -28,7 +28,7 @@ pub struct Status {
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TaskList {
-    /// Filter by sandbox or homeserver; omission includes both destinations.
+    /// Filter by an execution target, including historical names; omission includes all.
     #[serde(default, deserialize_with = "non_null")]
     pub execution_target: Option<String>,
     #[serde(default, deserialize_with = "non_null")]
@@ -78,7 +78,7 @@ pub struct History {
 #[derive(Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TaskCreate {
-    /// One execution destination; omitted values keep the sandbox default.
+    /// One externally configured execution target; omission requires an external default.
     #[serde(
         default,
         deserialize_with = "non_null",
@@ -126,7 +126,7 @@ pub struct TaskCreate {
 #[derive(Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TaskUpdate {
-    /// sandbox or homeserver; omission preserves the current destination.
+    /// An externally configured execution target; omission preserves the current reference.
     #[serde(
         default,
         deserialize_with = "non_null",
@@ -270,6 +270,7 @@ fn brief_task(t: &Value) -> Value {
             "id",
             "product_id",
             "execution_target",
+            "execution_target_configured",
             "title",
             "status",
             "priority",
@@ -279,8 +280,9 @@ fn brief_task(t: &Value) -> Value {
         ],
     )
 }
-fn task_receipt(t: &Value, fields: &Value) -> Value {
+fn task_receipt(s: &AppState, t: &Value, fields: &Value) -> Value {
     let mut result = brief_task(t);
+    task::project_target(s, &mut result);
     result["ok"] = json!(true);
     result["updated_at"] = t["updated_at"].clone();
     result["changed"] = json!(
@@ -347,7 +349,13 @@ impl Admin {
         }
     }
     #[tool(
-        description = "List compact tasks filtered by status/product_id/execution_target (sandbox or homeserver). Default excludes closed tasks. Stable priority descending then id order; limit 1..200 (default 50), offset default 0. Follow next_offset until null; pages reflect current state."
+        description = "Read externally configured execution target names and optional default. Read-only; definitions are owned by deployment and loaded at server startup."
+    )]
+    fn execution_targets_get(&self) -> CallToolResult {
+        answer(Ok(json!(self.state.execution_targets)))
+    }
+    #[tool(
+        description = "List compact tasks filtered by status/product_id/execution_target (any current or historical name). Default excludes closed tasks. Stable priority descending then id order; limit 1..200 (default 50), offset default 0. Follow next_offset until null; pages reflect current state."
     )]
     fn task_list(&self, Parameters(a): Parameters<TaskList>) -> CallToolResult {
         answer((|| {
@@ -376,6 +384,7 @@ impl Admin {
                     "body",
                     "product_id",
                     "execution_target",
+                    "execution_target_configured",
                     "status",
                     "priority",
                     "kind",
@@ -444,11 +453,14 @@ impl Admin {
         })())
     }
     #[tool(
-        description = "Create a draft task with title, body, product_id, optional id/priority/dependency/release_level/execution_target (sandbox default, or homeserver). Returns compact receipt; task_get reads the body."
+        description = "Create a draft task with title, body, product_id, optional id/priority/dependency/release_level/execution_target. Target must be externally configured; omission requires an external default. execution_targets_get reads configuration. Returns compact receipt; task_get reads the body."
     )]
     fn task_create(&self, Parameters(a): Parameters<TaskCreate>) -> CallToolResult {
         let fields = fields(&a);
-        answer(task::create(&self.state, fields.clone()).map(|t| task_receipt(&t, &fields)))
+        answer(
+            task::create(&self.state, fields.clone())
+                .map(|t| task_receipt(&self.state, &t, &fields)),
+        )
     }
     #[tool(
         description = "Patch supplied task fields; id is required. Null clears product_id/depends_on/release_level/commit_sha. Returns compact receipt; task_get/task_history read results."
@@ -464,7 +476,8 @@ impl Admin {
                     return Err(Error::Invalid(format!("{key} must be a string or null")));
                 }
             }
-            task::patch(&self.state, &a.id, fields.clone()).map(|t| task_receipt(&t, &fields))
+            task::patch(&self.state, &a.id, fields.clone())
+                .map(|t| task_receipt(&self.state, &t, &fields))
         })())
     }
     #[tool(
@@ -473,7 +486,7 @@ impl Admin {
     fn task_set_status(&self, Parameters(a): Parameters<Status>) -> CallToolResult {
         answer(
             task::set_status(&self.state, &a.id, &a.status)
-                .map(|t| task_receipt(&t, &json!({"status":a.status}))),
+                .map(|t| task_receipt(&self.state, &t, &json!({"status":a.status}))),
         )
     }
     #[tool(

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import TaskForm from "../lib/TaskForm.svelte";
   import ControlPanel from "../lib/ControlPanel.svelte";
   import StatusTaskList from "../lib/StatusTaskList.svelte";
@@ -8,9 +8,10 @@
     createTask,
     fetchControl,
     fetchTasks,
+    fetchExecutionTargets,
     type ControlPlane,
     type TaskSummary,
-    type ExecutionTarget,
+    type ExecutionTargets,
   } from "../lib/api";
 
   type FetchState = "loading" | "error" | "ready";
@@ -22,7 +23,9 @@
 
   onDestroy(() => onclose());
 
-  let target = $state<ExecutionTarget | "">("");
+  let target = $state<string | null | undefined>(undefined);
+  let targets = $state<ExecutionTargets>();
+  let configError = $state(false);
   let plane = $state<ControlPlane | undefined>();
   let controlState = $state<FetchState>("loading");
   let items = $state<TaskSummary[]>([]);
@@ -32,14 +35,40 @@
   let listController: AbortController | undefined;
   let controlLoaded = false;
   let listLoaded = false;
+  let historicalTargets = $derived([
+    ...new Set(
+      items
+        .map((item) => item.execution_target)
+        .filter(
+          (name): name is string =>
+            name != null && !targets?.labels.includes(name),
+        ),
+    ),
+  ]);
+
+  const configController = new AbortController();
+  async function loadTargets() {
+    configError = false;
+    try {
+      const loaded = await fetchExecutionTargets(configController.signal);
+      if (!configController.signal.aborted) targets = loaded;
+    } catch {
+      if (!configController.signal.aborted) configError = true;
+    }
+  }
+  onMount(() => {
+    void loadTargets();
+    return () => configController.abort();
+  });
 
   let visibleItems = $derived(
     items.filter(
-      (item) => !target || (item.execution_target ?? "sandbox") === target,
+      (item) =>
+        target === undefined || (item.execution_target ?? null) === target,
     ),
   );
   let visiblePlane = $derived(
-    plane && target
+    plane && target !== undefined
       ? {
           ...plane,
           stuck: plane.stuck.filter((row) =>
@@ -139,10 +168,31 @@
     <div class="target-filter">
       <label for="execution-target-filter">実行先で絞り込み</label>
       <select id="execution-target-filter" class="btn" bind:value={target}>
-        <option value="">すべて</option>
-        <option value="sandbox">sandbox</option>
-        <option value="homeserver">homeserver</option>
+        <option value={undefined}>すべて</option>
+        {#each targets?.labels ?? [] as name}
+          <option value={name}>{name}</option>
+        {/each}
+        {#if historicalTargets.length}
+          <optgroup label="記録済みの実行先">
+            {#each historicalTargets as name}
+              <option value={name}
+                >{name}{targets ? "（現在の設定にありません）" : ""}</option
+              >
+            {/each}
+          </optgroup>
+        {/if}
+        {#if items.some((item) => item.execution_target == null)}
+          <option value={null}>未設定</option>
+        {/if}
       </select>
+      {#if configError}
+        <span role="alert">実行先の設定を読み込めませんでした</span>
+        <button class="btn" type="button" onclick={() => void loadTargets()}
+          >実行先を再読み込み</button
+        >
+      {:else if targets?.labels.length === 0}
+        <span>実行先が設定されていません</span>
+      {/if}
     </div>
   </div>
   {#if creating}
@@ -185,4 +235,11 @@
     gap: var(--sp-2)
     font-size: var(--fs-xs)
     color: var(--c-muted)
+    min-width: 0
+    flex: 1
+
+  select
+    max-width: 100%
+    min-width: 0
+    flex: 1
 </style>

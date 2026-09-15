@@ -16,6 +16,31 @@ impl Drop for Server {
 }
 
 #[test]
+fn explicit_execution_config_failures_stop_the_binary_before_opening_the_ledger() {
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("missing.yaml").into_os_string();
+    let broken = root.path().join("broken.yaml");
+    std::fs::write(&broken, "labels: [forge]\ndefault: absent").unwrap();
+    let mut values = vec![std::ffi::OsString::new(), missing, broken.into_os_string()];
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        values.push(std::ffi::OsString::from_vec(vec![0xff]));
+    }
+    for value in values {
+        let result = Command::new(env!("CARGO_BIN_EXE_task-server"))
+            .env_clear()
+            .current_dir(root.path())
+            .env("EXECUTION_TARGETS_FILE", value)
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("EXECUTION_TARGETS_FILE"));
+        assert!(!root.path().join("data").exists());
+    }
+}
+
+#[test]
 fn retired_path_variables_do_not_change_startup_or_storage() {
     for configured in [false, true] {
         let root = tempfile::tempdir().unwrap();

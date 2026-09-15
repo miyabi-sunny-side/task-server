@@ -1,3 +1,4 @@
+mod common;
 use serde_json::json;
 use std::sync::Arc;
 use task_server::{AppState, SharedClock, ledger::Store, task};
@@ -6,7 +7,7 @@ use time::macros::datetime;
 fn setup() -> (tempfile::TempDir, AppState, SharedClock, serde_json::Value) {
     let dir = tempfile::tempdir().unwrap();
     let clock = SharedClock::at(datetime!(2026-09-05 00:00 UTC));
-    let state = AppState::new(Store::open(dir.path()).unwrap())
+    let state = common::state(Store::open(dir.path()).unwrap())
         .with_clock(Arc::new(clock.clone()))
         .with_ttl(10);
     state
@@ -19,7 +20,7 @@ fn setup() -> (tempfile::TempDir, AppState, SharedClock, serde_json::Value) {
     )
     .unwrap();
     task::set_status(&state, "t", "ready").unwrap();
-    let claim = task::claim(&state, "worker", None, "sandbox")
+    let claim = task::claim(&state, "worker", None, "forge")
         .unwrap()
         .unwrap();
     (dir, state, clock, claim)
@@ -61,7 +62,7 @@ fn both_report_formats_preserve_lifecycle_across_reopened_executions() {
             assert_eq!(task::report(&state, payload).unwrap(), record);
             assert!(task::heartbeat(&state, claim["claim_id"].as_str().unwrap()).is_err());
             task::set_status(&state, "t", "ready").unwrap();
-            claim = task::claim(&state, "worker", None, "sandbox")
+            claim = task::claim(&state, "worker", None, "forge")
                 .unwrap()
                 .unwrap();
         }
@@ -124,7 +125,7 @@ fn old_report_retry_after_another_claim_does_not_duplicate_or_revert_progress() 
     let record = task::report(&state, first.clone()).unwrap();
     let first_id = record["report_id"].clone();
     task::set_status(&state, "t", "ready").unwrap();
-    let claim = task::claim(&state, "second", None, "sandbox")
+    let claim = task::claim(&state, "second", None, "forge")
         .unwrap()
         .unwrap();
     task::report(&state,json!({"claim_id":claim["claim_id"],"outcome":"done","report_markdown":"finished","commit_sha":"def"})).unwrap();
@@ -159,9 +160,7 @@ fn old_completion_prose_remains_readable_without_becoming_the_new_stop_reason() 
     let (_dir, state, clock, claim) = setup();
     task::report(&state,json!({"claim_id":claim["claim_id"],"outcome":"blocked","summary":"old summary","verification":"old reason","checks":["old evidence"]})).unwrap();
     task::set_status(&state, "t", "ready").unwrap();
-    let claim = task::claim(&state, "next", None, "sandbox")
-        .unwrap()
-        .unwrap();
+    let claim = task::claim(&state, "next", None, "forge").unwrap().unwrap();
     let report = task::report(
         &state,
         json!({"claim_id":claim["claim_id"],"outcome":"blocked","report_markdown":"new reason"}),
@@ -171,7 +170,7 @@ fn old_completion_prose_remains_readable_without_becoming_the_new_stop_reason() 
     assert_eq!(report["legacy_completion"][0]["checks"][0], "old evidence");
     assert!(report["verification"].is_null());
     task::set_status(&state, "t", "ready").unwrap();
-    task::claim(&state, "interrupted", None, "sandbox")
+    task::claim(&state, "interrupted", None, "forge")
         .unwrap()
         .unwrap();
     clock.advance_secs(11);
@@ -184,7 +183,7 @@ fn legacy_report_after_new_report_selects_current_legacy_result() {
     let (_dir, state, _, claim) = setup();
     let first=task::report(&state,json!({"claim_id":claim["claim_id"],"outcome":"blocked","report_markdown":"earlier original"})).unwrap();
     task::set_status(&state, "t", "ready").unwrap();
-    let claim = task::claim(&state, "legacy", None, "sandbox")
+    let claim = task::claim(&state, "legacy", None, "forge")
         .unwrap()
         .unwrap();
     let current=task::report(&state,json!({"claim_id":claim["claim_id"],"outcome":"done","summary":"latest legacy result","verification":"latest legacy evidence"})).unwrap();

@@ -9,6 +9,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import Home from "./Home.svelte";
 
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
+
 type Summary = {
   id: string;
   title: string;
@@ -115,6 +120,12 @@ function stubFetch(scenario: Scenario) {
   const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
     const url = String(input);
     const method = init?.method ?? "GET";
+    if (url === "/api/execution-targets") {
+      return jsonResponse({
+        labels: ["forge", "field", "研究 / 試行"],
+        default: "forge",
+      });
+    }
     if (url === "/api/control" && method === "GET") {
       return (scenario.control ?? (() => jsonResponse(EMPTY_PLANE)))();
     }
@@ -173,11 +184,6 @@ function setVisibility(state: DocumentVisibilityState) {
 }
 
 describe("Home", () => {
-  afterEach(() => {
-    cleanup();
-    vi.unstubAllGlobals();
-  });
-
   it("only reads on load with legacy queues", async () => {
     const fetchMock = stubFetch({
       control: () =>
@@ -366,11 +372,6 @@ describe("Home", () => {
 });
 
 describe("list Ready action", () => {
-  afterEach(() => {
-    cleanup();
-    vi.unstubAllGlobals();
-  });
-
   it("sends once while pending, then moves the returned task and focus to Ready even if reload fails", async () => {
     let finish!: (response: Response) => void;
     let reloadFails = false;
@@ -516,9 +517,9 @@ it.each([false, true])(
 
 it("filters both the common list and blocked panel by execution destination", async () => {
   const items = [
-    summary("legacy", "ready"),
-    { ...summary("remote", "ready"), execution_target: "homeserver" },
-    { ...summary("stopped", "blocked"), execution_target: "homeserver" },
+    { ...summary("legacy", "ready"), execution_target: "forge" },
+    { ...summary("remote", "ready"), execution_target: "field" },
+    { ...summary("stopped", "blocked"), execution_target: "field" },
   ];
   stubFetch({
     tasks: () => jsonResponse(items),
@@ -550,17 +551,62 @@ it("filters both the common list and blocked panel by execution destination", as
     ]),
   );
   await fireEvent.change(screen.getByLabelText("実行先で絞り込み"), {
-    target: { value: "sandbox" },
+    target: { value: "forge" },
   });
   expect(rows()).toEqual(["/tasks/legacy"]);
   expect(region("control").dataset.state).toBe("empty");
   await fireEvent.change(screen.getByLabelText("実行先で絞り込み"), {
-    target: { value: "homeserver" },
+    target: { value: "field" },
   });
   expect(rows()).toEqual(["/tasks/remote", "/tasks/stopped"]);
   expect(region("control").dataset.state).toBe("success");
   await fireEvent.change(screen.getByLabelText("実行先で絞り込み"), {
-    target: { value: "" },
+    target: { selectedIndex: 0 },
   });
   expect(rows()).toEqual(["/tasks/legacy", "/tasks/remote", "/tasks/stopped"]);
+});
+
+it("keeps removed destinations distinct from configured choices and from unset tasks", async () => {
+  stubFetch({
+    tasks: () =>
+      jsonResponse([
+        {
+          ...summary("removed", "ready"),
+          execution_target: "retired destination",
+          execution_target_configured: false,
+        },
+        {
+          ...summary("unset", "ready"),
+          execution_target: null,
+          execution_target_configured: false,
+        },
+        {
+          ...summary("custom", "ready"),
+          execution_target: "研究 / 試行",
+          execution_target_configured: true,
+        },
+      ]),
+  });
+  render(Home);
+  await screen.findByRole("option", { name: "研究 / 試行" });
+  await fireEvent.change(screen.getByLabelText("実行先で絞り込み"), {
+    target: { value: "retired destination" },
+  });
+  const rows = () =>
+    [...document.querySelectorAll<HTMLAnchorElement>('a[href^="/tasks/"]')].map(
+      (a) => a.getAttribute("href"),
+    );
+  expect(rows()).toEqual(["/tasks/removed"]);
+  expect(
+    screen.getByRole("option", {
+      name: /retired destination.*現在の設定にありません/,
+    }),
+  ).toBeTruthy();
+  const unset = screen.getByRole("option", {
+    name: "未設定",
+  }) as HTMLOptionElement;
+  await fireEvent.change(screen.getByLabelText("実行先で絞り込み"), {
+    target: { selectedIndex: unset.index },
+  });
+  expect(rows()).toEqual(["/tasks/unset"]);
 });

@@ -46,7 +46,7 @@ class LoopTests(unittest.TestCase):
                 if self.path == '/worker/claim':
                     status = 200 if case.task else 204
                     result = {'claim_id': case.claim_id, 'lease_expires_at': '2099-01-01T00:00:00Z', 'task': case.task}
-                elif self.path == '/worker/tasks/task-one/checkpoint':
+                elif self.path.startswith('/worker/tasks/') and self.path.endswith('/checkpoint'):
                     result = {'execution_id': case.claim_id, 'revision': body['expected_revision'] + 1, 'updated_at': '2026-09-06T00:00:00Z', 'values': body['set']}
                 elif self.path == '/worker/report':
                     status = 503 if case.fail_report else 409 if case.refuse_report else 200
@@ -87,16 +87,28 @@ class LoopTests(unittest.TestCase):
         return [body for path, body in self.calls if path == '/worker/report']
 
     def test_execution_target_reaches_claim_and_prompt(self):
-        self.task['execution_target'] = 'homeserver'
-        result = self.run_loop('--execution-target', 'homeserver')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(next(body for path, body in self.calls if path == '/worker/claim')['execution_target'], 'homeserver')
-        context = json.loads(next((self.root/'state').glob('claims/*/prompt.txt')).read_text().split('\n', 1)[1])
-        self.assertEqual(context['task']['execution_target'], 'homeserver')
+        for index, target in enumerate(('forge', 'field', '研究 / 試行')):
+            with self.subTest(target=target):
+                self.calls.clear()
+                self.claim_id = f'claim-{index}'
+                self.task['id'] = f'task-{index}'
+                self.task['execution_target'] = target
+                folder = self.root / f'state-{index}'
+                result = self.run_loop('--execution-target', target, '--state-dir', str(folder))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.reports()[0]['outcome'], 'done', self.reports())
+                self.assertEqual(next(body for path, body in self.calls if path == '/worker/claim')['execution_target'], target)
+                context = json.loads(next(folder.glob('claims/*/prompt.txt')).read_text().split('\n', 1)[1])
+                self.assertEqual(context['task']['execution_target'], target)
+
+    def test_blank_execution_target_is_refused_without_claiming(self):
+        result = self.run_loop('--execution-target', '  ')
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.calls, [])
 
     def test_foreign_placement_uses_canonical_repository_without_changing_registry(self):
         self.product.update(local_path='/absent/other-machine/repo', repository=str(self.repo))
-        result = self.run_loop('--execution-target', 'homeserver')
+        result = self.run_loop('--execution-target', 'field')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.reports()[0]['outcome'], 'done')
         record = json.loads(next((self.root/'state/workspaces').glob('*.json')).read_text())
@@ -107,6 +119,7 @@ class LoopTests(unittest.TestCase):
     def test_success_and_durable_logs(self):
         result = self.run_loop()
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('execution_target', next(body for path, body in self.calls if path == '/worker/claim'))
         self.assertEqual(self.reports()[0]['outcome'], 'done')
         self.assertTrue(list((self.root/'state').glob('claims/*/prompt.txt')))
         report = self.reports()[0]

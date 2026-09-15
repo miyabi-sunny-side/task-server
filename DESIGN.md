@@ -529,7 +529,7 @@ counterpart to carry, so it earns no token pair.
 - **Top page — active task ledger.** 新規タスク opens the existing create
   modal from the header's right slot; closing returns focus to that button.
   The first content block offers a labelled native select
-  実行先で絞り込み with すべて (default), sandbox and homeserver. It filters both
+  実行先で絞り込み with すべて (default) and the externally configured names. It filters both
   status groups and the blocked-work panel, preserving selection during reloads.
   Controls wrap with existing spacing and input/button tokens. The task list follows,
   grouped in `draft`, `ready`, `wip`, `blocked` order. Empty groups are
@@ -542,9 +542,19 @@ counterpart to carry, so it earns no token pair.
   Each row is one link to `/tasks/<id>` with exactly one focus stop:
   product id (body-sm, on-surface), wrapping title (label), then neutral
   outline status badge. A muted caption beside the product shows the execution
-  target: sandbox or homeserver; absent legacy values display sandbox. Task detail
-  shows a labelled 実行先 caption, and closed rows show the target in their tail. Create/edit forms offer a labelled 実行先 native
-  select with sandbox (new-task default) and homeserver. Failed saves and background
+  target returned by the server; null reads 未設定. Historical names outside the
+  current configuration carry 現在の設定にありません on rows, details and history.
+  The filter keeps those references in a separate 記録済みの実行先 option group,
+  alongside an 未設定 option when needed. These references never become creation choices.
+  Task detail shows a labelled 実行先 caption, and closed rows show the target in their tail.
+  Create/edit forms offer a labelled 実行先 native select populated only by the
+  read-only server configuration, including its optional new-task default. No
+  default means an explicit selection is required. With no configured choices,
+  selection is disabled and 実行先が設定されていません explains why. Configuration
+  fetch errors show an in-place reason and 実行先を再読み込み; task data remains visible.
+  An unrelated edit preserves the old reference without resubmitting it, including
+  while configuration is unavailable. Long names stay within the content/modal width.
+  Failed saves and background
   refreshes preserve this selection alongside the other form fields.
   Optional legacy kind and blocked-by metadata
   use the same badge recipe. No milestone is used as a current status.

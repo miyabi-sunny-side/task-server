@@ -23,12 +23,13 @@ run `cargo build --locked --release` after the frontend build and copy only
 
 ## Environment variables
 
-All four application settings are optional and are read at startup. Helper CLI
+Application settings are optional and are read at startup. Helper CLI
 settings are listed separately under [Helper and deployment settings](#helper-and-deployment-settings).
 
 | Variable | Default when unset | Purpose / invalid values | Reader |
 | --- | --- | --- | --- |
 | `APP_DATA_DIR` | `data/ledger` | Markdown ledger path, relative to the working directory. Missing directories are created. Blank paths, inaccessible storage or an already-locked ledger fail startup; an empty ledger beside a legacy `task-server.db` requires explicit import. | [`src/state.rs`](src/state.rs), [`src/ledger.rs`](src/ledger.rs) |
+| `EXECUTION_TARGETS_FILE` | No labels or default | Read-only external YAML defining execution targets; see below. Empty/non-Unicode paths, unreadable files, invalid YAML/schema, blank/duplicate names or a default outside the list fail startup. | [`src/state.rs`](src/state.rs) |
 | `PORT` | `3000` | Decimal TCP port from `1` to `65535`. Empty, non-Unicode, signed, whitespace-padded, nonnumeric or out-of-range values fail startup with a `PORT` error. | [`src/port.rs`](src/port.rs) |
 | `LOG_LEVEL` | `info` | Logging verbosity: exactly `off`, `error`, `warn`, `info`, `debug`, or `trace`. Empty, non-Unicode or invalid values (including uppercase and module filters) use `info`. | [`src/logging.rs`](src/logging.rs) |
 | `CLAIM_TTL_SECS` | `3600` seconds | Integer from `1` through `86400`, inclusive. A claim and each heartbeat set expiry to now plus this lifetime. Empty, nonnumeric, whitespace-padded or out-of-range values fail startup. | [`src/state.rs`](src/state.rs), [`src/task.rs`](src/task.rs) |
@@ -36,6 +37,50 @@ settings are listed separately under [Helper and deployment settings](#helper-an
 Non-Unicode `APP_DATA_DIR` and `CLAIM_TTL_SECS` values are treated as unset.
 The former `RUST_LOG` is ignored; use `LOG_LEVEL`. Build-time Cargo/CI variables
 are not runtime application settings.
+
+### External execution targets
+
+Execution names belong to the operator. Save a YAML file **outside this repository**
+and point `EXECUTION_TARGETS_FILE` at it (relative paths use the server's working
+directory). For example, an operator might supply:
+
+```yaml
+labels:
+  - forge
+  - field
+  - "研究 / 試行"
+default: forge
+```
+
+`labels` is required and contains unique, nonblank strings. Names are matched
+exactly, without trimming, and may contain Unicode, spaces or punctuation.
+`default` is optional (or null); when present it must name one of the labels.
+Unknown keys and wrong types are configuration errors. An explicit empty list
+is valid. An omitted environment variable means an empty list and no default.
+It never generates names from task records or supplies a built-in destination.
+
+The process reads this file once at startup. Change the external file and restart
+to add, remove or rename choices; no code change or rebuild is needed. Existing
+task references are not renamed or removed. The file is never written, copied
+into the ledger, or included in the image. There is no label registration/edit API.
+`GET /api/execution-targets` and MCP `execution_targets_get` return the same
+read-only `{"labels":[...],"default":null}` configuration consumed by the UI.
+
+Containers receive the file through a read-only bind mount, with
+`EXECUTION_TARGETS_FILE` pointing to its container path. The runtime UID/GID
+`10001:10001` needs read access. Keep the existing data volume and `APP_DATA_DIR`.
+When upgrading from built-in destinations, first inject an external file containing
+the deployment's existing names and legacy default into the old container. That
+version ignores the new variable. Verify the mount, permissions and existing service
+before releasing/applying the new version through normal automatic updates. Then
+verify configuration, UI/API/MCP and retained task references on the running version.
+If advance injection is unavailable, prepare a concrete coordinated cutover before
+publication. Retain the external file and data volume for rollback to a known working
+version; do not overwrite the ledger or add a permanent update pin.
+
+Without configuration the UI explains the absence and disables destination selection
+for new tasks. A configuration fetch failure offers retry without losing form text.
+Existing tasks remain readable and other fields remain editable.
 
 The server listens on `0.0.0.0:${PORT}` in both native and container runs. Native
 runs therefore accept connections on all IPv4 interfaces. `APP_BIND_ADDR` is no
@@ -128,7 +173,8 @@ resolves a task worktree, starts a fresh `codex exec`, renews the lease, records
 result and appends a haystack note. The agent uses the installed development skills;
 review and fixes are part of that delivery, not additional server-generated tasks.
 Use `--once` for a single attempt and `--loop` for continuous execution.
-`--execution-target sandbox|homeserver` selects the worker queue (default: sandbox).
+`--execution-target NAME` selects any externally configured worker queue. Omitting
+it leaves selection to the server's external default; without one the claim fails.
 This is independent of where task-server is hosted; each machine runs its own
 loop/state directory and explicitly chooses its execution target.
 The loop fetches fresh product metadata using its task's stable ID. If `local_path`
@@ -149,13 +195,13 @@ The loop does not grant release or deployment authority. Put the intended outcom
 and relevant authorization in the task. It must report incomplete work as blocked,
 even when an earlier implementation step succeeded.
 
-For requests requiring development and real-machine checks, create a sandbox
-development task and a homeserver deployment/check task whose single `depends_on`
-is the development task ID. Development finishes on reproduction, fixes and
-sandbox regression checks; pending real-machine work remains visible in the
+For requests requiring development and real-machine checks, use the operator's
+separate execution targets. A deployment/check task can use the development task ID
+as its single `depends_on`. Development finishes on reproduction, fixes and
+isolated regression checks; pending real-machine work remains visible in the
 successor rather than blocking completed development. Hand off the artifact/version,
 application procedure, concrete operations, and observable success criteria (logs,
-DB records, etc.). Ready homeserver work becomes claimable only after its dependency
+DB records, etc.). Dependent ready work becomes claimable only after its dependency
 is done. This split is explicit; releases do not automatically generate deployments.
 
 ## Execution handoff
@@ -331,24 +377,30 @@ bash .github/smoke-image.sh task-server:test
 
 ### Claim a ready task
 
-Tasks own one `execution_target`: `sandbox` or `homeserver`. HTTP create/patch
+Tasks own one `execution_target` reference. HTTP create/patch
 (`/api/tasks`, `/api/tasks/:id`) and MCP `task_create`/`task_update` accept it;
-detail/list responses expose it. `GET /api/tasks?execution_target=homeserver` and
-MCP `task_list(execution_target: "homeserver")` filter by it. Omit the list filter
-to see both destinations. The UI displays it on task rows/cards, edits it in the
+detail/list responses expose it. `GET /api/tasks?execution_target=field` and
+MCP `task_list(execution_target: "field")` filter by exact name, including historical
+names no longer configured. URL-encode names in HTTP queries. Omit the list filter
+to see all destinations. The UI displays it on task rows/cards, edits it in the
 create/edit form, and filters the common active list with a native select.
 
-Existing task documents without the field read as `sandbox` without a bulk
-rewrite. New tasks default to and persist `sandbox`. Updates that omit the field
-preserve its value. Explicit null, empty, unknown and multiple values are invalid.
-No generic labels or separate development/deployment field are added.
+New assignments and claims accept only names from the external configuration.
+Create/claim may omit the target only when an external default exists. Existing
+task documents without the field use that default on reads; without one they are
+shown as null/未設定. Reads never rewrite the stored record. Explicit historical
+references survive removed choices and are marked 現在の設定にありません in the UI.
+Read responses include `execution_target_configured` to distinguish those references
+from current choices. Updates omitting the target preserve it, even when it is
+unset or no longer configured. New assignments reject null, unconfigured or multiple
+values. The single execution target is not a multi-label classification system.
 
 `POST /worker/claim` accepts a nonblank `worker`, optional `execution_target`
-(default: `sandbox`), and optional nonblank `task_id` (one path segment excluding
+(using the external default when omitted), and optional nonblank `task_id` (one path segment excluding
 `.` and `..`; null and non-string IDs are **400**):
 
 ```json
-{"worker":"task-work:handoff", "execution_target":"homeserver", "task_id":"the-task-to-resume"}
+{"worker":"task-work:handoff", "execution_target":"field", "task_id":"the-task-to-resume"}
 ```
 
 The server atomically considers only tasks matching the execution target, even
@@ -357,8 +409,9 @@ with `task_id`. Omitting `task_id` selects eligible ready tasks by priority
 An empty eligible queue, execution-target mismatch, or unfinished dependency
 returns **204**, including ID selection. These conditions leave tasks waiting
 without marking them blocked. ID selection never falls back to another task.
-Old claim clients always use the sandbox queue and cannot take homeserver work.
-Deploy the server contract before enabling homeserver clients.
+Old claim clients use only the externally supplied default. Changing that default
+changes their queue, so preserve the deployment's current default during migration.
+Missing defaults or unconfigured claim targets produce **400**, never another queue.
 
 Success is **200** with the existing `{claim_id, lease_expires_at, task}` envelope.
 Selection, eligibility checks and lease creation share the ledger writer lock,
@@ -450,6 +503,7 @@ No ledger migration or rewriting is required.
 
 | Tool | Response and explicit follow-up |
 | --- | --- |
+| `execution_targets_get()` | External execution names and optional default; no mutation or ledger definitions. |
 | `task_list(status?, product_id?, execution_target?, limit?, offset?)` | `tasks` with ID, product, execution target, title, status, priority, dependency/status and blocker; no prose or evidence. Default excludes closed tasks; supply one lifecycle status to include that status. |
 | `task_get(id)` | Task body and current lifecycle, claim, commit, report ID, timestamps, transitions and run counts. It does not expand completion prose, milestones, history or checkpoint values. |
 | `task_history(id, limit?, offset?)` | `entries` tagged by source field: `current_completion` (summary/verification/checks), `last_report`, `milestones`, `milestone_history`, `legacy_completion`, `report_ids`, `legacy`. Array entries retain their original index; historical values retain their original provenance, including overlapping legacy evidence. |
@@ -483,3 +537,21 @@ Clients migrating from unpaged MCP reads must follow `next_offset` with the same
 filters until null, fetch product metadata before acting on release policy, and
 use the explicit history/run/checkpoint tools when those records are needed.
 `bin/task-loop` uses the unchanged worker HTTP contract and needs no adapter.
+
+## Browser regression check
+
+After building the frontend and `cargo build --locked`, run the isolated Chromium
+check. It starts its own binary with temporary ledgers and external settings,
+restarts that same binary with changed settings, and never connects to deployed tasks.
+Playwright can stay outside the product's dependency tree:
+
+```sh
+task_browser_dir=$(mktemp -d)
+npm install --prefix "$task_browser_dir" --no-save --package-lock=false playwright
+"$task_browser_dir/node_modules/.bin/playwright" install chromium
+PLAYWRIGHT_MODULE="$task_browser_dir/node_modules/playwright/index.mjs" node tests/execution-targets.e2e.mjs
+rm -rf "$task_browser_dir"
+```
+
+Set `E2E_EVIDENCE_DIR` to a directory outside this repository to retain screenshots
+and measurements. `TASK_SERVER_BINARY` can point at another built binary.

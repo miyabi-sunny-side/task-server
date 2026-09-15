@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { TaskSummary } from "./api";
-  import { blockedByLabel } from "./api";
+  import { blockedByLabel, executionTargetLabel } from "./api";
 
   import { onMount, tick } from "svelte";
   import { postTaskStatus } from "./api";
@@ -243,8 +243,8 @@
 >
   <span class="head">
     <span class="product product-first">{item.product_id}</span>
-    <span class="product" data-field="execution-target"
-      >{item.execution_target ?? "sandbox"}</span
+    <span class="product execution-target" data-field="execution-target"
+      >{executionTargetLabel(item)}</span
     >
   </span>
   <span class="name">{item.title}</span>

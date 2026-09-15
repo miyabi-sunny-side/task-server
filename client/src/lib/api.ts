@@ -1,4 +1,23 @@
-export type ExecutionTarget = "sandbox" | "homeserver";
+export type ExecutionTarget = string;
+
+export interface ExecutionTargets {
+  labels: string[];
+  default: string | null;
+}
+
+interface ExecutionReference {
+  execution_target?: ExecutionTarget | null;
+  execution_target_configured?: boolean;
+}
+
+export function executionTargetLabel(reference: ExecutionReference): string {
+  return reference.execution_target == null
+    ? "未設定"
+    : reference.execution_target +
+        (reference.execution_target_configured === false
+          ? "（現在の設定にありません）"
+          : "");
+}
 
 export interface Milestone {
   report_id?: number;
@@ -8,8 +27,7 @@ export interface Milestone {
   evidence?: string | null;
 }
 
-export interface TaskSummary {
-  execution_target?: ExecutionTarget;
+export interface TaskSummary extends ExecutionReference {
   archived?: boolean;
   id: string;
   title: string;
@@ -63,8 +81,7 @@ export interface ExecutionCheckpoint {
   values: Record<string, unknown>;
 }
 
-export interface TaskCard {
-  execution_target?: ExecutionTarget;
+export interface TaskCard extends ExecutionReference {
   execution_checkpoints?: ExecutionCheckpoint[];
   report_id?: number;
   report_ids?: number[];
@@ -169,11 +186,16 @@ export function fetchTasks(
   return requestJson(url, { signal });
 }
 
+export function fetchExecutionTargets(
+  signal?: AbortSignal,
+): Promise<ExecutionTargets> {
+  return requestJson("/api/execution-targets", { signal });
+}
+
 // A row of the done screen: what a `normal` task finished, and when.
 // `done_at` is the moment this task first reached `done` — not `updated_at`,
 // which keeps moving through approval, landing, and release.
-export interface DoneTask {
-  execution_target?: ExecutionTarget;
+export interface DoneTask extends ExecutionReference {
   id: string;
   title: string;
   status: string;
@@ -258,7 +280,7 @@ export function fetchControl(signal?: AbortSignal): Promise<ControlPlane> {
 }
 
 export interface TaskFields {
-  execution_target?: ExecutionTarget;
+  execution_target?: ExecutionTarget | null;
   title: string;
   product_id: string;
   body: string;

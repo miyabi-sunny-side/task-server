@@ -8,8 +8,26 @@ import {
   fetchControl,
   fetchTasks,
   postTaskStatus,
+  executionTargetLabel,
   type TaskCard,
 } from "./api";
+
+it("labels unset and removed execution references without inventing a default", () => {
+  expect(executionTargetLabel({})).toBe("未設定");
+  expect(executionTargetLabel({ execution_target: null })).toBe("未設定");
+  expect(
+    executionTargetLabel({
+      execution_target: "研究 / 試行",
+      execution_target_configured: true,
+    }),
+  ).toBe("研究 / 試行");
+  expect(
+    executionTargetLabel({
+      execution_target: "retired",
+      execution_target_configured: false,
+    }),
+  ).toBe("retired（現在の設定にありません）");
+});
 
 const CARD: TaskCard = {
   id: "alpha",

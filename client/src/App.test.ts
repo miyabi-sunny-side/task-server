@@ -42,6 +42,13 @@ describe("App", () => {
     let failSave = true;
     const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
       const url = String(input);
+      if (url === "/api/execution-targets")
+        return new Response(
+          JSON.stringify({
+            labels: ["forge", "field", "研究 / 試行"],
+            default: "forge",
+          }),
+        );
       if (url === "/api/tasks" && init?.method === "POST") {
         if (failSave)
           return new Response(JSON.stringify({ error: "save refused" }), {
@@ -93,7 +100,16 @@ describe("App", () => {
       "fetch",
       vi
         .fn<typeof fetch>()
-        .mockImplementation(async () => new Response(JSON.stringify([]))),
+        .mockImplementation(
+          async (input) =>
+            new Response(
+              JSON.stringify(
+                String(input) === "/api/execution-targets"
+                  ? { labels: [], default: null }
+                  : [],
+              ),
+            ),
+        ),
     );
     window.history.replaceState(null, "", "/products");
     render(App);
@@ -117,6 +133,10 @@ describe("App", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn<typeof fetch>().mockImplementation((input) => {
+        if (String(input) === "/api/execution-targets")
+          return Promise.resolve(
+            new Response(JSON.stringify({ labels: [], default: null })),
+          );
         const payload = String(input) === "/api/tasks" ? [TASK] : TASK;
         return Promise.resolve(
           new Response(JSON.stringify(payload), { status: 200 }),
@@ -149,6 +169,10 @@ describe("App", () => {
       "fetch",
       vi.fn<typeof fetch>().mockImplementation((input) => {
         const url = String(input);
+        if (url === "/api/execution-targets")
+          return Promise.resolve(
+            new Response(JSON.stringify({ labels: [], default: null })),
+          );
         const payload =
           url === "/api/tasks" || url === "/api/closed"
             ? []
