@@ -319,7 +319,8 @@ it lives in the header's right slot. The execution-target filter stays
 first in the content column. Content controls are never a third band,
 never sticky, and never full-width: the two bands above stay the only bands, and
 main content stays the only scrolling region, so the controls scroll away
-with the work they act on.
+with the work they act on. Task detail has one explicit exception: its
+existing edit/status actions stay in a bottom footer throughout normal viewing.
 
 One breakpoint: **768px**, and it moves the **vertical** rhythm only.
 The content column is `max-width: 720px`, centered at every width, with
@@ -675,6 +676,18 @@ counterpart to carry, so it earns no token pair.
   card. Request errors remain in place; no toast or disappearing
   notice. Deletion remains an API operation; no new delete dialog is
   required for this ledger surface.
+
+  **Detail action footer.** Keep the existing actions once, after the body
+  and run history in document order. A sticky bottom footer stays at the
+  viewport's lower edge from initial display through the end of the page,
+  including short content. Its natural height reserves space for the final
+  body/history lines; wrapping buttons at 320px never hide content or cause
+  horizontal scrolling. Use the content column and its gutters, surface-raised
+  background, top hairline, and existing button spacing. The footer sits below
+  the header/menu/modal layers. Request errors appear beside its controls and
+  remain visible for retry. Preserve available transitions, pending disabled
+  buttons, Ready emphasis, focus and modal behavior. Archived, loading and
+  failed initial detail views expose no footer; other pages are unchanged.
 
 - **Closed page — history.** Keep header navigation to `/closed` and
   the `/done` replacement redirect. This flat list holds `done`,

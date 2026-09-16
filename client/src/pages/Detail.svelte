@@ -92,7 +92,13 @@
       {ontransition}
       onedit={() => (editing = true)}
       onreport={(id) => (selectedReport = id)}
-    />
+    >
+      {#key task.id}<RunHistory
+          taskId={task.id}
+          selectedReport={selectedReport ??
+            (task.status === "blocked" ? task.report_id : undefined)}
+        />{/key}
+    </TaskCard>
     {#if editing}
       <TaskForm
         title="タスクを編集"
@@ -106,15 +112,16 @@
         }}
       />
     {/if}
-    {#key task.id}<RunHistory
-        taskId={task.id}
-        selectedReport={selectedReport ??
-          (task.status === "blocked" ? task.report_id : undefined)}
-      />{/key}
   {/if}
 </div>
 
 <style lang="sass">
+  .content
+    display: flex
+    flex-direction: column
+    min-height: calc(100dvh - var(--header-h) - var(--subheader-h))
+    padding-bottom: 0
+
   .sub-header
     position: sticky
     top: var(--header-h)

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { Snippet } from "svelte";
   import type { TaskCard as Task } from "./api";
   import { blockedByLabel, checkLabel, executionTargetLabel } from "./api";
 
@@ -9,6 +10,7 @@
     ontransition,
     onedit,
     onreport,
+    children,
   }: {
     task: Task;
     busy?: boolean;
@@ -16,6 +18,7 @@
     ontransition?: (status: string) => void;
     onedit?: () => void;
     onreport?: (id: number) => void;
+    children?: Snippet;
   } = $props();
 
   let transitions = $derived(task.archived ? [] : task.available_transitions);
@@ -34,219 +37,224 @@
   );
 </script>
 
-<!-- The head reads in the same order as a list card (DESIGN.md, Detail
+<div class="task-content">
+  <!-- The head reads in the same order as a list card (DESIGN.md, Detail
      page): product first, then the state. The title is the page's h1 above. -->
-<div class="meta">
-  <p class="product">{task.product_id}</p>
-  <p class="caption execution-target" data-field="execution-target">
-    実行先: {executionTargetLabel(task)}
-  </p>
-  <p class="caption">現在の状態</p>
-  <p class="badges" data-field="current-status">
-    <span class="badge">{task.status}</span>
-    {#if task.archived}<span class="badge">履歴</span>{/if}
-    {#if task.status === "blocked" && task.blocked_by}
-      <span class="badge" data-blocked-by={task.blocked_by}
-        >{blockedByLabel(task.blocked_by)}</span
-      >
-    {/if}
-    {#if kind}
-      <span class="badge">{kind}</span>
-    {/if}
-  </p>
-</div>
-<!-- The forest first: the one or two sentences a person reads as the
+  <div class="meta">
+    <p class="product">{task.product_id}</p>
+    <p class="caption execution-target" data-field="execution-target">
+      実行先: {executionTargetLabel(task)}
+    </p>
+    <p class="caption">現在の状態</p>
+    <p class="badges" data-field="current-status">
+      <span class="badge">{task.status}</span>
+      {#if task.archived}<span class="badge">履歴</span>{/if}
+      {#if task.status === "blocked" && task.blocked_by}
+        <span class="badge" data-blocked-by={task.blocked_by}
+          >{blockedByLabel(task.blocked_by)}</span
+        >
+      {/if}
+      {#if kind}
+        <span class="badge">{kind}</span>
+      {/if}
+    </p>
+  </div>
+  <!-- The forest first: the one or two sentences a person reads as the
      completion report. The log (verification, checks) is folded below it,
      closed by default (DESIGN.md, Task Card). -->
-{#if task.report_id}
-  <p class="caption">
-    <a
-      class="dependency"
-      href={`#run-${task.report_id}`}
-      onclick={() => onreport?.(task.report_id!)}
-      >報告 #{task.report_id} を読む</a
-    >
-  </p>
-{/if}
-{#if task.summary && !task.report_id}
-  <p class="summary" data-field="summary">{task.summary}</p>
-{/if}
-{#if reason}
-  <section data-field="blocked-reason">
-    <h2 class="caption">停止理由</h2>
-    <p class="record-text">{reason}</p>
-  </section>
-{/if}
-<section class="milestones" data-field="milestones">
-  <h2 class="caption">到達実績</h2>
-  {#each task.milestones ?? [] as milestone, index (index)}
-    <div class="milestone">
-      <p class="caption">
-        <span class="badge">{milestone.name}</span> <time>{milestone.at}</time>
-      </p>
-      {#if milestone.commit_sha}<p class="caption">
-          {milestone.commit_sha}
-        </p>{/if}
-      {#if milestone.report_id}<p class="caption">
-          <a
-            class="dependency"
-            href={`#run-${milestone.report_id}`}
-            onclick={() => onreport?.(milestone.report_id!)}
-            >報告 #{milestone.report_id} を読む</a
-          >
-        </p>{/if}
-      {#if milestone.evidence}<p class="record-text">
-          {milestone.evidence}
-        </p>{/if}
-    </div>
-  {:else}
-    <p class="caption">到達実績はありません</p>
-  {/each}
-</section>
-{#if task.execution_checkpoints?.some((checkpoint) => Object.keys(checkpoint.values).length)}
-  <details class="record" data-field="execution-checkpoints">
-    <summary class="caption record-head">引き継ぎ情報</summary>
+  {#if task.report_id}
     <p class="caption">
-      保存したパスや担当の稼働状況は、再開時に確認してください。
+      <a
+        class="dependency"
+        href={`#run-${task.report_id}`}
+        onclick={() => onreport?.(task.report_id!)}
+        >報告 #{task.report_id} を読む</a
+      >
     </p>
-    {#each [...task.execution_checkpoints].reverse() as checkpoint (checkpoint.execution_id)}
-      <section class="milestone" data-execution-id={checkpoint.execution_id}>
-        <h2 class="caption">
-          {checkpoint.execution_id === task.claim_id
-            ? "現在の実行"
-            : "以前の実行"}
-        </h2>
+  {/if}
+  {#if task.summary && !task.report_id}
+    <p class="summary" data-field="summary">{task.summary}</p>
+  {/if}
+  {#if reason}
+    <section data-field="blocked-reason">
+      <h2 class="caption">停止理由</h2>
+      <p class="record-text">{reason}</p>
+    </section>
+  {/if}
+  <section class="milestones" data-field="milestones">
+    <h2 class="caption">到達実績</h2>
+    {#each task.milestones ?? [] as milestone, index (index)}
+      <div class="milestone">
         <p class="caption">
-          {checkpoint.execution_id} · 更新 <time>{checkpoint.updated_at}</time>
-          · revision {checkpoint.revision}
+          <span class="badge">{milestone.name}</span>
+          <time>{milestone.at}</time>
         </p>
-        <dl class="checkpoint-values">
-          {#each Object.entries(checkpoint.values) as [key, value] (key)}
-            <dt class="caption">{key}</dt>
-            <dd class="record-text">
-              {typeof value === "string"
-                ? value
-                : JSON.stringify(value, null, 2)}
-            </dd>
-          {:else}
-            <dd class="record-text">引き継ぎ内容はありません</dd>
-          {/each}
-        </dl>
-      </section>
+        {#if milestone.commit_sha}<p class="caption">
+            {milestone.commit_sha}
+          </p>{/if}
+        {#if milestone.report_id}<p class="caption">
+            <a
+              class="dependency"
+              href={`#run-${milestone.report_id}`}
+              onclick={() => onreport?.(milestone.report_id!)}
+              >報告 #{milestone.report_id} を読む</a
+            >
+          </p>{/if}
+        {#if milestone.evidence}<p class="record-text">
+            {milestone.evidence}
+          </p>{/if}
+      </div>
+    {:else}
+      <p class="caption">到達実績はありません</p>
     {/each}
-  </details>
-{/if}
-{#if task.legacy_completion?.length}
-  <details class="record" data-field="legacy-completion">
-    <summary class="caption record-head">以前の作業記録</summary>
-    {#each task.legacy_completion as record}
-      <p class="caption">{record.at ?? ""} {record.commit_sha ?? ""}</p>
-      {#if record.summary}<p class="record-text">{record.summary}</p>{/if}
-      {#if record.verification}<p class="record-text">
-          {record.verification}
-        </p>{/if}
-      {#each record.checks ?? [] as check}<p class="record-text">
-          {checkLabel(check)}
-        </p>{/each}
-    {/each}
-  </details>
-{/if}
-{#if task.milestone_history?.length}
-  <details class="record" data-field="milestone-history">
-    <summary class="caption record-head">過去の到達実績</summary>
-    {#each task.milestone_history as milestone, index (index)}
-      <p class="record-text">
-        {milestone.name} · {milestone.at}
-        {milestone.commit_sha ?? ""}
-        {milestone.evidence ?? ""}
-        {#if milestone.report_id}<a
-            class="dependency"
-            href={`#run-${milestone.report_id}`}
-            onclick={() => onreport?.(milestone.report_id!)}
-            >報告 #{milestone.report_id} を読む</a
-          >{/if}
+  </section>
+  {#if task.execution_checkpoints?.some((checkpoint) => Object.keys(checkpoint.values).length)}
+    <details class="record" data-field="execution-checkpoints">
+      <summary class="caption record-head">引き継ぎ情報</summary>
+      <p class="caption">
+        保存したパスや担当の稼働状況は、再開時に確認してください。
       </p>
-    {/each}
-  </details>
-{/if}
-<p class="caption" data-field={commitField}>
-  <span class="caption-label">{commitField}</span>
-  {task.commit_sha ?? ""}
-</p>
-<details class="record" data-field="verification">
-  <summary class="caption record-head">作業記録</summary>
-  <p class="record-text">{task.verification ?? ""}</p>
-</details>
-{#if task.checks && task.checks.length > 0}
-  <details class="record" data-field="checks">
-    <summary class="caption record-head">確認結果</summary>
-    <ul class="checks">
-      {#each task.checks as check}
-        <li class="record-text">{checkLabel(check)}</li>
+      {#each [...task.execution_checkpoints].reverse() as checkpoint (checkpoint.execution_id)}
+        <section class="milestone" data-execution-id={checkpoint.execution_id}>
+          <h2 class="caption">
+            {checkpoint.execution_id === task.claim_id
+              ? "現在の実行"
+              : "以前の実行"}
+          </h2>
+          <p class="caption">
+            {checkpoint.execution_id} · 更新
+            <time>{checkpoint.updated_at}</time>
+            · revision {checkpoint.revision}
+          </p>
+          <dl class="checkpoint-values">
+            {#each Object.entries(checkpoint.values) as [key, value] (key)}
+              <dt class="caption">{key}</dt>
+              <dd class="record-text">
+                {typeof value === "string"
+                  ? value
+                  : JSON.stringify(value, null, 2)}
+              </dd>
+            {:else}
+              <dd class="record-text">引き継ぎ内容はありません</dd>
+            {/each}
+          </dl>
+        </section>
       {/each}
-    </ul>
+    </details>
+  {/if}
+  {#if task.legacy_completion?.length}
+    <details class="record" data-field="legacy-completion">
+      <summary class="caption record-head">以前の作業記録</summary>
+      {#each task.legacy_completion as record}
+        <p class="caption">{record.at ?? ""} {record.commit_sha ?? ""}</p>
+        {#if record.summary}<p class="record-text">{record.summary}</p>{/if}
+        {#if record.verification}<p class="record-text">
+            {record.verification}
+          </p>{/if}
+        {#each record.checks ?? [] as check}<p class="record-text">
+            {checkLabel(check)}
+          </p>{/each}
+      {/each}
+    </details>
+  {/if}
+  {#if task.milestone_history?.length}
+    <details class="record" data-field="milestone-history">
+      <summary class="caption record-head">過去の到達実績</summary>
+      {#each task.milestone_history as milestone, index (index)}
+        <p class="record-text">
+          {milestone.name} · {milestone.at}
+          {milestone.commit_sha ?? ""}
+          {milestone.evidence ?? ""}
+          {#if milestone.report_id}<a
+              class="dependency"
+              href={`#run-${milestone.report_id}`}
+              onclick={() => onreport?.(milestone.report_id!)}
+              >報告 #{milestone.report_id} を読む</a
+            >{/if}
+        </p>
+      {/each}
+    </details>
+  {/if}
+  <p class="caption" data-field={commitField}>
+    <span class="caption-label">{commitField}</span>
+    {task.commit_sha ?? ""}
+  </p>
+  <details class="record" data-field="verification">
+    <summary class="caption record-head">作業記録</summary>
+    <p class="record-text">{task.verification ?? ""}</p>
   </details>
-{/if}
-<!-- A task that waits for another says so beside the other captions; a
+  {#if task.checks && task.checks.length > 0}
+    <details class="record" data-field="checks">
+      <summary class="caption record-head">確認結果</summary>
+      <ul class="checks">
+        {#each task.checks as check}
+          <li class="record-text">{checkLabel(check)}</li>
+        {/each}
+      </ul>
+    </details>
+  {/if}
+  <!-- A task that waits for another says so beside the other captions; a
      ready one whose dependency has not landed says, in one more muted line,
      that this is why no worker has it yet (DESIGN.md, Dependency). -->
-{#if task.depends_on}
-  <p class="caption" data-field="depends_on">
-    <span class="caption-label">depends_on</span>
-    <a class="dependency" href={`/tasks/${task.depends_on}`}
-      >{task.depends_on}</a
-    >
-  </p>
-  {#if task.status === "ready" && task.dependency_status}
-    <p class="caption" data-field="waiting">
-      waiting depends_on:
+  {#if task.depends_on}
+    <p class="caption" data-field="depends_on">
+      <span class="caption-label">depends_on</span>
       <a class="dependency" href={`/tasks/${task.depends_on}`}
         >{task.depends_on}</a
       >
     </p>
+    {#if task.status === "ready" && task.dependency_status}
+      <p class="caption" data-field="waiting">
+        waiting depends_on:
+        <a class="dependency" href={`/tasks/${task.depends_on}`}
+          >{task.depends_on}</a
+        >
+      </p>
+    {/if}
   {/if}
-{/if}
-<!-- Above the body: a worker who was sent back to `ready` has to read the
+  <!-- Above the body: a worker who was sent back to `ready` has to read the
      correction before the instruction it corrects (DESIGN.md, Review block).
      Neutral throughout — `request_changes` is a finished review, not a
      failure of this app, so the danger tokens stay out of it. -->
-{#if review}
-  <section class="review" data-field="latest_review">
-    <p class="caption review-head">
-      レビュー
-      <span class="badge">{review.verdict}</span>
-    </p>
-    <!-- The verdict is read at once; the findings are the trees, folded. -->
-    <details class="record" data-findings>
-      <summary class="caption record-head">レビュー所見</summary>
-      <p class="findings">{review.findings ?? ""}</p>
-    </details>
-  </section>
-{/if}
-<p class="body-text">{task.body}</p>
-{#if error}
-  <p class="state error">{error}</p>
-{/if}
+  {#if review}
+    <section class="review" data-field="latest_review">
+      <p class="caption review-head">
+        レビュー
+        <span class="badge">{review.verdict}</span>
+      </p>
+      <!-- The verdict is read at once; the findings are the trees, folded. -->
+      <details class="record" data-findings>
+        <summary class="caption record-head">レビュー所見</summary>
+        <p class="findings">{review.findings ?? ""}</p>
+      </details>
+    </section>
+  {/if}
+  <p class="body-text">{task.body}</p>
+  {@render children?.()}
+</div>
 {#if transitions.length > 0 || (!task.archived && onedit)}
-  <div class="actions">
-    {#if !task.archived && onedit}<button
-        class="btn"
-        type="button"
-        disabled={busy}
-        onclick={onedit}>編集</button
-      >{/if}
-    {#each transitions as status (status)}
-      <button
-        class="btn"
-        class:primary={status === "ready" && !busy}
-        type="button"
-        disabled={busy}
-        onclick={() => ontransition?.(status)}
-      >
-        {status}
-      </button>
-    {/each}
-  </div>
+  <footer class="action-footer" aria-label="タスクの操作">
+    {#if error}<p class="error-banner" role="alert">{error}</p>{/if}
+    <div class="actions">
+      {#if !task.archived && onedit}<button
+          class="btn"
+          type="button"
+          disabled={busy}
+          onclick={onedit}>編集</button
+        >{/if}
+      {#each transitions as status (status)}
+        <button
+          class="btn"
+          class:primary={status === "ready" && !busy}
+          type="button"
+          disabled={busy}
+          onclick={() => ontransition?.(status)}
+        >
+          {status}
+        </button>
+      {/each}
+    </div>
+  </footer>
 {/if}
 
 <style lang="sass">
@@ -356,9 +364,20 @@
     margin: var(--sp-3) 0 0
     white-space: pre-line
 
+  .action-footer
+    position: sticky
+    bottom: 0
+    z-index: 8
+    display: flex
+    flex-direction: column
+    gap: var(--sp-2)
+    margin: auto calc(-1 * var(--sp-3)) 0
+    padding: var(--sp-2) var(--sp-3)
+    border-top: 1px solid var(--c-border)
+    background: var(--c-surface-raised)
+
   .actions
     display: flex
     flex-wrap: wrap
     gap: var(--sp-2)
-    margin-top: var(--sp-4)
 </style>
