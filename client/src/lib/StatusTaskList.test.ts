@@ -64,9 +64,9 @@ describe("StatusTaskList", () => {
     render(StatusTaskList, { props: { fetchState: "ready", items: ITEMS } });
 
     expect(groups().map((group) => group.dataset.status)).toEqual([
-      "draft",
-      "ready",
       "wip",
+      "ready",
+      "draft",
       "blocked",
     ]);
     // Called-off work leaves this page for the closed one, like released.
@@ -150,9 +150,9 @@ describe("StatusTaskList", () => {
       expect(document.querySelector(`a[href="/tasks/${id}"]`)).toBeNull();
     }
     expect(groups().map((group) => group.dataset.status)).toEqual([
-      "draft",
-      "ready",
       "wip",
+      "ready",
+      "draft",
       "blocked",
     ]);
     const ready = groups().find((group) => group.dataset.status === "ready")!;

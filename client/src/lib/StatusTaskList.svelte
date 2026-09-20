@@ -2,7 +2,7 @@
   import type { TaskSummary } from "./api";
   import TaskRow from "./TaskRow.svelte";
 
-  const STATUS_ORDER = ["draft", "ready", "wip", "blocked"];
+  const STATUS_ORDER = ["wip", "ready", "draft", "blocked"];
 
   let {
     fetchState,

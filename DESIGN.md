@@ -532,8 +532,10 @@ counterpart to carry, so it earns no token pair.
   The first content block offers a labelled native select
   実行先で絞り込み with すべて (default) and the externally configured names. It filters both
   status groups and the blocked-work panel, preserving selection during reloads.
-  Controls wrap with existing spacing and input/button tokens. The task list follows,
-  grouped in `draft`, `ready`, `wip`, `blocked` order. Empty groups are
+  Controls wrap with existing spacing and input/button tokens. The execution-waiting
+  alerts stay above the task list. The list groups remaining tasks in
+  `wip`, `ready`, `draft`, `blocked` order, so a growing draft backlog
+  cannot push current or ready work down. Empty groups are
   absent, including their heading and count. `done`, `cancelled` and
   `dropped` belong to the closed page; `archived: true` records belong
   to history regardless of their retained status or legacy kind.
@@ -840,8 +842,10 @@ counterpart to carry, so it earns no token pair.
   11. A blocked reason is visible without opening a details element.
       Activating `ready` and reloading displays ready with the same
       milestone records. Only available server transitions are offered.
-  12. Active groups are draft, ready, wip, blocked in that order, with
-      counts matching rows and no empty groups. Archived rows never
+  12. Active groups are wip, ready, draft, blocked in that order, with
+      counts matching rows and no empty groups. Execution-waiting alerts
+      stay above WIP. Tasks shown there do not repeat in the list.
+      Adding drafts does not move WIP or Ready down. Archived rows never
       appear there. No automatic review/merge/release queues or
       missing-subtask notices appear, including with legacy API fields.
   13. Closed rows include done, cancelled, dropped and archived legacy

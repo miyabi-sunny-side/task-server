@@ -202,7 +202,7 @@ describe("Home", () => {
       [...region("tasks").querySelectorAll<HTMLElement>("[data-status]")].map(
         (g) => g.dataset.status,
       ),
-    ).toEqual(["draft", "ready", "wip", "blocked"]);
+    ).toEqual(["wip", "ready", "draft", "blocked"]);
   });
 
   it("shows a stopped task once in the execution readout", async () => {
@@ -233,6 +233,15 @@ describe("Home", () => {
     expect(
       region("tasks").querySelector('a[href="/tasks/t-blocked"]'),
     ).toBeNull();
+    expect(
+      region("control").compareDocumentPosition(region("tasks")) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      [...region("tasks").querySelectorAll<HTMLElement>("[data-status]")].map(
+        (group) => group.dataset.status,
+      ),
+    ).toEqual(["wip", "ready", "draft"]);
   });
 
   it("shows the empty state for an empty list", async () => {
