@@ -7,6 +7,10 @@
 See [AGENTS.md](../AGENTS.md) for build/test commands and [DESIGN.md](../DESIGN.md) for
 UI behavior. Tests isolate data and agent execution from deployed work.
 
+`cargo test --locked` also starts a copy of the binary in a temporary directory.
+UI smoke checks cover HTML, assets, icons, HEAD, deep links, and API boundaries.
+The binary must also expose a snapshot and run without external UI files.
+
 ## Releases
 
 Push a `vMAJOR.MINOR.PATCH` tag matching `Cargo.toml` and `Cargo.lock`.
@@ -25,12 +29,18 @@ The real manifest supplies the compiled application's version. The frontend has 
 
 The release profile uses Cargo's standard optimization and codegen settings,
 with symbols stripped, to keep build time reasonable for this I/O-oriented server.
-To run the same image check locally:
+First build the frontend using the commands in AGENTS.md.
+The image check needs Cargo, jq, curl, and Docker:
 
 ```sh
 docker buildx build --load -t task-server:test .
 bash .github/smoke-image.sh task-server:test
 ```
+
+The script compiles the Rust smoke test and runs it against the isolated container.
+Release CI passes this test executable to the publish job.
+That job does not need Rust or frontend dependencies.
+Set `TASK_SERVER_SMOKE_TEST` to use an already compiled test executable.
 
 ## Browser regression check
 

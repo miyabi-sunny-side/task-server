@@ -64,8 +64,16 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:build-cache
 
+      - name: Download the native image verifier
+        uses: actions/download-artifact@v4
+        with:
+          name: ui-smoke
+          path: .ci-bin
+
       - name: Smoke-test the release image
-        run: bash .github/smoke-image.sh task-server:test
+        run: |
+          chmod +x .ci-bin/ui-smoke
+          TASK_SERVER_SMOKE_TEST="$PWD/.ci-bin/ui-smoke" bash .github/smoke-image.sh task-server:test
 
       # Same builder, inputs and labels: reuse the image just tested, then
       # retain intermediate stages for the next tag (no main-branch warmup).
