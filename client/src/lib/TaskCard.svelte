@@ -229,6 +229,13 @@
       </details>
     </section>
   {/if}
+  {#if task.idea_id}
+    <p class="caption" data-field="idea">
+      <a class="dependency" href={`/ideas/${encodeURIComponent(task.idea_id)}`}
+        >元のアイデア</a
+      >
+    </p>
+  {/if}
   <p class="body-text">{task.body}</p>
   {@render children?.()}
 </div>

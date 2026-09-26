@@ -150,9 +150,10 @@ describe("App", () => {
     const header = screen.getByRole("banner");
     const title = header.querySelector('a[href="/"]');
     expect(title?.textContent).toContain("Task Server");
+    expect(header.querySelector('a[href="/ideas"]')).toBeTruthy();
     expect(header.querySelector('a[href="/closed"]')).toBeTruthy();
     expect(screen.getByRole("button", { name: "メニュー" })).toBeTruthy();
-    expect(header.querySelectorAll("a, button")).toHaveLength(3);
+    expect(header.querySelectorAll("a, button")).toHaveLength(4);
 
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: TASK.title })).toBeTruthy(),

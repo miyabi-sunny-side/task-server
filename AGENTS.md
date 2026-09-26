@@ -5,7 +5,7 @@ One Axum process serves a Markdown task ledger, JSON API, MCP and the Svelte UI.
 ## Ownership
 
 - `APP_DATA_DIR` (default `data/ledger`) is the persistent truth. Collections are
-  `tasks`, `products`, `runs`, `archive`, `claim_receipts`; one YAML-frontmatter
+  `tasks`, `products`, `runs`, `archive`, `claim_receipts`, `idea`; one YAML-frontmatter
   Markdown file per record. Body text follows the closing fence. Unknown metadata
   survives updates. Filenames percent-encode UTF-8 IDs; products remain `org/repo`.
 - `ledger::Store` owns reading, validation, one-process exclusion and atomic file
@@ -23,6 +23,8 @@ One Axum process serves a Markdown task ledger, JSON API, MCP and the Svelte UI.
   stay stable; repository, optional absolute local_path and nullable releases are
   independent. No startup scan or repository configuration is authoritative.
   Existing product Markdown needs no rewrite; absent policy/placement is unknown.
+- `idea` owns notes that may become tasks: no lifecycle or execution target,
+  `revision` rejects stale edits, promotion creates one draft task per idea.
 - `task` owns current status, claims and milestones. `runs` owns the haystack and
   reading receipts. HTTP and MCP call the same domain functions.
 - The server does not launch agents or create review/merge/release subtasks.

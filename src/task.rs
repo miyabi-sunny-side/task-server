@@ -81,11 +81,16 @@ pub fn filter_target(tasks: &mut Vec<Value>, target: Option<&str>) -> Result<(),
     Ok(())
 }
 pub fn create(s: &AppState, v: Value) -> Result<Value, Error> {
-    let target = execution_target(s, &v)?;
+    let (id, t) = new_record(s, &v)?;
+    s.store.create("tasks", &id, t)
+}
+/// A validated draft record; callers choose how and where it is written.
+pub(crate) fn new_record(s: &AppState, v: &Value) -> Result<(String, Value), Error> {
+    let target = execution_target(s, v)?;
     let id = v["id"]
         .as_str()
         .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
-    let title = required(&v, "title")?;
+    let title = required(v, "title")?;
     if id.trim().is_empty() || id.contains('/') || id == "." || id == ".." {
         return Err(Error::Invalid("id must be one path segment".into()));
     }
@@ -105,7 +110,7 @@ pub fn create(s: &AppState, v: Value) -> Result<Value, Error> {
             t[k] = value.clone();
         }
     }
-    s.store.create("tasks", &id, t)
+    Ok((id, t))
 }
 pub(crate) fn invalidate(t: &mut Value, new: &Value) {
     if &t["commit_sha"] != new {

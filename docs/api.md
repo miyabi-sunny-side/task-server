@@ -5,7 +5,7 @@
 ## API
 
 The browser uses `/api/tasks`, `/api/tasks/{id}`,
-`/api/tasks/{id}/status`, `/api/closed`, `/api/products` and `/api/runs`.
+`/api/tasks/{id}/status`, `/api/closed`, `/api/ideas`, `/api/products` and `/api/runs`.
 MCP CRUD remains available at `/mcp`. `/worker/claim`, `/worker/heartbeat`,
 `/worker/report` and `/worker/runs` serve the small loop. `/worker/snapshot`
 exports a consistent backup generation. Old control-plane issuing endpoints are
@@ -14,6 +14,35 @@ retired: review, merge and rework no longer create separate task trees.
 Haystack readers can continue using `/api/runs/next` and `/api/runs/{id}/read`.
 Mark a run read after its downstream wiki update is safely stored; keep the cursor
 on the server so reader restarts do not lose unread work.
+
+## Ideas
+
+An idea is a note that may or may not become a task: a title, a free Markdown body
+(plan, research, source URLs, open questions, why it was dropped), an optional
+`product_id`, and no status or execution target. Each idea is
+`APP_DATA_DIR/idea/<id>.md`; the server assigns the UUID. Reading never changes
+`updated_at`. Workers never claim ideas.
+
+| HTTP | MCP | Behavior |
+| --- | --- | --- |
+| `GET /api/ideas[?archived=true]` | `idea_list(archived?, product_id?, limit?, offset?)` | Summaries without body, newest `updated_at` first, then ID. Archived ideas appear only with `archived=true`. |
+| `GET /api/ideas/{id}` | `idea_get(id)` | Full idea including body and `revision`; archived ideas stay readable. |
+| `POST /api/ideas` (201) | `idea_create(title, body?, product_id?)` | Title alone is enough. Revision starts at 1. |
+| `PATCH /api/ideas/{id}` | `idea_update(id, expected_revision, title?, body?, product_id?)` | Requires the revision that was read. A different current revision returns 409 `conflict` and writes nothing. `body` replaces the whole text; `product_id: null` clears it. |
+| `POST /api/ideas/{id}/archive` | `idea_archive(id)` | Idempotent. The idea leaves the default list and becomes read-only. |
+| `POST /api/ideas/{id}/promote` | `idea_promote(id, execution_target?, title?, body?, product_id?)` | Creates a draft task `idea-<id>` with `idea_id`, and records `task_id`/`promoted_at` on the idea. Omitted title, body and product default to the idea's; the execution target follows task creation rules. HTTP returns `{idea, task}` with the task card; MCP returns the idea summary and a compact `task`. |
+
+Every successful edit, archive or first promotion increments `revision`. Agents
+edit an idea by reading it with `idea_get`, researching, and sending the full new
+body with `expected_revision`. A conflict means another person or agent saved first:
+read again, merge the additions and retry. Archived ideas and conflicting promotions
+return 409.
+
+Promotion is an explicit action by the user or an agent instructed to do it. It
+never makes the task ready or starts a worker. The idea text stays unchanged. The
+task ID is derived from the idea, so retrying a promotion returns the same task;
+after a stop between the task write and the idea write, the retry links the
+existing task. Older ledgers and backups without `idea/` load normally.
 
 ## Explicit product metadata
 
@@ -108,7 +137,7 @@ or null). Limits are 1..200, default 50; offsets are nonnegative integers, defau
 Checkpoints sort oldest first. History uses the source-field order above, then array index. An offset beyond the end returns
 an empty page. These are views of current state, not frozen snapshots: restart a
 traversal if concurrent edits change membership/order. `/worker/snapshot` remains
-the consistent five-collection export for backup.
+the consistent export of every collection for backup.
 
 Task create/update/status responses include compact task state and the ID.
 They also include `ok`, `updated_at`, and `changed` field names.

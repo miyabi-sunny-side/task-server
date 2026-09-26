@@ -291,17 +291,20 @@ The shell stacks three rows:
 
 1. **App header.** Sticky, 48px, full width,
    `--c-wash-base` background, 1px bottom hairline. Every page keeps
-   three controls, left to right: the app title as a home link (`<a href="/">`,
-   label type, on-surface ink, no underline), the closed link
-   (`<a href="/closed">`, label type, same ink, grouped beside the title
-   with `--sp-2` gap), and the hamburger icon-button (right, unchanged).
+   four controls, left to right: the app title as a home link (`<a href="/">`,
+   label type, on-surface ink, no underline), the idea link
+   (`<a href="/ideas">`) and the closed link (`<a href="/closed">`), both
+   label type in the same ink, grouped beside the title with `--sp-2` gaps,
+   and the hamburger icon-button (right, unchanged).
    The top page adds a fourth control: the existing text-only 新規タスク
    primary button immediately before the hamburger, with `--sp-2` gap.
    Other pages omit this button. It stays directly visible, outside the menu.
    At narrow widths the title may ellipsize; the controls remain tappable.
-   **The title and the closed link are the header's only navigation
-   links**; every other destination lives inside the menu, so phone
-   widths never crowd. The closed link is a plain page-navigation link,
+   **The title, idea and closed are the header's only navigation
+   links**, in that order (revised 2026-09-26 for ideas; previously title
+   and closed only). Every other destination lives inside the menu, so phone
+   widths never crowd: at 320px the title ellipsizes first and idea, closed,
+   新規タスク and the hamburger stay whole and apart. Idea and closed are plain page-navigation links,
    not a primary action — it never takes the accent-filled button
    treatment, so it never competes with a page's one accent-filled
    control (see Colors, Buttons). Its only states are default and
@@ -490,8 +493,9 @@ counterpart to carry, so it earns no token pair.
 
 - **App header:** per Layout. The title link keeps on-surface ink with
   no underline (chrome, not content — the `link` token is for body
-  links). Beside it, the **closed link** is the header's one
-  page-navigation link: label type, `var(--sp-1) var(--sp-2)` padding,
+  links). Beside it, the **idea link** and the **closed link** are the
+  header's page-navigation links (this paragraph describes both;
+  "selected" means any `/ideas` route for idea, `/closed` for closed): label type, `var(--sp-1) var(--sp-2)` padding,
   `--radius-sm`, inline-flex, 36px min height (the same hit target as
   the hamburger). Default state matches the title — on-surface ink,
   transparent background, hover fills `--c-hover-1`. On `/closed` it
@@ -706,9 +710,66 @@ counterpart to carry, so it earns no token pair.
   points; with neither, omit the summary element. No full logs on a
   list. The same four list states apply; empty text remains
   閉じたタスクがありません and error offers 再試行.
+- **Idea pages — notes that may become tasks.** An idea is a titled
+  Markdown note kept apart from tasks; people and agents grow it over time
+  and may never promote it. `/ideas` lists open ideas, `/ideas/archived`
+  lists archived ones, `/ideas/<id>` is one idea. The header idea link is
+  selected on all three. No extra page title on the open list: the
+  header already says where you are.
+
+  **List.** The first content block is the quick add: a caption-labelled
+  新しいアイデア text input, an 追加 button and a quiet アーカイブ page
+  link, wrapping at narrow widths. A title alone creates the idea; Enter
+  submits. 追加 is the page's one primary fill only while the trimmed
+  title is non-empty, otherwise default with `aria-disabled`; a blank
+  submit does nothing. During the request the controls disable. Success
+  clears the field, keeps focus in it for the next idea and reloads the
+  list; failure keeps the typed title and shows an error banner under the
+  controls (role alert). Rows reuse the single-link card recipe in
+  document order: optional product (muted caption), wrapping title
+  (label), then the caption time and an optional タスク化済み outline badge.
+  Server order is `updated_at` descending with a stable tie; open rows
+  show `updated_at`, archived rows show `archived_at`. The archive page
+  replaces the quick add with a label-type アーカイブ heading and an
+  アイデア一覧 link back; it has no add or edit controls. Both lists use
+  the four list states (empty: アイデアがありません /
+  アーカイブしたアイデアはありません) and the shared reload rhythm, keeping
+  drawn rows on a failed background reload.
+
+  **Detail.** The title-only sub-header, then optional product (body-sm),
+  a caption 更新 … ・ 作成 …, and when present neutral アーカイブ済み /
+  タスク化済み badges with a タスクを開く link to the promoted task. The
+  body is plain text with pre-line and long-token wrapping; Markdown is
+  shown as source and never rendered as HTML. An empty body reads
+  本文はまだありません. The Detail action footer recipe carries 編集,
+  タスク化 (absent once promoted) and アーカイブ, all default buttons: no
+  action here is the page's one obvious next move. Archived ideas are
+  read-only and show no footer.
+
+  **Editing** happens in place, not in a modal, because research notes run
+  long: labelled title, product (optional) and a 14-row body textarea,
+  with 保存 (primary while valid) and キャンセル in the footer. A blank
+  title keeps 保存 focusable with `aria-disabled` and the reason. The save
+  sends the revision the edit started from. Background reloads refresh the
+  record but never the draft or focus. A failed save keeps the draft and
+  shows the reason in the footer for retry. A 409 keeps the draft too and
+  shows, above the form, an error banner and the latest title and body in
+  a card; the footer then offers この内容で上書き保存 (saves the draft
+  over the latest revision just shown) and 下書きを破棄 (shows the
+  latest). If the idea was archived meanwhile, only 下書きを破棄 remains
+  and the banner says so. Leaving the editor returns focus to 編集.
+
+  **Archive** asks once in the shared Modal (アーカイブ primary /
+  取りやめ); failure stays in the dialog. **タスク化** opens the task
+  create/edit modal titled アイデアをタスク化, prefilled with the idea's
+  product, title and body, the target select defaulting as for a new task,
+  and a タスクを作成 submit. Success lands on the new draft task's detail
+  page, whose caption row carries a 元のアイデア link back. A retried
+  promotion returns the same task; nothing becomes ready.
+
 - **Products page — read-only registry.** `/products` is reached by the
   dropdown's プロダクト一覧 link after テーマ設定; the header keeps its
-  existing three controls. Activation closes the menu and navigates
+  existing controls. Activation closes the menu and navigates
   without a full reload; direct loading restores this page. Keep the
   existing content column, with a label-type プロダクト一覧 heading and
   a flat list of every registered product in server order, including
@@ -809,13 +870,14 @@ counterpart to carry, so it earns no token pair.
   2. Choosing ライト in the theme modal sets `data-theme="light"`,
      turns the body `rgb(250, 246, 239)`, writes the storage key, and
      leaves the modal open.
-  3. At 375px the closed header menu leaves three interactive elements —
-     the title `<a href="/">`, the closed link `<a href="/closed">`, and
-     the hamburger `<button>` — plus 新規タスク on `/` only, for four.
+  3. At 375px and 320px the closed header menu leaves four interactive
+     elements — the title `<a href="/">`, the idea link `<a href="/ideas">`,
+     the closed link `<a href="/closed">`, and the hamburger `<button>` —
+     plus 新規タスク on `/` only, for five.
      The creation button is absent on other pages and from the content column.
      Header controls never overlap and
      `document.documentElement.scrollWidth` never exceeds the
-     viewport, with the menu closed or open, on both `/` and `/closed`.
+     viewport, with the menu closed or open, on `/`, `/ideas` and `/closed`.
   4. Cards compute to 1px border / 8px radius / 10px padding / 8px gap;
      the list's `data-state` reflects loading, empty, error, success.
   5. Chrome icons are all inline SVG on the 24×24 viewBox grid, stroked
@@ -896,7 +958,9 @@ counterpart to carry, so it earns no token pair.
       clip (no ink lost) and the ink bounding box is at least 28px wide
       of the 48, so what remains is the whole check rather than a
       fragment.
-  22. Header closed link states, computed. Off `/closed`, the closed
+  22. Header idea and closed link states, computed — the rule below is
+      stated for closed and holds equally for idea on `/ideas` routes.
+      Off `/closed`, the closed
       link's computed `background-color` is transparent and it carries no
       `aria-current` attribute. On `/closed`, it carries
       `aria-current="page"`, its computed `background-color` equals
@@ -979,7 +1043,7 @@ counterpart to carry, so it earns no token pair.
   weight the others don't have.
 - Do present the menu as a hamburger-anchored dropdown; centered
   modals are for dialogs (theme settings), never for navigation.
-- Do give the closed link the selected-radio tint (`--c-accent-subtle`
+- Do give the idea and closed links the selected-radio tint (`--c-accent-subtle`
   background, `--c-accent` text) and `aria-current="page"` when active;
   don't give a page-navigation link a solid accent-filled background —
   that treatment stays reserved for a region's one primary action.

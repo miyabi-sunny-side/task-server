@@ -114,6 +114,23 @@ class DataTests(unittest.TestCase):
         with self.assertRaises(ValueError): self.data.restore(bad,self.root/'bad-restore')
         self.assertFalse((self.root/'bad-restore').exists())
 
+    def test_snapshots_restore_ideas_and_older_exports_without_them(self):
+        records={name:[] for name in self.data.COLLECTIONS}
+        records['idea']=[dict(id='i1',title='maybe',body='research\n',revision=2,archived=False)]
+        records['tasks']=[dict(id='t',title='x',body='',status='draft',idea_id='i1')]
+        self.data.snapshot(records,self.root/'new.tar.gz')
+        self.data.restore(self.root/'new.tar.gz',self.root/'new')
+        self.assertEqual(self.data.read_generated(self.root/'new'/'idea'/'i1.md'),records['idea'][0])
+        self.assertEqual(self.data.read_generated(self.root/'new'/'tasks'/'t.md'),records['tasks'][0])
+        older={name:[] for name in ('tasks','products','runs','archive','claim_receipts')}
+        older['products']=[dict(id='org/repo',repository='r')]
+        self.data.snapshot(older,self.root/'old.tar.gz')
+        self.data.restore(self.root/'old.tar.gz',self.root/'old')
+        self.assertTrue((self.root/'old'/'idea').is_dir())
+        self.assertEqual(self.data.read_generated(self.root/'old'/'products'/self.data.filename('org/repo')),older['products'][0])
+        with self.assertRaises(ValueError): self.data.snapshot(dict(older,unknown=[]),self.root/'bad.tar.gz')
+        with self.assertRaises(ValueError): self.data.snapshot({'tasks':[]},self.root/'partial.tar.gz')
+
     def test_r2_upload_uses_configured_destination_and_environment(self):
         archive = self.root / 'generation.tar.gz'
         archive.write_bytes(b'local backup')

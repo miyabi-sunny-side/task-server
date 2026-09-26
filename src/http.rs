@@ -1,4 +1,4 @@
-use crate::{AppState, Error, product, runs, task};
+use crate::{AppState, Error, idea, product, runs, task};
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -103,6 +103,52 @@ pub async fn api_control(State(s): State<AppState>) -> Result<Json<Value>, Error
     Ok(Json(
         json!({"mergeable":[],"pending_merges":[],"pending_releases":[],"pending_reviews":[],"unreviewed":[],"releasable":[],"stuck":stuck}),
     ))
+}
+pub async fn api_ideas(
+    State(s): State<AppState>,
+    Query(q): Query<BTreeMap<String, String>>,
+) -> Result<Json<Value>, Error> {
+    let archived = match q.get("archived").map(String::as_str) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => return Err(Error::Invalid("archived must be true or false".into())),
+    };
+    Ok(Json(json!(idea::list(&s, archived)?)))
+}
+pub async fn api_idea(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, Error> {
+    Ok(Json(idea::get(&s, &id)?))
+}
+pub async fn api_create_idea(
+    State(s): State<AppState>,
+    Json(v): Json<Value>,
+) -> Result<(StatusCode, Json<Value>), Error> {
+    Ok((StatusCode::CREATED, Json(idea::create(&s, v)?)))
+}
+pub async fn api_patch_idea(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(v): Json<Value>,
+) -> Result<Json<Value>, Error> {
+    Ok(Json(idea::update(&s, &id, v)?))
+}
+pub async fn api_archive_idea(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, Error> {
+    Ok(Json(idea::archive(&s, &id)?))
+}
+pub async fn api_promote_idea(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(v): Json<Value>,
+) -> Result<Json<Value>, Error> {
+    let mut promoted = idea::promote(&s, &id, v)?;
+    let task_id = task::string(&promoted["task"], "id").to_owned();
+    promoted["task"] = task::card(&s, &task_id)?;
+    Ok(Json(promoted))
 }
 pub async fn api_products(State(s): State<AppState>) -> Result<Json<Value>, Error> {
     Ok(Json(json!(
@@ -266,8 +312,8 @@ pub async fn worker_snapshot(State(s): State<AppState>) -> Result<Json<Value>, E
     Ok(Json(s.store.transaction(|a| {
         crate::report::recover(a)?;
         let mut result = json!({});
-        for c in ["tasks", "products", "runs", "archive", "claim_receipts"] {
-            result[c] = json!(a.list(c)?);
+        for c in crate::ledger::COLLECTIONS {
+            result[*c] = json!(a.list(c)?);
         }
         Ok(result)
     })?))

@@ -13,6 +13,7 @@ pub mod clock;
 pub mod error;
 pub mod frontmatter;
 pub mod http;
+pub mod idea;
 pub mod ledger;
 pub mod mcp;
 pub mod product;
@@ -42,6 +43,13 @@ pub fn app(state: AppState) -> Router {
         .route("/runs/next", get(http::api_runs_next))
         .route("/runs/{id}", get(http::api_run))
         .route("/runs/{id}/read", post(http::api_run_read))
+        .route("/ideas", get(http::api_ideas).post(http::api_create_idea))
+        .route(
+            "/ideas/{id}",
+            get(http::api_idea).patch(http::api_patch_idea),
+        )
+        .route("/ideas/{id}/archive", post(http::api_archive_idea))
+        .route("/ideas/{id}/promote", post(http::api_promote_idea))
         .route("/products", get(http::api_products))
         .route("/products/rescan", post(http::retired))
         .route(

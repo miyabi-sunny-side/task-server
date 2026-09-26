@@ -9,23 +9,30 @@
 
   let {
     initial,
+    prefill,
+    submitLabel = "保存",
     title,
     onsave,
     onclose,
   }: {
     initial?: TaskFields;
+    // Starting values for a new task (e.g. promoting an idea); unlike
+    // `initial`, the form still creates, so the target default applies.
+    prefill?: TaskFields;
+    submitLabel?: string;
     title: string;
     onsave: (fields: TaskFields) => Promise<void>;
     onclose: () => void;
   } = $props();
   // A form owns its draft for its lifetime; background card refreshes do not.
-  let product = $state(untrack(() => initial?.product_id ?? ""));
-  let taskTitle = $state(untrack(() => initial?.title ?? ""));
+  const start = untrack(() => initial ?? prefill);
+  let product = $state(start?.product_id ?? "");
+  let taskTitle = $state(start?.title ?? "");
   const originalTarget = untrack(() => initial?.execution_target ?? undefined);
   let target = $state<string | undefined>(originalTarget);
   let targets = $state<ExecutionTargets>();
   let configError = $state(false);
-  let body = $state(untrack(() => initial?.body ?? ""));
+  let body = $state(start?.body ?? "");
   let busy = $state(false);
   let error = $state("");
   let invalid = $derived(
@@ -142,7 +149,8 @@
       type="submit"
       disabled={busy}
       aria-disabled={!!invalid}
-      aria-describedby={invalid ? "task-form-required" : undefined}>保存</button
+      aria-describedby={invalid ? "task-form-required" : undefined}
+      >{submitLabel}</button
     >
   </form>
 </Modal>

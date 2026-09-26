@@ -10,6 +10,7 @@
   let menuButton = $state<HTMLButtonElement | undefined>();
 
   let onClosed = $derived(router.index === 2);
+  let onIdeas = $derived(router.index >= 4 && router.index <= 6);
 
   function closeMenu() {
     menuOpen = false;
@@ -39,6 +40,14 @@
 <header>
   <div class="nav">
     <a class="title" href="/">Task Server</a>
+    <a
+      class="done-link"
+      class:selected={onIdeas}
+      href="/ideas"
+      aria-current={onIdeas ? "page" : undefined}
+    >
+      idea
+    </a>
     <a
       class="done-link"
       class:selected={onClosed}

@@ -382,3 +382,17 @@ it("shows checkpoint values under their execution and keeps arbitrary text inert
   expect(panel?.querySelector("script")).toBeNull();
   cleanup();
 });
+
+describe("TaskCard idea link", () => {
+  afterEach(cleanup);
+
+  it("links a promoted task back to its idea, and nothing otherwise", () => {
+    render(TaskCard, { task: { ...FIXTURE, idea_id: "i/1" } });
+    expect(
+      screen.getByRole("link", { name: "元のアイデア" }).getAttribute("href"),
+    ).toBe("/ideas/i%2F1");
+    cleanup();
+    render(TaskCard, { task: FIXTURE });
+    expect(screen.queryByRole("link", { name: "元のアイデア" })).toBeNull();
+  });
+});

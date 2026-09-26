@@ -131,6 +131,8 @@ export interface TaskCard extends ExecutionReference {
   // What that task is doing while it has not landed. Absent once it has, or
   // when there is no dependency at all.
   dependency_status?: string;
+  // The idea this task was promoted from, kept for the way back.
+  idea_id?: string | null;
 }
 
 // A refusal the server explained. The message is the human wording the
@@ -328,4 +330,73 @@ export function fetchRuns(
 
 export function fetchRun(id: number): Promise<Run> {
   return requestJson(`/api/runs/${id}`);
+}
+
+// An idea is a Markdown note that may or may not become a task. `revision`
+// is the version an edit was based on; the server refuses a save from an
+// older one with 409 so a collaborator's additions are never overwritten.
+export interface Idea {
+  id: string;
+  title: string;
+  body: string;
+  product_id: string | null;
+  created_at: string;
+  updated_at: string;
+  revision: number;
+  archived: boolean;
+  archived_at: string | null;
+  task_id: string | null;
+  promoted_at: string | null;
+}
+
+export type IdeaSummary = Omit<Idea, "body">;
+
+export interface IdeaFields {
+  title?: string;
+  body?: string;
+  product_id?: string | null;
+}
+
+function ideaUrl(id: string, action = ""): string {
+  return `/api/ideas/${encodeURIComponent(id)}${action}`;
+}
+
+export function fetchIdeas(
+  archived: boolean,
+  signal?: AbortSignal,
+): Promise<IdeaSummary[]> {
+  return requestJson(archived ? "/api/ideas?archived=true" : "/api/ideas", {
+    signal,
+  });
+}
+
+export function fetchIdea(id: string, signal?: AbortSignal): Promise<Idea> {
+  return requestJson(ideaUrl(id), { signal });
+}
+
+export function createIdea(fields: IdeaFields): Promise<Idea> {
+  return postJson("/api/ideas", fields);
+}
+
+export function updateIdea(
+  id: string,
+  expectedRevision: number,
+  fields: IdeaFields,
+): Promise<Idea> {
+  return requestJson(ideaUrl(id), {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ...fields, expected_revision: expectedRevision }),
+  });
+}
+
+export function archiveIdea(id: string): Promise<Idea> {
+  return postJson(ideaUrl(id, "/archive"), {});
+}
+
+export function promoteIdea(
+  id: string,
+  fields: TaskFields,
+): Promise<{ idea: Idea; task: TaskCard }> {
+  return postJson(ideaUrl(id, "/promote"), fields);
 }

@@ -20,7 +20,9 @@ import tarfile
 import tempfile
 import urllib.request
 
-COLLECTIONS = ('tasks', 'products', 'runs', 'archive', 'claim_receipts')
+COLLECTIONS = ('tasks', 'products', 'runs', 'archive', 'claim_receipts', 'idea')
+# Exports from servers before ideas existed lack only these collections.
+OPTIONAL = ('idea',)
 
 
 def filename(value):
@@ -142,7 +144,8 @@ def migrate(source, destination):
 
 
 def snapshot(records, archive):
-    if set(records) != set(COLLECTIONS): raise ValueError('incomplete snapshot collections')
+    if not set(COLLECTIONS) - set(OPTIONAL) <= set(records) <= set(COLLECTIONS):
+        raise ValueError('incomplete snapshot collections')
     files = {}
     for collection, rows in records.items():
         if not isinstance(rows, list): raise ValueError('snapshot collection must be a list')

@@ -16,6 +16,15 @@ describe("matchRoute", () => {
     });
   });
 
+  it("maps the idea list, archive and detail routes", () => {
+    expect(matchRoute("/ideas")).toEqual({ index: 4, params: {} });
+    expect(matchRoute("/ideas/archived")).toEqual({ index: 5, params: {} });
+    expect(matchRoute("/ideas/a%2Fb")).toEqual({
+      index: 6,
+      params: { id: "a/b" },
+    });
+  });
+
   it("normalizes unknown paths to home", () => {
     expect(matchRoute("/no/such/page")).toEqual({ index: 0, params: {} });
   });

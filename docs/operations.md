@@ -81,6 +81,7 @@ ledger/
   runs/<number>.md
   archive/<record-id>.md
   claim_receipts/<record-id>.md
+  idea/<idea-id>.md
 ```
 
 Each document has YAML frontmatter and a Markdown body. IDs are encoded in filenames;
@@ -128,7 +129,8 @@ bin/task-data snapshot --server http://127.0.0.1:3000 --output-dir /backups/task
 bin/task-data restore /backups/task-server/ledger-TIMESTAMP.tar.gz /data/restored-ledger
 ```
 
-Snapshots include tasks, catalogue, haystack, read receipts and migration history.
+Snapshots include tasks, ideas, catalogue, haystack, read receipts and migration history.
+Archives made before ideas existed restore with an empty `idea/` directory.
 The archive contains a SHA-256 manifest. Restore validates all entries and checksums
 before publishing a new directory. Open that directory with a separate server to
 verify task history and unread haystack counts. It does not overwrite a live ledger.

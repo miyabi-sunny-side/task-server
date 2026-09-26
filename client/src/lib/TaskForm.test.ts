@@ -194,3 +194,25 @@ it("retains drafts through a configuration failure and retries before creating",
     expect.objectContaining({ execution_target: "forge" }),
   );
 });
+it("a prefilled new task keeps the given fields and the default target", async () => {
+  const onsave = vi.fn().mockResolvedValue(undefined);
+  render(TaskForm, {
+    title: "アイデアをタスク化",
+    submitLabel: "タスクを作成",
+    prefill: { product_id: "org/repo", title: "案", body: "本文" },
+    onsave,
+    onclose: vi.fn(),
+  });
+  await waitFor(() =>
+    expect((screen.getByLabelText("実行先") as HTMLSelectElement).value).toBe(
+      "forge",
+    ),
+  );
+  await fireEvent.click(screen.getByRole("button", { name: "タスクを作成" }));
+  expect(onsave).toHaveBeenCalledWith({
+    product_id: "org/repo",
+    title: "案",
+    body: "本文",
+    execution_target: "forge",
+  });
+});

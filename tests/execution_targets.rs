@@ -278,7 +278,14 @@ async fn legacy_default_and_definitions_stay_external() {
             .keys()
             .map(String::as_str)
             .collect::<Vec<_>>(),
-        ["archive", "claim_receipts", "products", "runs", "tasks"]
+        [
+            "archive",
+            "claim_receipts",
+            "idea",
+            "products",
+            "runs",
+            "tasks"
+        ]
     );
 }
 

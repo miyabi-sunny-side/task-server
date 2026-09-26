@@ -82,7 +82,7 @@ Copy `target/release/task-server`; no separate UI directory is needed at runtime
 ## Reference
 
 - [Operations](docs/operations.md): configuration, target names, storage, migration, and backups.
-- [HTTP and MCP](docs/api.md): product registration, task reads and mutations, execution notes, pagination.
+- [HTTP and MCP](docs/api.md): product registration, task reads and mutations, ideas, execution notes, pagination.
 - [Worker execution](docs/workers.md): claims, leases, checkpoints, completion reports, and resumption.
 - [Development and releases](docs/development.md): build checks, browser verification, and container publishing.
 

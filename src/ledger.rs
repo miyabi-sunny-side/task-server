@@ -10,7 +10,14 @@ use serde_json::Value;
 use crate::error::Error;
 use crate::frontmatter::{Document, join_document, split_document};
 
-const COLLECTIONS: &[&str] = &["tasks", "products", "runs", "archive", "claim_receipts"];
+pub const COLLECTIONS: &[&str] = &[
+    "tasks",
+    "products",
+    "runs",
+    "archive",
+    "claim_receipts",
+    "idea",
+];
 
 pub struct Store {
     root: PathBuf,

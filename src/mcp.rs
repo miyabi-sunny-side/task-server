@@ -1,5 +1,5 @@
 //! Trusted-network MCP adapters for the same Markdown domain.
-use crate::{AppState, Error, product, task};
+use crate::{AppState, Error, idea, product, task};
 use axum::Router;
 use rmcp::{
     ServerHandler,
@@ -186,6 +186,96 @@ pub struct TaskUpdate {
         skip_serializing_if = "Option::is_none"
     )]
     pub milestones: Option<Vec<Value>>,
+}
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IdeaList {
+    /// true lists archived ideas only; omission or false lists the others.
+    #[serde(default, deserialize_with = "non_null")]
+    pub archived: Option<bool>,
+    #[serde(default, deserialize_with = "non_null")]
+    pub product_id: Option<String>,
+    #[serde(default, deserialize_with = "non_null")]
+    pub limit: Option<usize>,
+    #[serde(default, deserialize_with = "non_null")]
+    pub offset: Option<usize>,
+}
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IdeaCreate {
+    pub title: String,
+    #[serde(
+        default,
+        deserialize_with = "non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub body: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub product_id: Option<String>,
+}
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IdeaUpdate {
+    #[serde(skip_serializing)]
+    pub id: String,
+    /// The revision returned by the `idea_get` this edit is based on.
+    pub expected_revision: u64,
+    #[serde(
+        default,
+        deserialize_with = "non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub title: Option<String>,
+    /// Replaces the whole Markdown body; include the text you read plus your additions.
+    #[serde(
+        default,
+        deserialize_with = "non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub body: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "Option<String>")]
+    pub product_id: Option<Value>,
+}
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IdeaPromote {
+    #[serde(skip_serializing)]
+    pub id: String,
+    /// One externally configured execution target; omission requires an external default.
+    #[serde(
+        default,
+        deserialize_with = "non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub execution_target: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub title: Option<String>,
+    /// Task scope and completion conditions; omission copies the idea body.
+    #[serde(
+        default,
+        deserialize_with = "non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub body: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub product_id: Option<String>,
 }
 fn non_null<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
 where
@@ -401,6 +491,7 @@ impl Admin {
                     "interrupted_claim_id",
                     "last_claim_id",
                     "report_id",
+                    "idea_id",
                     "created_at",
                     "updated_at",
                     "done_at",
@@ -587,6 +678,56 @@ impl Admin {
         answer(
             task::delete(&self.state, &a.id).map(|_| json!({"ok":true,"id":a.id,"deleted":true})),
         )
+    }
+    #[tool(
+        description = "List ideas (notes that may or may not become tasks) without bodies, newest update first, stable id order on ties. archived:true lists archived ideas only; optional product_id. limit 1..200 default 50, offset default 0; follow next_offset until null. idea_get reads the body."
+    )]
+    fn idea_list(&self, Parameters(a): Parameters<IdeaList>) -> CallToolResult {
+        answer((|| {
+            validate_product(a.product_id.as_deref())?;
+            validate_page(a.limit)?;
+            let ideas = idea::list(&self.state, a.archived.unwrap_or(false))?
+                .into_iter()
+                .filter(|i| a.product_id.as_ref().is_none_or(|p| i["product_id"] == *p))
+                .collect();
+            page("ideas", ideas, a.limit, a.offset)
+        })())
+    }
+    #[tool(
+        description = "Read one idea with its Markdown body (plan, research, source URLs, open questions, reasons to drop) and revision. Archived ideas stay readable. Pass revision as expected_revision to idea_update."
+    )]
+    fn idea_get(&self, Parameters(a): Parameters<Id>) -> CallToolResult {
+        answer(idea::get(&self.state, &a.id))
+    }
+    #[tool(
+        description = "Save a new idea; only title is required. Optional Markdown body and product_id (org/repo). No execution target or status. Returns a summary with id and revision."
+    )]
+    fn idea_create(&self, Parameters(a): Parameters<IdeaCreate>) -> CallToolResult {
+        answer(idea::create(&self.state, fields(&a)).map(|i| idea::summary(&i)))
+    }
+    #[tool(
+        description = "Edit an idea after idea_get: pass the revision you read as expected_revision. body replaces the whole text, so send what you read plus your research. A conflict error means someone else saved first: idea_get again, merge your additions into the new body, retry. Archived ideas are read-only. product_id:null clears it."
+    )]
+    fn idea_update(&self, Parameters(a): Parameters<IdeaUpdate>) -> CallToolResult {
+        answer(idea::update(&self.state, &a.id, fields(&a)).map(|i| idea::summary(&i)))
+    }
+    #[tool(
+        description = "Archive an idea that will not be pursued (record the reason in the body first). It leaves the default list, stays readable via idea_list archived:true and idea_get, and becomes read-only. Idempotent."
+    )]
+    fn idea_archive(&self, Parameters(a): Parameters<Id>) -> CallToolResult {
+        answer(idea::archive(&self.state, &a.id).map(|i| idea::summary(&i)))
+    }
+    #[tool(
+        description = "Only when the user or your instructions explicitly ask: turn an idea into a draft task (never ready, no worker is started). title/product_id default to the idea's; body should state the task scope and completion conditions (default copies the idea body). execution_target must be configured (execution_targets_get) or falls back to the external default. The idea keeps its text and gains task_id; the task gains idea_id. Retrying returns the same task instead of a duplicate."
+    )]
+    fn idea_promote(&self, Parameters(a): Parameters<IdeaPromote>) -> CallToolResult {
+        answer(idea::promote(&self.state, &a.id, fields(&a)).map(|r| {
+            let mut result = idea::summary(&r["idea"]);
+            let mut task = brief_task(&r["task"]);
+            task::project_target(&self.state, &mut task);
+            result["task"] = task;
+            result
+        }))
     }
     #[tool(
         description = "List registered product summaries, optional archived filter. Stable id order; limit 1..200 default 50, offset default 0. Follow next_offset; product_get reads full metadata."

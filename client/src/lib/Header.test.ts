@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/svelte";
 import { afterEach, describe, expect, it } from "vitest";
 
 import Header from "./Header.svelte";
+import { syncRoute } from "./router.svelte";
 import { THEME_STORAGE_KEY } from "./theme";
 
 describe("Header menu and theme flow", () => {
@@ -9,6 +10,34 @@ describe("Header menu and theme flow", () => {
     cleanup();
     window.localStorage.clear();
     delete document.documentElement.dataset.theme;
+  });
+
+  it("navigates Task Server, idea, closed in that order", () => {
+    render(Header);
+    const links = screen.getByRole("banner").querySelectorAll(".nav > a");
+    expect(Array.from(links, (link) => link.textContent?.trim())).toEqual([
+      "Task Server",
+      "idea",
+      "closed",
+    ]);
+  });
+
+  it("marks idea as the current page on every idea route", () => {
+    for (const path of ["/ideas", "/ideas/archived", "/ideas/abc"]) {
+      window.history.replaceState(null, "", path);
+      syncRoute();
+      render(Header);
+      const idea = screen.getByRole("link", { name: "idea" });
+      expect(idea.getAttribute("aria-current")).toBe("page");
+      expect(
+        screen
+          .getByRole("link", { name: "closed" })
+          .getAttribute("aria-current"),
+      ).toBeNull();
+      cleanup();
+    }
+    window.history.replaceState(null, "", "/");
+    syncRoute();
   });
 
   it("hamburger opens an anchored dropdown, not a dialog", async () => {
