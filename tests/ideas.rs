@@ -306,21 +306,7 @@ async fn tool(app: &axum::Router, session: &str, name: &str, arguments: Value) -
     )
 }
 
-#[tokio::test]
-async fn http_and_mcp_edit_the_same_idea_and_share_conflict_detection() {
-    let dir = tempfile::tempdir().unwrap();
-    let s = common::state(Store::open(dir.path()).unwrap());
-    let app = task_server::app(s.clone());
-    let (code, created) = request(
-        app.clone(),
-        "POST",
-        "/api/ideas",
-        json!({"title":"from UI"}),
-    )
-    .await;
-    assert_eq!(code, StatusCode::CREATED);
-    let id = created["id"].as_str().unwrap().to_owned();
-
+async fn mcp_session(app: &axum::Router) -> String {
     let (headers, _) = rpc(
         app.clone(),
         None,
@@ -339,6 +325,25 @@ async fn http_and_mcp_edit_the_same_idea_and_share_conflict_detection() {
         json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
     )
     .await;
+    session
+}
+
+#[tokio::test]
+async fn http_and_mcp_edit_the_same_idea_and_share_conflict_detection() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = common::state(Store::open(dir.path()).unwrap());
+    let app = task_server::app(s.clone());
+    let (code, created) = request(
+        app.clone(),
+        "POST",
+        "/api/ideas",
+        json!({"title":"from UI"}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED);
+    let id = created["id"].as_str().unwrap().to_owned();
+
+    let session = mcp_session(&app).await;
 
     let (error, listed) = tool(&app, &session, "idea_list", json!({"limit":1})).await;
     assert!(!error);
@@ -394,6 +399,22 @@ async fn http_and_mcp_edit_the_same_idea_and_share_conflict_detection() {
     )
     .await;
     assert!(error);
+}
+
+#[tokio::test]
+async fn http_and_mcp_promote_archive_and_export_the_same_ideas() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = common::state(Store::open(dir.path()).unwrap());
+    let app = task_server::app(s.clone());
+    let (_, created) = request(
+        app.clone(),
+        "POST",
+        "/api/ideas",
+        json!({"title":"from UI"}),
+    )
+    .await;
+    let id = created["id"].as_str().unwrap().to_owned();
+    let session = mcp_session(&app).await;
 
     let (error, created) = tool(
         &app,
