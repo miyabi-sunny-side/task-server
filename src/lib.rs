@@ -49,6 +49,7 @@ pub fn app(state: AppState) -> Router {
             get(http::api_idea).patch(http::api_patch_idea),
         )
         .route("/ideas/{id}/archive", post(http::api_archive_idea))
+        .route("/ideas/{id}/unarchive", post(http::api_unarchive_idea))
         .route("/ideas/{id}/promote", post(http::api_promote_idea))
         .route("/products", get(http::api_products))
         .route("/products/rescan", post(http::retired))

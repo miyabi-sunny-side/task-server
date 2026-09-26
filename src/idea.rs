@@ -131,6 +131,18 @@ pub fn archive(s: &AppState, id: &str) -> Result<Value, Error> {
     })
 }
 
+/// Idempotent; restores an editable idea, keeping its text and task link.
+pub fn unarchive(s: &AppState, id: &str) -> Result<Value, Error> {
+    s.store.update(COLLECTION, id, |idea| {
+        if archived(idea) {
+            idea["archived"] = json!(false);
+            idea["archived_at"] = Value::Null;
+            touch(s, idea);
+        }
+        Ok(())
+    })
+}
+
 /// Create the idea's draft task, or return the one an earlier attempt created.
 /// The task id derives from the idea, so a retry after a stop between the two
 /// file writes links the existing task instead of creating another.

@@ -183,6 +183,43 @@ fn archive_moves_idea_to_the_archive_list_and_makes_it_read_only() {
 }
 
 #[test]
+fn unarchive_restores_an_editable_idea_and_keeps_its_text_and_task_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let (s, clock) = clocked(dir.path());
+    let id = idea::create(&s, json!({"title":"back again","body":"notes"})).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let promoted = idea::promote(&s, &id, json!({})).unwrap();
+    let task_id = promoted["task"]["id"].as_str().unwrap().to_owned();
+    clock.advance_secs(5);
+    idea::archive(&s, &id).unwrap();
+    clock.advance_secs(5);
+    let restored = idea::unarchive(&s, &id).unwrap();
+    assert_eq!(restored["archived"], false);
+    assert!(restored["archived_at"].is_null());
+    assert_eq!(restored["updated_at"], "2026-09-26T00:00:10Z");
+    assert_eq!(restored["body"], "notes");
+    assert_eq!(restored["task_id"], task_id.as_str());
+    assert_eq!(restored["promoted_at"], promoted["idea"]["promoted_at"]);
+    clock.advance_secs(5);
+    assert_eq!(idea::unarchive(&s, &id).unwrap(), restored);
+    assert_eq!(ids(&idea::list(&s, false).unwrap()), [id.as_str()]);
+    assert!(idea::list(&s, true).unwrap().is_empty());
+    let edited = idea::update(
+        &s,
+        &id,
+        json!({"expected_revision":restored["revision"],"body":"edited"}),
+    )
+    .unwrap();
+    assert_eq!(edited["body"], "edited");
+    assert!(matches!(
+        idea::unarchive(&s, "absent"),
+        Err(Error::NotFound(_))
+    ));
+}
+
+#[test]
 fn promotion_creates_one_linked_draft_and_survives_an_interrupted_link() {
     let dir = tempfile::tempdir().unwrap();
     let (s, _) = clocked(dir.path());
@@ -463,6 +500,35 @@ async fn http_and_mcp_promote_archive_and_export_the_same_ideas() {
     assert_eq!(archived_list["ideas"][0]["id"], id.as_str());
     let (code, _) = request(app.clone(), "GET", "/api/ideas/absent", json!(null)).await;
     assert_eq!(code, StatusCode::NOT_FOUND);
+
+    let (code, restored) = request(
+        app.clone(),
+        "POST",
+        &format!("/api/ideas/{id}/unarchive"),
+        json!(null),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(restored["archived"], false);
+    let (_, old) = request(app.clone(), "GET", "/api/ideas?archived=true", json!(null)).await;
+    assert!(old.as_array().unwrap().is_empty());
+    let (code, _) = request(
+        app.clone(),
+        "POST",
+        "/api/ideas/absent/unarchive",
+        json!(null),
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND);
+    tool(&app, &session, "idea_archive", json!({"id":id})).await;
+    let (error, restored) = tool(&app, &session, "idea_unarchive", json!({"id":id})).await;
+    assert!(!error);
+    assert_eq!(restored["archived"], false);
+    assert!(restored.get("body").is_none());
+    let (_, active) = tool(&app, &session, "idea_list", json!({})).await;
+    assert_eq!(active["total"], 2);
+    let (error, _) = tool(&app, &session, "idea_unarchive", json!({"id":"absent"})).await;
+    assert!(error);
 
     let (_, snapshot) = request(app, "GET", "/worker/snapshot", json!(null)).await;
     assert_eq!(snapshot["idea"].as_array().unwrap().len(), 2);

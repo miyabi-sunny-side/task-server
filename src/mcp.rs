@@ -718,6 +718,12 @@ impl Admin {
         answer(idea::archive(&self.state, &a.id).map(|i| idea::summary(&i)))
     }
     #[tool(
+        description = "Return an archived idea to the default list, editable again, when the user asks to revive it. Body and task link are kept. Idempotent."
+    )]
+    fn idea_unarchive(&self, Parameters(a): Parameters<Id>) -> CallToolResult {
+        answer(idea::unarchive(&self.state, &a.id).map(|i| idea::summary(&i)))
+    }
+    #[tool(
         description = "Only when the user or your instructions explicitly ask: turn an idea into a draft task (never ready, no worker is started). title/product_id default to the idea's; body should state the task scope and completion conditions (default copies the idea body). execution_target must be configured (execution_targets_get) or falls back to the external default. The idea keeps its text and gains task_id; the task gains idea_id. Retrying returns the same task instead of a duplicate."
     )]
     fn idea_promote(&self, Parameters(a): Parameters<IdeaPromote>) -> CallToolResult {

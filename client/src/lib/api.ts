@@ -394,6 +394,10 @@ export function archiveIdea(id: string): Promise<Idea> {
   return postJson(ideaUrl(id, "/archive"), {});
 }
 
+export function unarchiveIdea(id: string): Promise<Idea> {
+  return postJson(ideaUrl(id, "/unarchive"), {});
+}
+
 export function promoteIdea(
   id: string,
   fields: TaskFields,

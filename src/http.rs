@@ -140,6 +140,12 @@ pub async fn api_archive_idea(
 ) -> Result<Json<Value>, Error> {
     Ok(Json(idea::archive(&s, &id)?))
 }
+pub async fn api_unarchive_idea(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, Error> {
+    Ok(Json(idea::unarchive(&s, &id)?))
+}
 pub async fn api_promote_idea(
     State(s): State<AppState>,
     Path(id): Path<String>,

@@ -1,5 +1,5 @@
 <script lang="ts">
-  // The one archive confirmation, from an idea's page or its list row.
+  // The archive confirmation on an idea's page; list rows archive at once.
   // While the request runs, nothing dismisses it and the buttons keep focus.
   import Modal from "./Modal.svelte";
 
@@ -7,14 +7,12 @@
     title,
     busy,
     error,
-    errorId,
     onconfirm,
     onclose,
   }: {
     title: string;
     busy: boolean;
     error: string;
-    errorId?: string;
     onconfirm: () => void;
     onclose: () => void;
   } = $props();
@@ -28,7 +26,7 @@
   <p class="dialog-text">
     「{title}」を一覧から外します。本文はアーカイブから読めます。
   </p>
-  {#if error}<p id={errorId} class="error-banner" role="alert">
+  {#if error}<p class="error-banner" role="alert">
       {error}
     </p>{/if}
   <div class="actions">

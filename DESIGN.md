@@ -728,22 +728,26 @@ counterpart to carry, so it earns no token pair.
   controls (role alert). Rows reuse the single-link card recipe in
   document order: optional product (muted caption), wrapping title
   (label), then the caption time and an optional タスク化済み outline badge.
-  Open rows carry the same row context menu as task rows (the shared
-  `RowMenu`: hold, right click, ContextMenu/Shift+F10, keyboard, placement,
-  look, dismissal and in-place errors as in Task context menu). Its one
-  item is アーカイブ, offered whether or not the idea was promoted. It opens
-  the same archive Modal as the detail page; only confirmation posts the
-  existing archive API, and 取りやめ, Escape, close or scrim change
-  nothing. While archiving, dismissal and duplicate submission are guarded
-  and the buttons keep focus with aria-disabled; a failure stays in the
-  dialog for retry and the row remains. Success drops the row, reloads the
-  list and, as a task leaving the page focuses the closed link, focuses
-  the quiet アーカイブ link where the idea went. Archived-list rows stay
-  plain links with no menu.
+  Rows on both lists carry the same row context menu as task rows (the
+  shared `RowMenu`: hold, right click, ContextMenu/Shift+F10, keyboard,
+  placement, look, dismissal and in-place errors as in Task context menu).
+  Its one item moves the idea to the other list without confirmation,
+  like Blockする, because archiving deletes nothing and is undone from the
+  archive: アーカイブ on an open row, whether or not the idea was
+  promoted, and アイデアに戻す on an archived row. Choosing it posts the
+  archive or unarchive API once; the item is disabled while pending and
+  duplicate activation is guarded. A failure keeps the row and shows the
+  reason inside the menu, or by the row after closing, and choosing the
+  item again retries. Success drops the row, reloads the list and, as a
+  task leaving the page focuses the closed link, focuses the quiet page
+  link where the idea went (アーカイブ from the open list, アイデア一覧
+  from the archive). A returned idea is an open idea again: editable, with
+  its body and タスク化済み link unchanged.
   Server order is `updated_at` descending with a stable tie; open rows
   show `updated_at`, archived rows show `archived_at`. The archive page
   replaces the quick add with a label-type アーカイブ heading and an
-  アイデア一覧 link back; it has no add or edit controls. Both lists use
+  アイデア一覧 link back; it has no add or edit controls beyond the row
+  menu's アイデアに戻す. Both lists use
   the four list states (empty: アイデアがありません /
   アーカイブしたアイデアはありません) and the shared reload rhythm, keeping
   drawn rows on a failed background reload.
@@ -772,8 +776,8 @@ counterpart to carry, so it earns no token pair.
   and the banner says so. Leaving the editor returns focus to 編集.
 
   **Archive** asks once in the shared Modal (アーカイブ primary /
-  取りやめ), the same dialog as the list row's menu; failure stays in the
-  dialog. **タスク化** opens the task
+  取りやめ); failure stays in the dialog. Only the detail page asks; the
+  list row menu archives at once. **タスク化** opens the task
   create/edit modal titled アイデアをタスク化, prefilled with the idea's
   product, title and body, the target select defaulting as for a new task,
   and a タスクを作成 submit. Success lands on the new draft task's detail

@@ -15,6 +15,8 @@
   let adding = $state(false);
   let addError = $state("");
   let input = $state<HTMLInputElement | undefined>();
+  // The page link to the other list, where a moved row went.
+  let pageLink = $state<HTMLAnchorElement>();
 
   async function load() {
     controller?.abort();
@@ -61,7 +63,7 @@
   }
 
   // Drop the row at once, then reload so the list matches the server.
-  async function removeArchived(id: string) {
+  async function removeMoved(id: string) {
     items = items.filter((item) => item.id !== id);
     await load();
   }
@@ -88,7 +90,7 @@
   {#if archived}
     <div class="controls archive-head">
       <h1 class="heading">アーカイブ</h1>
-      <a class="quiet-link" href="/ideas">アイデア一覧</a>
+      <a class="quiet-link" href="/ideas" bind:this={pageLink}>アイデア一覧</a>
     </div>
   {:else}
     <form class="controls add" onsubmit={add}>
@@ -109,7 +111,9 @@
         disabled={adding}
         aria-disabled={!draft.trim()}>追加</button
       >
-      <a class="quiet-link" href="/ideas/archived">アーカイブ</a>
+      <a class="quiet-link" href="/ideas/archived" bind:this={pageLink}
+        >アーカイブ</a
+      >
       {#if addError}
         <p class="error-banner add-error" role="alert">{addError}</p>
       {/if}
@@ -140,7 +144,8 @@
           <li>
             <IdeaRow
               {item}
-              onarchived={archived ? undefined : () => removeArchived(item.id)}
+              landing={pageLink}
+              onmoved={() => removeMoved(item.id)}
             />
           </li>
         {/each}

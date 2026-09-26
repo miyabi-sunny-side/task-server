@@ -157,57 +157,42 @@ describe("Ideas", () => {
     expect(screen.getByRole("menu")).toBeTruthy();
   });
 
-  it("archives a row after one confirmation, then drops it and focuses the archive link", async () => {
-    let archived = false;
+  // One pending POST the test resolves itself; list reads follow `moved`.
+  function pendingMove(before: unknown[], after: unknown[], moved: unknown) {
+    let done = false;
     let finish!: () => void;
     const fetchMock = vi.fn<typeof fetch>((_input, init) => {
       if (init?.method === "POST") {
         return new Promise((resolve) => {
           finish = () => {
-            archived = true;
-            resolve(
-              new Response(
-                JSON.stringify({
-                  ...IDEA,
-                  archived: true,
-                  archived_at: "2026-09-26T00:00:00Z",
-                }),
-              ),
-            );
+            done = true;
+            resolve(new Response(JSON.stringify(moved)));
           };
         });
       }
-      return json(archived ? [] : [IDEA]);
+      return json(done ? after : before);
     });
     vi.stubGlobal("fetch", fetchMock);
     const posts = () =>
       fetchMock.mock.calls.filter(([, init]) => init?.method === "POST");
+    return { posts, finish: () => finish() };
+  }
+
+  it("archives a row at once from its menu, posting once, then focuses the archive link", async () => {
+    const { posts, finish } = pendingMove([IDEA], [], {
+      ...IDEA,
+      archived: true,
+      archived_at: "2026-09-26T00:00:00Z",
+    });
     render(Ideas, { props: { archived: false } });
     const row = await screen.findByRole("link", { name: /棚の在庫/ });
 
     await fireEvent.contextMenu(row);
-    await fireEvent.click(screen.getByRole("menuitem", { name: "アーカイブ" }));
-    const dialog = screen.getByRole("dialog", { name: "アイデアをアーカイブ" });
-    expect(dialog.textContent).toContain(IDEA.title);
-    await fireEvent.click(screen.getByRole("button", { name: "取りやめ" }));
+    const item = screen.getByRole("menuitem", { name: "アーカイブ" });
+    await fireEvent.click(item);
     expect(screen.queryByRole("dialog")).toBeNull();
-    expect(document.activeElement).toBe(row);
-
-    await fireEvent.contextMenu(row);
-    await fireEvent.click(screen.getByRole("menuitem", { name: "アーカイブ" }));
-    await fireEvent.keyDown(window, { key: "Escape" });
-    expect(screen.queryByRole("dialog")).toBeNull();
-    expect(posts()).toHaveLength(0);
-
-    await fireEvent.contextMenu(row);
-    await fireEvent.click(screen.getByRole("menuitem", { name: "アーカイブ" }));
-    const confirm = screen
-      .getByRole("dialog")
-      .querySelector<HTMLButtonElement>("button.primary")!;
-    await fireEvent.click(confirm);
-    await fireEvent.click(confirm);
-    await fireEvent.keyDown(window, { key: "Escape" });
-    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect((item as HTMLButtonElement).disabled).toBe(true);
+    await fireEvent.click(item);
     expect(posts()).toHaveLength(1);
     expect(String(posts()[0][0])).toBe("/api/ideas/i1/archive");
 
@@ -215,7 +200,7 @@ describe("Ideas", () => {
     await waitFor(() =>
       expect(screen.queryByRole("link", { name: /棚の在庫/ })).toBeNull(),
     );
-    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.queryByRole("menu")).toBeNull();
     await screen.findByText("アイデアがありません");
     await waitFor(() =>
       expect(document.activeElement?.getAttribute("href")).toBe(
@@ -224,48 +209,65 @@ describe("Ideas", () => {
     );
   });
 
-  it("keeps a failed archive in the dialog for retry and leaves the row", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn<typeof fetch>((_input, init) =>
-        init?.method === "POST"
-          ? json({ error: "書き込めません", code: "io" }, 500)
-          : json([IDEA]),
-      ),
+  it("keeps a failed archive in the menu, then by the row, for retry", async () => {
+    const fetchMock = vi.fn<typeof fetch>((_input, init) =>
+      init?.method === "POST"
+        ? json({ error: "書き込めません", code: "io" }, 500)
+        : json([IDEA]),
     );
+    vi.stubGlobal("fetch", fetchMock);
     render(Ideas, { props: { archived: false } });
     const row = await screen.findByRole("link", { name: /棚の在庫/ });
 
     await fireEvent.contextMenu(row);
     await fireEvent.click(screen.getByRole("menuitem", { name: "アーカイブ" }));
-    await fireEvent.click(
-      screen
-        .getByRole("dialog")
-        .querySelector<HTMLButtonElement>("button.primary")!,
-    );
 
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("書き込めません");
-    expect(screen.getByRole("dialog").contains(alert)).toBe(true);
+    expect(screen.getByRole("menu").parentElement?.contains(alert)).toBe(true);
+    await fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByRole("alert").textContent).toContain("書き込めません");
+    expect(row.getAttribute("aria-describedby")).toBe(
+      screen.getByRole("alert").id,
+    );
     expect(screen.getByRole("link", { name: /棚の在庫/ })).toBe(row);
+
+    await fireEvent.contextMenu(row);
+    await fireEvent.click(screen.getByRole("menuitem", { name: "アーカイブ" }));
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(([, init]) => init?.method === "POST"),
+      ).toHaveLength(2),
+    );
   });
 
-  it("archived rows are plain links without a menu", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn<typeof fetch>(() =>
-        json([
-          { ...IDEA, archived: true, archived_at: "2026-09-26T00:00:00Z" },
-        ]),
-      ),
-    );
+  it("returns an archived row to the ideas at once and focuses the idea list link", async () => {
+    const archivedIdea = {
+      ...IDEA,
+      archived: true,
+      archived_at: "2026-09-26T00:00:00Z",
+    };
+    const { posts, finish } = pendingMove([archivedIdea], [], IDEA);
     render(Ideas, { props: { archived: true } });
     const row = await screen.findByRole("link", { name: /棚の在庫/ });
+    expect(row.getAttribute("aria-haspopup")).toBe("menu");
 
-    expect(row.hasAttribute("aria-haspopup")).toBe(false);
-    await fireEvent.contextMenu(row);
-    await fireEvent.keyDown(row, { key: "ContextMenu" });
-    expect(screen.queryByRole("menu")).toBeNull();
+    await fireEvent.keyDown(row, { key: "F10", shiftKey: true });
+    expect(screen.getAllByRole("menuitem").map((el) => el.textContent)).toEqual(
+      ["アイデアに戻す"],
+    );
+    await fireEvent.click(
+      screen.getByRole("menuitem", { name: "アイデアに戻す" }),
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(posts()).toHaveLength(1);
+    expect(String(posts()[0][0])).toBe("/api/ideas/i1/unarchive");
+
+    finish();
+    await screen.findByText("アーカイブしたアイデアはありません");
+    await waitFor(() =>
+      expect(document.activeElement?.textContent).toBe("アイデア一覧"),
+    );
   });
 
   it("offers a retry when the first load fails", async () => {

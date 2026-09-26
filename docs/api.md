@@ -30,9 +30,10 @@ An idea is a note that may or may not become a task: a title, a free Markdown bo
 | `POST /api/ideas` (201) | `idea_create(title, body?, product_id?)` | Title alone is enough. Revision starts at 1. |
 | `PATCH /api/ideas/{id}` | `idea_update(id, expected_revision, title?, body?, product_id?)` | Requires the revision that was read. A different current revision returns 409 `conflict` and writes nothing. `body` replaces the whole text; `product_id: null` clears it. |
 | `POST /api/ideas/{id}/archive` | `idea_archive(id)` | Idempotent. The idea leaves the default list and becomes read-only. |
+| `POST /api/ideas/{id}/unarchive` | `idea_unarchive(id)` | Idempotent. The idea returns to the default list, editable again; `archived_at` clears, body and `task_id`/`promoted_at` stay. |
 | `POST /api/ideas/{id}/promote` | `idea_promote(id, execution_target?, title?, body?, product_id?)` | Creates a draft task `idea-<id>` with `idea_id`, and records `task_id`/`promoted_at` on the idea. Omitted title, body and product default to the idea's; the execution target follows task creation rules. HTTP returns `{idea, task}` with the task card; MCP returns the idea summary and a compact `task`. |
 
-Every successful edit, archive or first promotion increments `revision`. Agents
+Every successful edit, archive, unarchive or first promotion increments `revision`. Agents
 edit an idea by reading it with `idea_get`, researching, and sending the full new
 body with `expected_revision`. A conflict means another person or agent saved first:
 read again, merge the additions and retry. Archived ideas and conflicting promotions
