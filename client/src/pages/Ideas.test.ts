@@ -134,6 +134,140 @@ describe("Ideas", () => {
     ).toBe("/ideas");
   });
 
+  it("opens the row menu from the keyboard with archive as its only item", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() => json([IDEA])),
+    );
+    render(Ideas, { props: { archived: false } });
+    const row = await screen.findByRole("link", { name: /棚の在庫/ });
+    expect(row.getAttribute("aria-haspopup")).toBe("menu");
+
+    await fireEvent.keyDown(row, { key: "F10", shiftKey: true });
+    expect(screen.getByRole("menu", { name: IDEA.title })).toBeTruthy();
+    expect(screen.getAllByRole("menuitem").map((el) => el.textContent)).toEqual(
+      ["アーカイブ"],
+    );
+    expect(document.activeElement?.textContent).toBe("アーカイブ");
+    await fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(row);
+
+    await fireEvent.keyDown(row, { key: "ContextMenu" });
+    expect(screen.getByRole("menu")).toBeTruthy();
+  });
+
+  it("archives a row after one confirmation, then drops it and focuses the archive link", async () => {
+    let archived = false;
+    let finish!: () => void;
+    const fetchMock = vi.fn<typeof fetch>((_input, init) => {
+      if (init?.method === "POST") {
+        return new Promise((resolve) => {
+          finish = () => {
+            archived = true;
+            resolve(
+              new Response(
+                JSON.stringify({
+                  ...IDEA,
+                  archived: true,
+                  archived_at: "2026-09-26T00:00:00Z",
+                }),
+              ),
+            );
+          };
+        });
+      }
+      return json(archived ? [] : [IDEA]);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const posts = () =>
+      fetchMock.mock.calls.filter(([, init]) => init?.method === "POST");
+    render(Ideas, { props: { archived: false } });
+    const row = await screen.findByRole("link", { name: /棚の在庫/ });
+
+    await fireEvent.contextMenu(row);
+    await fireEvent.click(screen.getByRole("menuitem", { name: "アーカイブ" }));
+    const dialog = screen.getByRole("dialog", { name: "アイデアをアーカイブ" });
+    expect(dialog.textContent).toContain(IDEA.title);
+    await fireEvent.click(screen.getByRole("button", { name: "取りやめ" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(row);
+
+    await fireEvent.contextMenu(row);
+    await fireEvent.click(screen.getByRole("menuitem", { name: "アーカイブ" }));
+    await fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(posts()).toHaveLength(0);
+
+    await fireEvent.contextMenu(row);
+    await fireEvent.click(screen.getByRole("menuitem", { name: "アーカイブ" }));
+    const confirm = screen
+      .getByRole("dialog")
+      .querySelector<HTMLButtonElement>("button.primary")!;
+    await fireEvent.click(confirm);
+    await fireEvent.click(confirm);
+    await fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(posts()).toHaveLength(1);
+    expect(String(posts()[0][0])).toBe("/api/ideas/i1/archive");
+
+    finish();
+    await waitFor(() =>
+      expect(screen.queryByRole("link", { name: /棚の在庫/ })).toBeNull(),
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await screen.findByText("アイデアがありません");
+    await waitFor(() =>
+      expect(document.activeElement?.getAttribute("href")).toBe(
+        "/ideas/archived",
+      ),
+    );
+  });
+
+  it("keeps a failed archive in the dialog for retry and leaves the row", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>((_input, init) =>
+        init?.method === "POST"
+          ? json({ error: "書き込めません", code: "io" }, 500)
+          : json([IDEA]),
+      ),
+    );
+    render(Ideas, { props: { archived: false } });
+    const row = await screen.findByRole("link", { name: /棚の在庫/ });
+
+    await fireEvent.contextMenu(row);
+    await fireEvent.click(screen.getByRole("menuitem", { name: "アーカイブ" }));
+    await fireEvent.click(
+      screen
+        .getByRole("dialog")
+        .querySelector<HTMLButtonElement>("button.primary")!,
+    );
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("書き込めません");
+    expect(screen.getByRole("dialog").contains(alert)).toBe(true);
+    expect(screen.getByRole("link", { name: /棚の在庫/ })).toBe(row);
+  });
+
+  it("archived rows are plain links without a menu", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        json([
+          { ...IDEA, archived: true, archived_at: "2026-09-26T00:00:00Z" },
+        ]),
+      ),
+    );
+    render(Ideas, { props: { archived: true } });
+    const row = await screen.findByRole("link", { name: /棚の在庫/ });
+
+    expect(row.hasAttribute("aria-haspopup")).toBe(false);
+    await fireEvent.contextMenu(row);
+    await fireEvent.keyDown(row, { key: "ContextMenu" });
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+
   it("offers a retry when the first load fails", async () => {
     let fail = true;
     vi.stubGlobal(

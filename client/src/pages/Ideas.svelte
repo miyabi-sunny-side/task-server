@@ -2,6 +2,7 @@
   import { createIdea, fetchIdeas, type IdeaSummary } from "../lib/api";
   import { tick } from "svelte";
   import { startAutoReload } from "../lib/auto-reload";
+  import IdeaRow from "../lib/IdeaRow.svelte";
 
   let { archived }: { archived: boolean } = $props();
 
@@ -57,6 +58,12 @@
       await tick();
       input?.focus();
     }
+  }
+
+  // Drop the row at once, then reload so the list matches the server.
+  async function removeArchived(id: string) {
+    items = items.filter((item) => item.id !== id);
+    await load();
   }
 
   let listState = $derived(
@@ -131,20 +138,10 @@
       <ul class="cards">
         {#each items as item (item.id)}
           <li>
-            <a class="card" href={`/ideas/${encodeURIComponent(item.id)}`}>
-              {#if item.product_id}
-                <span class="product idea-product">{item.product_id}</span>
-              {/if}
-              <span class="name">{item.title}</span>
-              <span class="tail">
-                <span class="at"
-                  >{archived
-                    ? (item.archived_at ?? item.updated_at)
-                    : item.updated_at}</span
-                >
-                {#if item.task_id}<span class="badge">タスク化済み</span>{/if}
-              </span>
-            </a>
+            <IdeaRow
+              {item}
+              onarchived={archived ? undefined : () => removeArchived(item.id)}
+            />
           </li>
         {/each}
       </ul>
@@ -211,25 +208,4 @@
     padding: 0 var(--sp-1)
     font-size: var(--fs-sm)
 
-  .card
-    flex-direction: column
-    align-items: stretch
-    gap: var(--sp-1)
-
-  .idea-product
-    color: var(--c-muted)
-
-  .name
-    overflow-wrap: anywhere
-
-  .tail
-    display: flex
-    flex-wrap: wrap
-    align-items: baseline
-    gap: var(--sp-1) var(--sp-2)
-
-  .at
-    font-size: var(--fs-xs)
-    line-height: 1.4
-    color: var(--c-muted)
 </style>

@@ -9,7 +9,7 @@
     type Idea,
   } from "../lib/api";
   import { startAutoReload } from "../lib/auto-reload";
-  import Modal from "../lib/Modal.svelte";
+  import IdeaArchiveDialog from "../lib/IdeaArchiveDialog.svelte";
   import TaskForm from "../lib/TaskForm.svelte";
   import { navigate } from "../lib/router.svelte";
 
@@ -292,35 +292,13 @@
 </div>
 
 {#if archiving && idea}
-  <Modal
-    title="アイデアをアーカイブ"
-    onclose={() => {
-      if (!busy) archiving = false;
-    }}
-  >
-    <p class="dialog-text">
-      「{idea.title}」を一覧から外します。本文はアーカイブから読めます。
-    </p>
-    {#if archiveError}<p class="error-banner" role="alert">
-        {archiveError}
-      </p>{/if}
-    <div class="actions">
-      <button
-        class="btn"
-        class:primary={!busy}
-        type="button"
-        data-autofocus
-        disabled={busy}
-        onclick={() => void confirmArchive()}>アーカイブ</button
-      >
-      <button
-        class="btn"
-        type="button"
-        disabled={busy}
-        onclick={() => (archiving = false)}>取りやめ</button
-      >
-    </div>
-  </Modal>
+  <IdeaArchiveDialog
+    title={idea.title}
+    {busy}
+    error={archiveError}
+    onconfirm={() => void confirmArchive()}
+    onclose={() => (archiving = false)}
+  />
 {/if}
 
 {#if promoting && idea}
@@ -470,9 +448,4 @@
     display: flex
     flex-wrap: wrap
     gap: var(--sp-2)
-
-  .dialog-text
-    margin: 0 0 var(--sp-3)
-    font-size: var(--fs-sm)
-    overflow-wrap: anywhere
 </style>
