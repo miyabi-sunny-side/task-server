@@ -20,9 +20,9 @@ import tarfile
 import tempfile
 import urllib.request
 
-COLLECTIONS = ('tasks', 'products', 'runs', 'archive', 'claim_receipts', 'idea')
-# Exports from servers before ideas existed lack only these collections.
-OPTIONAL = ('idea',)
+COLLECTIONS = ('tasks', 'products', 'runs', 'archive', 'claim_receipts', 'idea', 'settings')
+# Exports from older servers may lack the newer collections below.
+OPTIONAL = ('idea', 'settings')
 
 
 def filename(value):

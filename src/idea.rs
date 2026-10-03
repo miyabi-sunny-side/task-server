@@ -164,7 +164,7 @@ pub fn promote(s: &AppState, id: &str, v: Value) -> Result<Value, Error> {
                 for (key, value) in v.as_object().expect("validated object") {
                     fields[key] = value.clone();
                 }
-                let (_, mut record) = task::new_record(s, &fields)?;
+                let (_, mut record) = task::new_record(s, a, &fields)?;
                 record["idea_id"] = json!(id);
                 a.create("tasks", &task_id, record)?
             }

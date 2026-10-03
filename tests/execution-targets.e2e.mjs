@@ -12,9 +12,10 @@ const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const binary = resolve(process.env.TASK_SERVER_BINARY ?? join(repo, 'target/debug/task-server'));
 const root = await mkdtemp(join(tmpdir(), 'task-server-target-e2e-'));
 const ledger = join(root, 'ledger');
+const emptyLedger = join(root, 'empty-ledger');
 const config = join(root, 'targets.yaml');
 const evidence = process.env.E2E_EVIDENCE_DIR;
-const labels = ['forge', 'field', `研究 / 試行 ${'長い実行先'.repeat(18)}`];
+const labels = ['forge', 'field', `lab_${'long-target-'.repeat(8)}end`];
 let server, base;
 const checks = [];
 const browser = await chromium.launch({ headless: true });
@@ -26,7 +27,7 @@ async function stop() {
     await ended;
   }
 }
-async function start(configured = true) {
+async function start(configured = true, dataDir = ledger) {
   await stop();
   const reservation = createServer();
   reservation.listen(0, '127.0.0.1');
@@ -36,7 +37,7 @@ async function start(configured = true) {
   base = `http://127.0.0.1:${port}`;
   server = spawn(binary, [], {
     cwd: root,
-    env: { PORT: String(port), LOG_LEVEL: 'warn', APP_DATA_DIR: ledger,
+    env: { PORT: String(port), LOG_LEVEL: 'warn', APP_DATA_DIR: dataDir,
       ...(configured ? { EXECUTION_TARGETS_FILE: config } : {}) },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -70,7 +71,7 @@ async function geometry(page) {
       headerControls: document.querySelectorAll('header a, header button').length };
   });
   assert.ok(measured.scroll <= measured.width, JSON.stringify(measured));
-  assert.equal(measured.headerControls, 4);
+  assert.equal(measured.headerControls, 5);
   assert.equal(measured.border, '1px');
   assert.equal(measured.radius, '8px');
   assert.equal(measured.padding, '10px');
@@ -115,7 +116,7 @@ try {
     for (const caption of await page.locator('[data-field="execution-target"]').allTextContents()) assert.equal(caption.trim(), label);
     await page.getByLabel('実行先で絞り込み').selectOption({ label: 'すべて' });
   }
-  checks.push('external default and all three names reach real create/filter APIs');
+  checks.push('imported default and all three names reach real create/filter APIs');
   const created = (await api('/api/tasks')).find(task => task.title === 'Created forge');
   await page.locator(`a[href="/tasks/${created.id}"]`).click();
   await page.getByRole('button', { name: '編集', exact: true }).click();
@@ -181,25 +182,31 @@ try {
 
   await writeFile(config, 'labels: [island, field]\n');
   await start();
-  assert.deepEqual(await api('/api/execution-targets'), { labels: ['island', 'field'], default: null });
+  assert.deepEqual(await api('/api/execution-targets'), { labels, default: 'field' });
+  checks.push('restart keeps ledger definitions and ignores the changed external file');
+  await api('/api/execution-targets', 'POST', { label: 'island' });
+  await api(`/api/execution-targets/${labels[2]}`, 'DELETE');
+  assert.deepEqual(await api('/api/execution-targets'), { labels: ['forge', 'field', 'island'], default: 'field' });
   await page.goto(base);
   await page.getByRole('option', { name: 'island', exact: true }).waitFor({ state: 'attached' });
-  await page.getByLabel('実行先で絞り込み').selectOption({ label: '未設定' });
-  await page.locator('a[href="/tasks/legacy"]').waitFor();
-  assert.equal(await page.locator('a.card').count(), 1);
   await page.getByRole('button', { name: '新規タスク', exact: true }).click();
   await page.getByRole('dialog').getByRole('option', { name: 'island', exact: true }).waitFor({ state: 'attached' });
-  assert.equal(await page.getByRole('dialog').getByLabel('実行先', { exact: true }).inputValue(), '');
+  assert.equal(await page.getByRole('dialog').getByRole('option', { name: labels[2], exact: true }).count(), 0);
+  assert.equal(await page.getByRole('dialog').getByLabel('実行先', { exact: true }).inputValue(), 'field');
   await page.getByRole('dialog').getByLabel('product', { exact: true }).fill('example/project');
-  await page.getByRole('dialog').getByLabel('title', { exact: true }).fill('After restart');
-  assert.equal(await page.getByRole('dialog').getByRole('button', { name: '保存', exact: true }).getAttribute('aria-disabled'), 'true');
+  await page.getByRole('dialog').getByLabel('title', { exact: true }).fill('After API edit');
   await page.getByRole('dialog').getByLabel('実行先', { exact: true }).selectOption('island');
   await page.getByRole('dialog').getByRole('button', { name: '保存', exact: true }).click();
   await page.getByRole('dialog').waitFor({ state: 'hidden' });
-  assert.equal((await api('/api/tasks')).find(task => task.title === 'After restart').execution_target, 'island');
-  checks.push('same binary reloads replaced choices and absent default; unset legacy remains filterable');
+  assert.equal((await api('/api/tasks')).find(task => task.title === 'After API edit').execution_target, 'island');
+  const deletedRef = await api(`/api/tasks/${created.id}`);
+  assert.equal(deletedRef.execution_target, labels[2]);
+  assert.equal(deletedRef.execution_target_configured, false);
+  checks.push('API create/delete reach UI choices without restart; deleted references stay readable');
 
-  await start(false);
+  await mkdir(join(emptyLedger, 'tasks'), { recursive: true });
+  await writeFile(join(emptyLedger, 'tasks/legacy.md'), originalLegacy);
+  await start(false, emptyLedger);
   assert.deepEqual(await api('/api/execution-targets'), { labels: [], default: null });
   await page.goto(base);
   await page.getByText('実行先が設定されていません', { exact: true }).waitFor();

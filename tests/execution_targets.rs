@@ -129,6 +129,12 @@ fn explicit_configuration_errors_fail_startup() {
         "labels: [forge]\ndefault: field",
         "labels: [forge]\ndefault: 7",
         "labels: [forge]\nunknown: true",
+        "labels: [Forge]",
+        "labels: ['a/b']",
+        "labels: ['a.b']",
+        "labels: ['-x']",
+        "labels: ['研究']",
+        "labels: [\"a'b\"]",
     ] {
         std::fs::write(&path, text).unwrap();
         assert!(
@@ -141,11 +147,7 @@ fn explicit_configuration_errors_fail_startup() {
 fn configured() -> (tempfile::TempDir, std::path::PathBuf, AppState) {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("targets.yaml");
-    std::fs::write(
-        &path,
-        "labels: [forge, field, '研究 / 試行']\ndefault: forge\n",
-    )
-    .unwrap();
+    std::fs::write(&path, "labels: [forge, field, lab_2]\ndefault: forge\n").unwrap();
     let state = state(root.path(), Some(path.to_str().unwrap())).unwrap();
     (root, path, state)
 }
@@ -157,11 +159,7 @@ async fn configured_targets_route_http_requests() {
     for (id, label, filter) in [
         ("one", "forge", "forge"),
         ("two", "field", "field"),
-        (
-            "three",
-            "研究 / 試行",
-            "%E7%A0%94%E7%A9%B6%20%2F%20%E8%A9%A6%E8%A1%8C",
-        ),
+        ("three", "lab_2", "lab_2"),
     ] {
         let (code, created) = request(
             &s,
@@ -229,8 +227,25 @@ async fn configured_targets_route_http_requests() {
     }
 }
 
+#[test]
+fn labels_allow_only_lowercase_digits_hyphen_and_underscore() {
+    use task_server::execution_target::check_label;
+    for label in ["sandbox", "game", "a-b_1", "0x", "9"] {
+        assert!(check_label(label).is_ok(), "rejected {label:?}");
+    }
+    for label in [
+        "", "-x", "_x", "Forge", "a b", "a/b", "a.b", "..", "a\"b", "a'b", "研究", "x\n", "a;b",
+    ] {
+        assert!(check_label(label).is_err(), "accepted {label:?}");
+    }
+}
+
+fn targets_of(root: &Path) -> String {
+    std::fs::read_to_string(root.join("ledger/settings/execution_targets.md")).unwrap()
+}
+
 #[tokio::test]
-async fn legacy_default_and_definitions_stay_external() {
+async fn definitions_live_in_the_ledger_and_snapshot() {
     let (root, path, s) = configured();
     let config = std::fs::read_to_string(&path).unwrap();
     s.store.put("products", "a/b", json!({"id":"a/b"})).unwrap();
@@ -272,120 +287,160 @@ async fn legacy_default_and_definitions_stay_external() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), config);
     let snapshot = request(&s, "GET", "/worker/snapshot", json!(null)).await.1;
     assert_eq!(
-        snapshot
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        [
-            "archive",
-            "claim_receipts",
-            "idea",
-            "products",
-            "runs",
-            "tasks"
-        ]
+        snapshot["settings"],
+        json!([{"id":"execution_targets","body":"","labels":["forge","field","lab_2"],"default":"forge"}])
     );
 }
 
 #[tokio::test]
-async fn config_changes_only_take_effect_after_restart() {
+async fn the_external_file_is_imported_only_once() {
     let (root, path, s) = configured();
-    s.store
-        .put(
-            "tasks",
-            "one",
-            json!({"id":"one","title":"old","execution_target":"forge","status":"done"}),
-        )
-        .unwrap();
-    task::create(&s, json!({"id":"default","title":"default"})).unwrap();
-    let changed_config = "labels: [field, island]\n";
-    std::fs::write(&path, changed_config).unwrap();
+    let imported = json!({"labels":["forge","field","lab_2"],"default":"forge"});
     assert_eq!(
         request(&s, "GET", "/api/execution-targets", json!(null))
             .await
-            .1["default"],
-        "forge"
+            .1,
+        imported
     );
     drop(s);
+    for changed in ["labels: [field, island]\n", "labels: [Invalid / name]\n"] {
+        std::fs::write(&path, changed).unwrap();
+        let s = state(root.path(), Some(path.to_str().unwrap())).unwrap();
+        assert_eq!(
+            request(&s, "GET", "/api/execution-targets", json!(null))
+                .await
+                .1,
+            imported
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
+    }
+    let before = targets_of(root.path());
+    let s = state(root.path(), None).unwrap();
+    assert_eq!(
+        request(&s, "GET", "/api/execution-targets", json!(null))
+            .await
+            .1,
+        imported
+    );
+    assert_eq!(targets_of(root.path()), before);
+}
+
+async fn code(s: &AppState, method: &str, path: &str, body: Value) -> StatusCode {
+    request(s, method, path, body).await.0
+}
+
+#[tokio::test]
+async fn labels_are_created_and_deleted_without_restart() {
+    let (root, path, s) = configured();
+    s.store.put("products", "a/b", json!({"id":"a/b"})).unwrap();
+    let targets = "/api/execution-targets";
+    let (code_, created) = request(&s, "POST", targets, json!({"label":"game"})).await;
+    assert_eq!(code_, StatusCode::CREATED);
+    assert_eq!(
+        created,
+        json!({"labels":["forge","field","lab_2","game"],"default":"forge"})
+    );
+    for (body, expected) in [
+        (json!({"label":"game"}), StatusCode::CONFLICT),
+        (json!({"label":"Game"}), StatusCode::BAD_REQUEST),
+        (json!({"label":"../x"}), StatusCode::BAD_REQUEST),
+        (json!({"label":7}), StatusCode::BAD_REQUEST),
+        (json!({}), StatusCode::BAD_REQUEST),
+    ] {
+        assert_eq!(
+            code(&s, "POST", targets, body.clone()).await,
+            expected,
+            "{body}"
+        );
+    }
+    assert_eq!(request(&s, "GET", targets, json!(null)).await.1, created);
+    let task = json!({"id":"played","title":"play","product_id":"a/b","execution_target":"game"});
+    assert_eq!(
+        code(&s, "POST", "/api/tasks", task).await,
+        StatusCode::CREATED
+    );
+    task::set_status(&s, "played", "ready").unwrap();
+    let claim_game = json!({"worker":"gamer","execution_target":"game"});
+    let (code_, claim) = request(&s, "POST", "/worker/claim", claim_game.clone()).await;
+    assert_eq!(code_, StatusCode::OK);
+    assert_eq!(claim["task"]["id"], "played");
+    let report = json!({"claim_id":claim["claim_id"],"outcome":"done","report_markdown":"ok"});
+    assert_eq!(
+        code(&s, "POST", "/worker/report", report).await,
+        StatusCode::OK
+    );
+
+    let (code_, deleted) = request(&s, "DELETE", &format!("{targets}/game"), json!(null)).await;
+    assert_eq!(code_, StatusCode::OK);
+    assert_eq!(
+        deleted,
+        json!({"labels":["forge","field","lab_2"],"default":"forge"})
+    );
+    assert_eq!(request(&s, "GET", targets, json!(null)).await.1, deleted);
+    for (label, expected) in [
+        ("game", StatusCode::NOT_FOUND),
+        ("forge", StatusCode::CONFLICT),
+        ("Bad", StatusCode::BAD_REQUEST),
+    ] {
+        let path = format!("{targets}/{label}");
+        assert_eq!(
+            code(&s, "DELETE", &path, json!(null)).await,
+            expected,
+            "{label}"
+        );
+    }
+    let again = json!({"title":"again","execution_target":"game"});
+    assert_eq!(
+        code(&s, "POST", "/api/tasks", again).await,
+        StatusCode::BAD_REQUEST
+    );
+    let assign = json!({"execution_target":"game"});
+    assert_eq!(
+        code(&s, "PATCH", "/api/tasks/played", assign).await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        code(&s, "POST", "/worker/claim", claim_game).await,
+        StatusCode::BAD_REQUEST
+    );
+    let (code_, card) = request(&s, "GET", "/api/tasks/played", json!(null)).await;
+    assert_eq!(code_, StatusCode::OK);
+    assert_eq!(card["execution_target"], "game");
+    assert_eq!(card["execution_target_configured"], false);
+    let filter = "/api/tasks?status=done&execution_target=game";
+    assert_eq!(
+        request(&s, "GET", filter, json!(null)).await.1[0]["id"],
+        "played"
+    );
+    drop(s);
+    let s = state(root.path(), Some(path.to_str().unwrap())).unwrap();
+    assert_eq!(request(&s, "GET", targets, json!(null)).await.1, deleted);
+}
+
+#[tokio::test]
+async fn emptied_definitions_are_not_imported_again() {
+    let root = tempfile::tempdir().unwrap();
+    let s = state(root.path(), None).unwrap();
+    let (code, created) = request(
+        &s,
+        "POST",
+        "/api/execution-targets",
+        json!({"label":"solo"}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED);
+    assert_eq!(created, json!({"labels":["solo"],"default":null}));
+    let (code, deleted) = request(&s, "DELETE", "/api/execution-targets/solo", json!(null)).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(deleted, json!({"labels":[],"default":null}));
+    drop(s);
+    let path = root.path().join("targets.yaml");
+    std::fs::write(&path, "labels: [forge]\ndefault: forge\n").unwrap();
     let s = state(root.path(), Some(path.to_str().unwrap())).unwrap();
     assert_eq!(
         request(&s, "GET", "/api/execution-targets", json!(null))
             .await
             .1,
-        json!({"labels":["field","island"],"default":null})
+        deleted
     );
-    assert_eq!(
-        request(&s, "POST", "/api/tasks", json!({"title":"missing"}))
-            .await
-            .0,
-        StatusCode::BAD_REQUEST
-    );
-    assert_eq!(
-        request(&s, "POST", "/worker/claim", json!({"worker":"missing"}))
-            .await
-            .0,
-        StatusCode::BAD_REQUEST
-    );
-    assert_eq!(
-        request(
-            &s,
-            "POST",
-            "/api/tasks",
-            json!({"title":"new","execution_target":"island"})
-        )
-        .await
-        .0,
-        StatusCode::CREATED
-    );
-    let (code, rows) = request(
-        &s,
-        "GET",
-        "/api/tasks?status=done&execution_target=forge",
-        json!(null),
-    )
-    .await;
-    assert_eq!(code, StatusCode::OK);
-    assert_eq!(rows[0]["id"], "one");
-    assert_eq!(
-        request(&s, "PATCH", "/api/tasks/one", json!({"title":"retained"}))
-            .await
-            .1["execution_target"],
-        "forge"
-    );
-    assert_eq!(
-        request(
-            &s,
-            "PATCH",
-            "/api/tasks/one",
-            json!({"execution_target":"forge"})
-        )
-        .await
-        .0,
-        StatusCode::BAD_REQUEST
-    );
-    assert_eq!(
-        request(
-            &s,
-            "PATCH",
-            "/api/tasks/one",
-            json!({"execution_target":"island"})
-        )
-        .await
-        .1["execution_target"],
-        "island"
-    );
-    assert_eq!(
-        request(
-            &s,
-            "POST",
-            "/worker/claim",
-            json!({"worker":"removed","execution_target":"forge","task_id":"default"})
-        )
-        .await
-        .0,
-        StatusCode::BAD_REQUEST
-    );
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), changed_config);
 }

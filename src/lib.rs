@@ -11,6 +11,7 @@ static UI: include_dir::Dir<'_> = include_dir::include_dir!("$CARGO_MANIFEST_DIR
 pub mod checkpoint;
 pub mod clock;
 pub mod error;
+pub mod execution_target;
 pub mod frontmatter;
 pub mod http;
 pub mod idea;
@@ -27,7 +28,14 @@ pub use state::AppState;
 pub fn app(state: AppState) -> Router {
     let api = Router::new()
         .route("/health", get(http::api_health))
-        .route("/execution-targets", get(http::api_execution_targets))
+        .route(
+            "/execution-targets",
+            get(http::api_execution_targets).post(http::api_create_execution_target),
+        )
+        .route(
+            "/execution-targets/{label}",
+            axum::routing::delete(http::api_delete_execution_target),
+        )
         .route("/tasks", get(http::api_tasks).post(http::api_create_task))
         .route(
             "/tasks/{id}",

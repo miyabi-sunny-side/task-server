@@ -10,7 +10,7 @@ settings are listed separately under [Helper and deployment settings](#helper-an
 | Variable | Default when unset | Purpose / invalid values | Reader |
 | --- | --- | --- | --- |
 | `APP_DATA_DIR` | `data/ledger` | Markdown ledger path, relative to the working directory. Missing directories are created. Blank paths, inaccessible storage or an already-locked ledger fail startup; an empty ledger beside a legacy `task-server.db` requires explicit import. | [`src/state.rs`](../src/state.rs), [`src/ledger.rs`](../src/ledger.rs) |
-| `EXECUTION_TARGETS_FILE` | No labels or default | Read-only external YAML defining execution targets; see below. Empty/non-Unicode paths, unreadable files, invalid YAML/schema, blank/duplicate names or a default outside the list fail startup. | [`src/state.rs`](../src/state.rs) |
+| `EXECUTION_TARGETS_FILE` | No seed | Read-only YAML that seeds execution targets once, only while the ledger has no definitions; see below. Then it is not read. Non-Unicode values always fail startup. While seeding, empty paths, unreadable files, invalid YAML/schema, names outside the label rule, duplicates or a default outside the list fail startup. | [`src/execution_target.rs`](../src/execution_target.rs) |
 | `PORT` | `3000` | Decimal TCP port from `1` to `65535`. Empty, non-Unicode, signed, whitespace-padded, nonnumeric or out-of-range values fail startup with a `PORT` error. | [`src/port.rs`](../src/port.rs) |
 | `LOG_LEVEL` | `info` | Logging verbosity: exactly `off`, `error`, `warn`, `info`, `debug`, or `trace`. Empty, non-Unicode or invalid values (including uppercase and module filters) use `info`. | [`src/logging.rs`](../src/logging.rs) |
 | `CLAIM_TTL_SECS` | `3600` seconds | Integer from `1` through `86400`, inclusive. A claim and each heartbeat set expiry to now plus this lifetime. Empty, nonnumeric, whitespace-padded or out-of-range values fail startup. | [`src/state.rs`](../src/state.rs), [`src/task.rs`](../src/task.rs) |
@@ -19,47 +19,63 @@ Non-Unicode `APP_DATA_DIR` and `CLAIM_TTL_SECS` values are treated as unset.
 The former `RUST_LOG` is ignored; use `LOG_LEVEL`. Build-time Cargo/CI variables
 are not runtime application settings.
 
-### External execution targets
+### Execution targets
 
-Execution names belong to the operator. Save a YAML file **outside this repository**
-and point `EXECUTION_TARGETS_FILE` at it (relative paths use the server's working
-directory). For example, an operator might supply:
+Execution target labels name the queues where work runs. The labels and an
+optional default live in the ledger at `settings/execution_targets.md`. Manage
+them with `POST /api/execution-targets`, `DELETE /api/execution-targets/{label}`
+or the matching MCP tools ([API](api.md#execution-targets)). Changes apply to task
+creation, claims and the UI choices immediately, without a restart. Writes share
+the ledger writer lock with other updates.
+
+A label matches `^[a-z0-9][a-z0-9_-]*$`: lowercase ASCII letters, digits, `-` and
+`_`, starting with a letter or digit. Quotes, `/`, `.`, spaces, uppercase and
+non-ASCII characters are rejected. A leading `-` is rejected because it reads as a
+command option. Names are matched exactly. Creating an existing label returns 409.
+Deleting an unknown label returns 404, and deleting the current default returns 409.
+The API cannot change the default or rename a label.
+
+Deleting a label stops new assignments and claims to it. Existing task references
+stay in their records and remain readable and filterable. The UI marks them
+現在の設定にありません. The server never generates labels from task records and has
+no built-in destination.
+
+#### Seeding from a file
+
+A new ledger has no definitions: no labels and no default. Creating the first
+label through the API starts the definitions without a default. To start with a
+default, seed the ledger on first start. Save a YAML file **outside this
+repository** and point `EXECUTION_TARGETS_FILE` at it (relative paths use the
+server's working directory):
 
 ```yaml
 labels:
   - forge
   - field
-  - "研究 / 試行"
+  - lab_2
 default: forge
 ```
 
-`labels` is required and contains unique, nonblank strings. Names are matched
-exactly, without trimming, and may contain Unicode, spaces or punctuation.
+`labels` is required and contains unique names that follow the label rule.
 `default` is optional (or null); when present it must name one of the labels.
-Unknown keys and wrong types are configuration errors. An explicit empty list
-is valid. An omitted environment variable means an empty list and no default.
-It never generates names from task records or supplies a built-in destination.
+Unknown keys and wrong types are errors. An explicit empty list is valid.
 
-The process reads this file once at startup. Change the external file and restart
-to add, remove or rename choices; no code change or rebuild is needed. Existing
-task references are not renamed or removed. The file is never written, copied
-into the ledger, or included in the image. There is no label registration/edit API.
-`GET /api/execution-targets` and MCP `execution_targets_get` return the same
-read-only `{"labels":[...],"default":null}` configuration consumed by the UI.
+At startup, if the ledger has no definitions and the variable is set, the server
+imports the file once and fails to start if it is invalid. Once the ledger has
+definitions, the file is not read, even when it changes or becomes invalid. This
+includes definitions emptied through the API. The server never writes the file.
 
 Containers receive the file through a read-only bind mount, with
 `EXECUTION_TARGETS_FILE` pointing to its container path. The runtime UID/GID
 `10001:10001` needs read access. Keep the existing data volume and `APP_DATA_DIR`.
-When upgrading from built-in destinations, first inject an external file containing
-the deployment's existing names and legacy default into the old container. That
-version ignores the new variable. Verify the mount, permissions and existing service
-before upgrading. Then verify the configuration and retained task references.
-If advance injection is unavailable, stop the old service and configure the mount
-before starting the new version. Retain the external file and data volume for rollback to a known working
-version; do not overwrite the ledger or add a permanent update pin.
+When upgrading from a version that read the file at every start, keep the mount
+and variable unchanged. The first start of the new version imports the current
+labels and default. Removing the mount afterwards is optional. Keep the file for
+rollback: an older version reads the file again and ignores labels created or
+deleted through the API.
 
-Without configuration the UI explains the absence and disables destination selection
-for new tasks. A configuration fetch failure offers retry without losing form text.
+Without definitions the UI explains the absence and disables destination selection
+for new tasks. A fetch failure offers retry without losing form text.
 Existing tasks remain readable and other fields remain editable.
 
 The server listens on `0.0.0.0:${PORT}` in both native and container runs. Native
@@ -82,6 +98,7 @@ ledger/
   archive/<record-id>.md
   claim_receipts/<record-id>.md
   idea/<idea-id>.md
+  settings/execution_targets.md
 ```
 
 Each document has YAML frontmatter and a Markdown body. IDs are encoded in filenames;
@@ -129,8 +146,10 @@ bin/task-data snapshot --server http://127.0.0.1:3000 --output-dir /backups/task
 bin/task-data restore /backups/task-server/ledger-TIMESTAMP.tar.gz /data/restored-ledger
 ```
 
-Snapshots include tasks, ideas, catalogue, haystack, read receipts and migration history.
-Archives made before ideas existed restore with an empty `idea/` directory.
+Snapshots include tasks, ideas, catalogue, haystack, read receipts, execution
+target definitions and migration history. Archives made before ideas or ledger
+definitions existed restore with an empty `idea/` or `settings/` directory. A
+server opening such a ledger seeds definitions from `EXECUTION_TARGETS_FILE`, if set.
 The archive contains a SHA-256 manifest. Restore validates all entries and checksums
 before publishing a new directory. Open that directory with a separate server to
 verify task history and unread haystack counts. It does not overwrite a live ledger.
@@ -168,7 +187,7 @@ arguments. It does not read application storage settings. Loop options and local
 snapshot/restore paths are CLI arguments; see each command's `--help`.
 
 With a host bind mount, make the ledger writable by the container's UID/GID `10001:10001`.
-The execution-target file needs read access and is mounted read-only.
+The optional execution-target seed file needs read access and is mounted read-only.
 The [Docker quickstart](../README.md#run-with-docker) uses a named data volume instead.
 Deployment wrappers may use their own variable names; pass server settings explicitly.
 Keep backup credentials outside the repository and container image.

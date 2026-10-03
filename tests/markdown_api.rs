@@ -245,11 +245,7 @@ async fn mcp_flat_crud_contract_over_json_rpc() {
 async fn mcp_external_targets_and_historical_receipts_share_the_http_contract() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("targets.yaml");
-    std::fs::write(
-        &path,
-        "labels: [forge, field, '研究 / 試行']\ndefault: forge",
-    )
-    .unwrap();
+    std::fs::write(&path, "labels: [forge, field, lab_2]\ndefault: forge").unwrap();
     let state = AppState::from_vars(|key| match key {
         "APP_DATA_DIR" => Some(dir.path().join("ledger").to_string_lossy().into_owned()),
         "EXECUTION_TARGETS_FILE" => Some(path.to_string_lossy().into_owned()),
@@ -266,7 +262,7 @@ async fn mcp_external_targets_and_historical_receipts_share_the_http_contract() 
             .await
             .1
     );
-    for (id, target) in [("a", "forge"), ("b", "field"), ("c", "研究 / 試行")] {
+    for (id, target) in [("a", "forge"), ("b", "field"), ("c", "lab_2")] {
         let created = mcp_call(
             &app,
             session,
@@ -465,6 +461,99 @@ async fn list_shapes_summary_projection_and_haystack_cursor_contract() {
     let (_, unread) = request(app, "GET", "/api/runs?unread=true", json!({})).await;
     assert_eq!(unread["runs"].as_array().unwrap().len(), 1);
     assert_eq!(unread["runs"][0]["id"], 2);
+}
+
+#[tokio::test]
+async fn mcp_creates_and_deletes_execution_targets_without_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = common::state(Store::open(dir.path()).unwrap());
+    state
+        .store
+        .put("products", "a/b", json!({"id":"a/b"}))
+        .unwrap();
+    let app = task_server::app(state.clone());
+    let (_, headers, _) = rpc(app.clone(),None,json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"target-admin-test","version":"1"}}})).await;
+    let session = headers["mcp-session-id"].to_str().unwrap();
+    let created = mcp_call(
+        &app,
+        session,
+        "execution_target_create",
+        json!({"label":"game"}),
+    )
+    .await;
+    let expected = json!({"labels":["forge","field","lab_2","game"],"default":"forge"});
+    assert_eq!(created["result"]["structuredContent"], expected);
+    let listed = mcp_call(&app, session, "execution_targets_get", json!({})).await;
+    assert_eq!(listed["result"]["structuredContent"], expected);
+    let task = mcp_call(
+        &app,
+        session,
+        "task_create",
+        json!({"id":"played","title":"play","product_id":"a/b","execution_target":"game"}),
+    )
+    .await;
+    assert_eq!(
+        task["result"]["structuredContent"]["execution_target"],
+        "game"
+    );
+    task::set_status(&state, "played", "ready").unwrap();
+    let (code, claim) = request(
+        app.clone(),
+        "POST",
+        "/worker/claim",
+        json!({"worker":"gamer","execution_target":"game"}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(claim["task"]["id"], "played");
+    let deleted = mcp_call(
+        &app,
+        session,
+        "execution_target_delete",
+        json!({"label":"game"}),
+    )
+    .await;
+    let remaining = json!({"labels":["forge","field","lab_2"],"default":"forge"});
+    assert_eq!(deleted["result"]["structuredContent"], remaining);
+    let listed = mcp_call(&app, session, "execution_targets_get", json!({})).await;
+    assert_eq!(listed["result"]["structuredContent"], remaining);
+    let refused = mcp_call(
+        &app,
+        session,
+        "task_create",
+        json!({"title":"again","execution_target":"game"}),
+    )
+    .await;
+    assert_eq!(refused["result"]["isError"], true);
+    let (code, _) = request(
+        app.clone(),
+        "POST",
+        "/worker/claim",
+        json!({"worker":"gamer","execution_target":"game"}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    let kept = mcp_call(&app, session, "task_get", json!({"id":"played"})).await;
+    assert_eq!(
+        kept["result"]["structuredContent"]["execution_target"],
+        "game"
+    );
+    assert_eq!(
+        kept["result"]["structuredContent"]["execution_target_configured"],
+        false
+    );
+    for (name, label, code) in [
+        ("execution_target_create", "forge", "conflict"),
+        ("execution_target_create", "a/b", "invalid"),
+        ("execution_target_delete", "game", "not_found"),
+        ("execution_target_delete", "forge", "conflict"),
+    ] {
+        let result = mcp_call(&app, session, name, json!({"label":label})).await;
+        assert_eq!(
+            result["result"]["structuredContent"]["code"], code,
+            "{name} {label}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -898,6 +987,11 @@ async fn mcp_tool_schemas_reject_ignored_arguments() {
             ("task_update", json!({"id":"a","status":"done"})),
             ("task_create", json!({"title":"x","commit_sha":"ignored"})),
             ("product_list", json!({"unknown":true})),
+            (
+                "execution_target_create",
+                json!({"label":"x","default":true}),
+            ),
+            ("execution_target_delete", json!({})),
             (
                 "task_checkpoint_update",
                 json!({"id":"a","claim_id":"old","expected_revision":0,"unknown":true}),

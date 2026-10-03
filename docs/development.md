@@ -45,8 +45,8 @@ Set `TASK_SERVER_SMOKE_TEST` to use an already compiled test executable.
 ## Browser regression check
 
 After building the frontend and `cargo build --locked`, run the isolated Chromium
-check. It starts its own binary with temporary ledgers and external settings,
-restarts that same binary with changed settings, and never connects to deployed tasks.
+check. It starts its own binary with temporary ledgers and a seed file, restarts
+it with a changed file, edits labels through the API, and never connects to deployed tasks.
 Playwright can stay outside the product's dependency tree:
 
 ```sh

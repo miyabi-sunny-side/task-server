@@ -17,6 +17,7 @@ pub const COLLECTIONS: &[&str] = &[
     "archive",
     "claim_receipts",
     "idea",
+    "settings",
 ];
 
 pub struct Store {

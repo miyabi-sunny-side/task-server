@@ -19,8 +19,8 @@ bin/task-loop --once --url http://127.0.0.1:3000 --execution-target local \
 ```
 
 This command launches the configured agent. The server alone does not execute tasks.
-`--execution-target NAME` selects any externally configured worker queue. Omitting
-it leaves selection to the server's external default; without one the claim fails.
+`--execution-target NAME` selects any defined worker queue. Omitting it leaves
+selection to the server's default; without one the claim fails.
 This is independent of where task-server is hosted; each machine runs its own
 loop/state directory and explicitly chooses its execution target.
 The loop fetches fresh product metadata using its task's stable ID. If `local_path`
@@ -56,24 +56,25 @@ Tasks own one `execution_target` reference. HTTP create/patch
 (`/api/tasks`, `/api/tasks/:id`) and MCP `task_create`/`task_update` accept it;
 detail/list responses expose it. `GET /api/tasks?execution_target=field` and
 MCP `task_list(execution_target: "field")` filter by exact name, including historical
-names no longer configured. URL-encode names in HTTP queries. Omit the list filter
+names no longer defined. URL-encode names in HTTP queries. Omit the list filter
 to see all destinations. The UI displays it on task rows/cards, edits it in the
 create/edit form, and filters the common active list with a native select.
 
-New assignments and claims accept only names from the external configuration.
-Create/claim may omit the target only when an external default exists. Existing
+New assignments and claims accept only currently defined names
+([execution targets](api.md#execution-targets)).
+Create/claim may omit the target only when a default exists. Existing
 task documents without the field use that default on reads; without one they are
 shown as null/未設定. Reads never rewrite the stored record. Explicit historical
-references survive removed choices and are marked 現在の設定にありません in the UI.
+references survive deleted labels and are marked 現在の設定にありません in the UI.
 Read responses include `execution_target_configured` to distinguish those references
 from current choices. Updates omitting the target preserve it, even when it is
-unset or no longer configured. New assignments reject null, unconfigured or multiple
+unset or no longer defined. New assignments reject null, undefined or multiple
 values. The single execution target is not a multi-label classification system.
 
 `POST /worker/claim` accepts:
 
 - A nonblank `worker`.
-- An optional `execution_target`; omission uses the external default.
+- An optional `execution_target`; omission uses the default.
 - An optional, nonblank `task_id`: one path segment, excluding `.` and `..`.
   Null and non-string IDs return **400**.
 
@@ -89,9 +90,9 @@ with `task_id`. Omitting `task_id` selects eligible ready tasks by priority
 An empty eligible queue, execution-target mismatch, or unfinished dependency
 returns **204**, including ID selection. These conditions leave tasks waiting
 without marking them blocked. ID selection never falls back to another task.
-Old claim clients use only the externally supplied default. Changing that default
-changes their queue, so preserve the deployment's current default during migration.
-Missing defaults or unconfigured claim targets produce **400**, never another queue.
+Old claim clients use only the default. Changing that default would change their
+queue, so the API cannot change or delete it; seeding imports the current default.
+Missing defaults or undefined claim targets produce **400**, never another queue.
 
 Success is **200** with the existing `{claim_id, lease_expires_at, task}` envelope.
 Selection, eligibility checks and lease creation share the ledger writer lock,

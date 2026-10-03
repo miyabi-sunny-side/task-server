@@ -15,6 +15,18 @@ Haystack readers can continue using `/api/runs/next` and `/api/runs/{id}/read`.
 Mark a run read after its downstream wiki update is safely stored; keep the cursor
 on the server so reader restarts do not lose unread work.
 
+## Execution targets
+
+The labels live in the ledger; see [Operations](operations.md#execution-targets)
+for the label rule and seeding. Every response is the current
+`{"labels":[...],"default":"..."|null}`.
+
+| HTTP | MCP | Behavior |
+| --- | --- | --- |
+| `GET /api/execution-targets` | `execution_targets_get()` | Current labels in creation order and the optional default. The UI reads the same response. |
+| `POST /api/execution-targets` (201) | `execution_target_create(label)` | Body `{"label":"game"}`. Invalid names return 400 `invalid`; an existing label returns 409 `conflict`. |
+| `DELETE /api/execution-targets/{label}` | `execution_target_delete(label)` | Unknown labels return 404 `not_found`; the default returns 409 `conflict`. Existing task references are kept, while new assignments and claims to the label return 400. |
+
 ## Ideas
 
 An idea is a note that may or may not become a task: a title, a free Markdown body
@@ -123,7 +135,7 @@ No ledger migration or rewriting is required.
 
 | Tool | Response and explicit follow-up |
 | --- | --- |
-| `execution_targets_get()` | External execution names and optional default; no mutation or ledger definitions. |
+| `execution_targets_get()` | Current execution target labels and optional default; see [Execution targets](#execution-targets). |
 | `task_list(status?, product_id?, execution_target?, limit?, offset?)` | `tasks` with ID, product, execution target, title, status, priority, dependency/status and blocker; no prose or evidence. Default excludes closed tasks; supply one lifecycle status to include that status. |
 | `task_get(id)` | Task body and current lifecycle, claim, commit, report ID, timestamps, transitions and run counts. It does not expand completion prose, milestones, history or checkpoint values. |
 | `task_history(id, limit?, offset?)` | `entries` tagged by source field: `current_completion` (summary/verification/checks), `last_report`, `milestones`, `milestone_history`, `legacy_completion`, `report_ids`, `legacy`. Array entries retain their original index; historical values retain their original provenance, including overlapping legacy evidence. |

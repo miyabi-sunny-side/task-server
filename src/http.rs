@@ -1,4 +1,4 @@
-use crate::{AppState, Error, idea, product, runs, task};
+use crate::{AppState, Error, execution_target, idea, product, runs, task};
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -13,8 +13,26 @@ pub async fn healthz() -> &'static str {
 pub async fn api_health() -> Json<Value> {
     Json(json!({"status":"ok"}))
 }
-pub async fn api_execution_targets(State(s): State<AppState>) -> Json<Value> {
-    Json(json!(s.execution_targets))
+pub async fn api_execution_targets(State(s): State<AppState>) -> Result<Json<Value>, Error> {
+    Ok(Json(json!(execution_target::get(&s)?)))
+}
+pub async fn api_create_execution_target(
+    State(s): State<AppState>,
+    Json(v): Json<Value>,
+) -> Result<(StatusCode, Json<Value>), Error> {
+    let label = v["label"]
+        .as_str()
+        .ok_or_else(|| Error::Invalid("label must be a string".into()))?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!(execution_target::create(&s, label)?)),
+    ))
+}
+pub async fn api_delete_execution_target(
+    State(s): State<AppState>,
+    Path(label): Path<String>,
+) -> Result<Json<Value>, Error> {
+    Ok(Json(json!(execution_target::delete(&s, &label)?)))
 }
 pub async fn api_tasks(
     State(s): State<AppState>,
@@ -29,8 +47,9 @@ pub async fn api_tasks(
     } else {
         task::list(&s, q.get("status").map(String::as_str))?
     };
+    let targets = execution_target::get(&s)?;
     for t in &mut ts {
-        task::project_target(&s, t);
+        task::project_target(&targets, t);
     }
     task::filter_target(&mut ts, q.get("execution_target").map(String::as_str))?;
     if let Some(p) = q.get("product_id") {
@@ -86,8 +105,9 @@ fn history(s: &AppState, done: bool) -> Result<Value, Error> {
         }
     });
     ts.sort_by(|a, b| task::string(b, "closed_at").cmp(task::string(a, "closed_at")));
+    let targets = execution_target::get(s)?;
     for t in &mut ts {
-        task::project_target(s, t);
+        task::project_target(&targets, t);
     }
     Ok(json!(ts.iter().map(task::summary).collect::<Vec<_>>()))
 }
@@ -213,7 +233,7 @@ pub async fn worker_claim(
             &s,
             task::string(&v, "worker"),
             task_id,
-            task::execution_target(&s, &v)?,
+            &task::execution_target(&execution_target::get(&s)?, &v)?,
         )? {
             Some(v) => Json(v).into_response(),
             None => StatusCode::NO_CONTENT.into_response(),

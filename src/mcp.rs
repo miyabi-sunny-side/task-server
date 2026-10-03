@@ -1,5 +1,5 @@
 //! Trusted-network MCP adapters for the same Markdown domain.
-use crate::{AppState, Error, idea, product, task};
+use crate::{AppState, Error, execution_target, idea, product, task};
 use axum::Router;
 use rmcp::{
     ServerHandler,
@@ -18,6 +18,11 @@ use std::sync::Arc;
 #[serde(deny_unknown_fields)]
 pub struct Id {
     pub id: String,
+}
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Label {
+    pub label: String,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -370,9 +375,9 @@ fn brief_task(t: &Value) -> Value {
         ],
     )
 }
-fn task_receipt(s: &AppState, t: &Value, fields: &Value) -> Value {
+fn task_receipt(s: &AppState, t: &Value, fields: &Value) -> Result<Value, Error> {
     let mut result = brief_task(t);
-    task::project_target(s, &mut result);
+    task::project_target(&execution_target::get(s)?, &mut result);
     result["ok"] = json!(true);
     result["updated_at"] = t["updated_at"].clone();
     result["changed"] = json!(
@@ -383,7 +388,7 @@ fn task_receipt(s: &AppState, t: &Value, fields: &Value) -> Value {
             .filter(|k| *k != "id")
             .collect::<Vec<_>>()
     );
-    result
+    Ok(result)
 }
 fn nonempty(v: &Value) -> bool {
     !v.is_null()
@@ -439,10 +444,22 @@ impl Admin {
         }
     }
     #[tool(
-        description = "Read externally configured execution target names and optional default. Read-only; definitions are owned by deployment and loaded at server startup."
+        description = "Read the current execution target labels and optional default from the ledger. Edits by execution_target_create/delete apply immediately."
     )]
     fn execution_targets_get(&self) -> CallToolResult {
-        answer(Ok(json!(self.state.execution_targets)))
+        answer(execution_target::get(&self.state).map(|t| json!(t)))
+    }
+    #[tool(
+        description = "Add an execution target label (lowercase letters, digits, '-' and '_'; starts with a letter or digit). Duplicates conflict. Returns {labels, default}."
+    )]
+    fn execution_target_create(&self, Parameters(a): Parameters<Label>) -> CallToolResult {
+        answer(execution_target::create(&self.state, &a.label).map(|t| json!(t)))
+    }
+    #[tool(
+        description = "Delete an execution target label. Unknown labels are not_found and the default cannot be deleted. Existing task references stay readable; new assignments and claims to it are refused. Returns {labels, default}."
+    )]
+    fn execution_target_delete(&self, Parameters(a): Parameters<Label>) -> CallToolResult {
+        answer(execution_target::delete(&self.state, &a.label).map(|t| json!(t)))
     }
     #[tool(
         description = "List compact tasks filtered by status/product_id/execution_target (any current or historical name). Default excludes closed tasks. Stable priority descending then id order; limit 1..200 (default 50), offset default 0. Follow next_offset until null; pages reflect current state."
@@ -544,13 +561,13 @@ impl Admin {
         })())
     }
     #[tool(
-        description = "Create a draft task with title, body, product_id, optional id/priority/dependency/release_level/execution_target. Target must be externally configured; omission requires an external default. execution_targets_get reads configuration. Returns compact receipt; task_get reads the body."
+        description = "Create a draft task with title, body, product_id, optional id/priority/dependency/release_level/execution_target. Target must be a defined label; omission uses the default. execution_targets_get reads the labels. Returns compact receipt; task_get reads the body."
     )]
     fn task_create(&self, Parameters(a): Parameters<TaskCreate>) -> CallToolResult {
         let fields = fields(&a);
         answer(
             task::create(&self.state, fields.clone())
-                .map(|t| task_receipt(&self.state, &t, &fields)),
+                .and_then(|t| task_receipt(&self.state, &t, &fields)),
         )
     }
     #[tool(
@@ -568,7 +585,7 @@ impl Admin {
                 }
             }
             task::patch(&self.state, &a.id, fields.clone())
-                .map(|t| task_receipt(&self.state, &t, &fields))
+                .and_then(|t| task_receipt(&self.state, &t, &fields))
         })())
     }
     #[tool(
@@ -577,7 +594,7 @@ impl Admin {
     fn task_set_status(&self, Parameters(a): Parameters<Status>) -> CallToolResult {
         answer(
             task::set_status(&self.state, &a.id, &a.status)
-                .map(|t| task_receipt(&self.state, &t, &json!({"status":a.status}))),
+                .and_then(|t| task_receipt(&self.state, &t, &json!({"status":a.status}))),
         )
     }
     #[tool(
@@ -724,16 +741,17 @@ impl Admin {
         answer(idea::unarchive(&self.state, &a.id).map(|i| idea::summary(&i)))
     }
     #[tool(
-        description = "Only when the user or your instructions explicitly ask: turn an idea into a draft task (never ready, no worker is started). title/product_id default to the idea's; body should state the task scope and completion conditions (default copies the idea body). execution_target must be configured (execution_targets_get) or falls back to the external default. The idea keeps its text and gains task_id; the task gains idea_id. Retrying returns the same task instead of a duplicate."
+        description = "Only when the user or your instructions explicitly ask: turn an idea into a draft task (never ready, no worker is started). title/product_id default to the idea's; body should state the task scope and completion conditions (default copies the idea body). execution_target must be a defined label (execution_targets_get) or falls back to the default. The idea keeps its text and gains task_id; the task gains idea_id. Retrying returns the same task instead of a duplicate."
     )]
     fn idea_promote(&self, Parameters(a): Parameters<IdeaPromote>) -> CallToolResult {
-        answer(idea::promote(&self.state, &a.id, fields(&a)).map(|r| {
+        answer((|| {
+            let r = idea::promote(&self.state, &a.id, fields(&a))?;
             let mut result = idea::summary(&r["idea"]);
             let mut task = brief_task(&r["task"]);
-            task::project_target(&self.state, &mut task);
+            task::project_target(&execution_target::get(&self.state)?, &mut task);
             result["task"] = task;
-            result
-        }))
+            Ok(result)
+        })())
     }
     #[tool(
         description = "List registered product summaries, optional archived filter. Stable id order; limit 1..200 default 50, offset default 0. Follow next_offset; product_get reads full metadata."

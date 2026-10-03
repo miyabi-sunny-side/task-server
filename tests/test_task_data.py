@@ -131,6 +131,19 @@ class DataTests(unittest.TestCase):
         with self.assertRaises(ValueError): self.data.snapshot(dict(older,unknown=[]),self.root/'bad.tar.gz')
         with self.assertRaises(ValueError): self.data.snapshot({'tasks':[]},self.root/'partial.tar.gz')
 
+    def test_snapshots_restore_execution_targets_and_older_exports_without_them(self):
+        records={name:[] for name in self.data.COLLECTIONS}
+        targets=dict(id='execution_targets',body='',labels=['sandbox','game'],default='sandbox')
+        records['settings']=[targets]
+        self.data.snapshot(records,self.root/'new.tar.gz')
+        self.data.restore(self.root/'new.tar.gz',self.root/'new')
+        restored=self.data.read_generated(self.root/'new'/'settings'/'execution_targets.md')
+        self.assertEqual(dict(restored,body=''),targets)
+        older={name:[] for name in ('tasks','products','runs','archive','claim_receipts','idea')}
+        self.data.snapshot(older,self.root/'old.tar.gz')
+        self.data.restore(self.root/'old.tar.gz',self.root/'old')
+        self.assertEqual(list((self.root/'old'/'settings').iterdir()),[])
+
     def test_r2_upload_uses_configured_destination_and_environment(self):
         archive = self.root / 'generation.tar.gz'
         archive.write_bytes(b'local backup')
