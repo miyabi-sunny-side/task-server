@@ -13,12 +13,12 @@ The binary must also expose a snapshot and run without external UI files.
 
 ## Releases
 
+Run the checks in AGENTS.md, the image check and the browser check below before
+committing; GitHub Actions does not run them.
 Push a `vMAJOR.MINOR.PATCH` tag matching `Cargo.toml` and `Cargo.lock`.
-This runs verification, builds the container, and smoke-tests it with an empty ledger.
-The tested image is published as `ghcr.io/<owner>/<repo>:<version>` and `:latest`. The GitHub
-Release records the image digest. Manual release runs must select a version tag.
-PRs and manual CI runs perform verification; pushes to `main` do not prebuild or
-publish images.
+The tag builds the container and publishes it as `ghcr.io/<owner>/<repo>:<version>`
+and `:latest`. The GitHub Release records the image digest. Manual release runs
+must select a version tag. Pushes to `main` do not build or publish images.
 
 BuildKit retains intermediate stages at `ghcr.io/<owner>/<repo>:build-cache`
 using the workflow's `GITHUB_TOKEN` with `packages: write`. This registry cache
@@ -34,13 +34,11 @@ The image check needs Cargo, jq, curl, and Docker:
 
 ```sh
 docker buildx build --load -t task-server:test .
-bash .github/smoke-image.sh task-server:test
+bash tests/smoke-image.sh task-server:test
 ```
 
-The script compiles the Rust smoke test and runs it against the isolated container.
-Release CI passes this test executable to the publish job.
-That job does not need Rust or frontend dependencies.
-Set `TASK_SERVER_SMOKE_TEST` to use an already compiled test executable.
+The script compiles the Rust smoke test and runs it against the isolated container
+with an empty ledger. Set `TASK_SERVER_SMOKE_TEST` to use an already compiled test executable.
 
 ## Browser regression check
 

@@ -68,6 +68,7 @@ local snapshot is not evidence of a successful remote upload.
 
 ```sh
 npm --prefix client ci
+npm --prefix client run format:check
 npm --prefix client run check
 npm --prefix client test
 npm --prefix client run build
@@ -77,6 +78,10 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --locked
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
+
+Run these before committing; GitHub Actions only builds and publishes tagged
+releases. Changes to the image or UI also need the image and browser checks in
+[docs/development.md](docs/development.md).
 
 Tests use temporary ledgers and stub agents/HTTP servers, never deployed tasks.
 Frontend appearance and interaction follow root `DESIGN.md`.

@@ -1,6 +1,5 @@
 .git
 .github
-.ci-bin
 target
 data
 client/node_modules

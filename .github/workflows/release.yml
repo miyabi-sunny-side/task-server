@@ -14,12 +14,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  verify:
-    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
-    uses: ./.github/workflows/ci.yml
-
   publish:
-    needs: verify
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -55,29 +51,8 @@ jobs:
             type=semver,pattern={{version}}
             type=raw,value=latest
 
-      - name: Build release image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          load: true
-          tags: task-server:test
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:build-cache
-
-      - name: Download the native image verifier
-        uses: actions/download-artifact@v4
-        with:
-          name: ui-smoke
-          path: .ci-bin
-
-      - name: Smoke-test the release image
-        run: |
-          chmod +x .ci-bin/ui-smoke
-          TASK_SERVER_SMOKE_TEST="$PWD/.ci-bin/ui-smoke" bash .github/smoke-image.sh task-server:test
-
-      # Same builder, inputs and labels: reuse the image just tested, then
-      # retain intermediate stages for the next tag (no main-branch warmup).
-      - name: Publish tested image and build cache
+      # Retain intermediate stages for the next tag (no main-branch warmup).
+      - name: Publish image and build cache
         id: image
         uses: docker/build-push-action@v7
         with:
@@ -85,6 +60,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:build-cache
           cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:build-cache,mode=max
 
       - name: Create the GitHub Release
