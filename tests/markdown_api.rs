@@ -17,11 +17,16 @@ async fn request(
         .uri(path)
         .header("content-type", "application/json");
     let r = app
-        .oneshot(r.body(Body::from(body.to_string())).unwrap())
+        .oneshot(
+            r.body(Body::from(body.to_string()))
+                .expect("test request is well-formed"),
+        )
         .await
         .unwrap();
     let status = r.status();
-    let bytes = to_bytes(r.into_body(), usize::MAX).await.unwrap();
+    let bytes = to_bytes(r.into_body(), usize::MAX)
+        .await
+        .expect("test response body is readable");
     (status, serde_json::from_slice(&bytes).unwrap_or_default())
 }
 use task_server::{AppState, SharedClock, ledger::Store, task};
@@ -137,13 +142,19 @@ async fn rpc(
         request = request.header("mcp-session-id", session);
     }
     let response = app
-        .oneshot(request.body(Body::from(message.to_string())).unwrap())
+        .oneshot(
+            request
+                .body(Body::from(message.to_string()))
+                .expect("test request is well-formed"),
+        )
         .await
         .unwrap();
     let status = response.status();
     let headers = response.headers().clone();
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test response body is readable");
+    let text = String::from_utf8(bytes.to_vec()).expect("MCP response is UTF-8");
     assert!(status.is_success(), "MCP {status}: {text}");
     let value = serde_json::from_str(&text).unwrap_or_else(|_| {
         text.lines()
@@ -1064,7 +1075,7 @@ fn claim_queue(state: &AppState) {
     state
         .store
         .put("products", "a/b", json!({"id":"a/b"}))
-        .unwrap();
+        .expect("fresh ledger accepts a product");
     for (id, priority, created_at) in [
         ("older", 10, "2026-09-01T00:00:00Z"),
         ("newer", 10, "2026-09-02T00:00:00Z"),
@@ -1074,15 +1085,15 @@ fn claim_queue(state: &AppState) {
             state,
             json!({"id":id,"title":id,"product_id":"a/b","priority":priority}),
         )
-        .unwrap();
-        task::set_status(state, id, "ready").unwrap();
+        .expect("queue task is valid");
+        task::set_status(state, id, "ready").expect("draft task can become ready");
         state
             .store
             .update("tasks", id, |t| {
                 t["created_at"] = json!(created_at);
                 Ok(())
             })
-            .unwrap();
+            .expect("queue task is updatable");
     }
 }
 

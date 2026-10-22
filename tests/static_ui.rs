@@ -11,7 +11,7 @@ async fn request(app: axum::Router, method: &str, path: &str) -> axum::response:
             .method(method)
             .uri(path)
             .body(Body::empty())
-            .unwrap(),
+            .expect("test request is well-formed"),
     )
     .await
     .unwrap()

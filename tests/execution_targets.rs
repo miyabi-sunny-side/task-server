@@ -23,12 +23,14 @@ async fn request(s: &AppState, method: &str, path: &str, body: Value) -> (Status
                 .uri(path)
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
-                .unwrap(),
+                .expect("test request is well-formed"),
         )
         .await
         .unwrap();
     let status = response.status();
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test response body is readable");
     (status, serde_json::from_slice(&body).unwrap_or_default())
 }
 
@@ -145,10 +147,15 @@ fn explicit_configuration_errors_fail_startup() {
 }
 
 fn configured() -> (tempfile::TempDir, std::path::PathBuf, AppState) {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().expect("temporary directory is creatable");
     let path = root.path().join("targets.yaml");
-    std::fs::write(&path, "labels: [forge, field, lab_2]\ndefault: forge\n").unwrap();
-    let state = state(root.path(), Some(path.to_str().unwrap())).unwrap();
+    std::fs::write(&path, "labels: [forge, field, lab_2]\ndefault: forge\n")
+        .expect("temporary directory is writable");
+    let state = state(
+        root.path(),
+        Some(path.to_str().expect("temporary path is UTF-8")),
+    )
+    .expect("configured execution targets load");
     (root, path, state)
 }
 
@@ -241,7 +248,8 @@ fn labels_allow_only_lowercase_digits_hyphen_and_underscore() {
 }
 
 fn targets_of(root: &Path) -> String {
-    std::fs::read_to_string(root.join("ledger/settings/execution_targets.md")).unwrap()
+    std::fs::read_to_string(root.join("ledger/settings/execution_targets.md"))
+        .expect("execution targets are persisted")
 }
 
 #[tokio::test]

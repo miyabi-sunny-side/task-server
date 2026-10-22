@@ -10,19 +10,24 @@ use time::macros::datetime;
 use tower::ServiceExt;
 
 fn state(path: &std::path::Path, clock: &SharedClock) -> AppState {
-    common::state(Store::open(path).unwrap())
+    common::state(Store::open(path).expect("fresh ledger directory opens"))
         .with_clock(Arc::new(clock.clone()))
         .with_ttl(10)
 }
 fn seed(s: &AppState) {
-    s.store.put("products", "a/b", json!({"id":"a/b"})).unwrap();
-    task::create(s, json!({"id":"t","title":"checkpoint","product_id":"a/b"})).unwrap();
+    s.store
+        .put("products", "a/b", json!({"id":"a/b"}))
+        .expect("fresh ledger accepts a product");
+    task::create(s, json!({"id":"t","title":"checkpoint","product_id":"a/b"}))
+        .expect("seed task is valid");
 }
 fn claim(s: &AppState) -> String {
-    task::set_status(s, "t", "ready").unwrap();
-    task::claim(s, "test", None, "forge").unwrap().unwrap()["claim_id"]
+    task::set_status(s, "t", "ready").expect("draft task can become ready");
+    task::claim(s, "test", None, "forge")
+        .expect("ready task is claimable")
+        .expect("ready task is offered")["claim_id"]
         .as_str()
-        .unwrap()
+        .expect("claim has a string claim_id")
         .into()
 }
 async fn request(s: &AppState, method: &str, body: Value) -> (StatusCode, Value) {
@@ -33,12 +38,14 @@ async fn request(s: &AppState, method: &str, body: Value) -> (StatusCode, Value)
                 .uri("/worker/tasks/t/checkpoint")
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
-                .unwrap(),
+                .expect("test request is well-formed"),
         )
         .await
         .unwrap();
     let status = response.status();
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test response body is readable");
     (status, serde_json::from_slice(&bytes).unwrap_or_default())
 }
 async fn patch(

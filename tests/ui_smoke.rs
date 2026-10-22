@@ -39,7 +39,10 @@ fn referenced_assets(html: &[u8]) -> BTreeMap<String, &'static str> {
             _ => continue,
         };
         if let Some(path) = path {
-            assets.insert(String::from_utf8(path.to_vec()).unwrap(), mime);
+            assets.insert(
+                String::from_utf8(path.to_vec()).expect("html5gum yields UTF-8 attribute values"),
+                mime,
+            );
         }
     }
     assets
@@ -70,10 +73,12 @@ fn referenced_assets_follow_tags_and_attributes() {
 
 async fn fetch(address: SocketAddr, method: &str, path: &str, status: u16) -> (String, Bytes) {
     tokio::time::timeout(Duration::from_secs(10), async {
-        let stream = TcpStream::connect(address).await.unwrap();
+        let stream = TcpStream::connect(address)
+            .await
+            .expect("smoke server accepts TCP connections");
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
-            .unwrap();
+            .expect("HTTP/1 handshake succeeds");
         let connection = tokio::spawn(connection);
         let response = sender
             .send_request(
@@ -83,25 +88,30 @@ async fn fetch(address: SocketAddr, method: &str, path: &str, status: u16) -> (S
                     .header("Host", address.to_string())
                     .header("Connection", "close")
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("test request is well-formed"),
             )
             .await
-            .unwrap();
+            .expect("smoke server answers the request");
         assert_eq!(response.status().as_u16(), status, "{method} {path}");
         let mime = response
             .headers()
             .get("content-type")
-            .map_or("", |value| value.to_str().unwrap())
+            .map_or("", |value| {
+                value.to_str().expect("content-type header is ASCII")
+            })
             .split(';')
             .next()
-            .unwrap()
+            .expect("split yields at least one item")
             .trim()
             .to_ascii_lowercase();
         let body = to_bytes(Body::new(response.into_body()), usize::MAX)
             .await
-            .unwrap();
+            .expect("response body is readable");
         drop(sender);
-        connection.await.unwrap().unwrap();
+        connection
+            .await
+            .expect("connection task does not panic")
+            .expect("HTTP/1 connection closes cleanly");
         (mime, body)
     })
     .await
@@ -173,16 +183,24 @@ async fn packaged_ui() {
 }
 
 async fn check_ui(address: SocketAddr) {
-    assert_eq!(fetch(address, "GET", "/healthz", 200).await.1, "ok\n");
-    let (mime, health) = fetch(address, "GET", "/api/health", 200).await;
-    assert_eq!(mime, "application/json");
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&health).unwrap(),
-        serde_json::json!({"status":"ok"})
+        fetch(address, "GET", "/healthz", 200).await.1,
+        "ok\n",
+        "/healthz body"
+    );
+    let (mime, health) = fetch(address, "GET", "/api/health", 200).await;
+    assert_eq!(mime, "application/json", "/api/health content-type");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&health).expect("/api/health returns JSON"),
+        serde_json::json!({"status":"ok"}),
+        "/api/health body"
     );
     let (mime, html) = fetch(address, "GET", "/", 200).await;
-    assert_eq!(mime, "text/html");
-    assert!(html.to_ascii_lowercase().starts_with(b"<!doctype html>"));
+    assert_eq!(mime, "text/html", "/ content-type");
+    assert!(
+        html.to_ascii_lowercase().starts_with(b"<!doctype html>"),
+        "/ is an HTML document"
+    );
     let assets = referenced_assets(&html);
     for mime in [
         "text/javascript",
@@ -204,12 +222,32 @@ async fn check_ui(address: SocketAddr) {
         assert_eq!(head_mime, mime, "{path}");
         assert!(head_body.is_empty(), "{path}");
         if mime == "application/manifest+json" {
-            let manifest: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            for icon in manifest["icons"].as_array().unwrap() {
-                let (icon_mime, icon_body) =
-                    fetch(address, "GET", icon["src"].as_str().unwrap(), 200).await;
-                assert_eq!(icon_mime, icon["type"].as_str().unwrap());
-                assert!(icon_body.starts_with(b"\x89PNG\r\n\x1a\n"));
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&body).expect("manifest is JSON");
+            for icon in manifest["icons"]
+                .as_array()
+                .expect("manifest has an icons array")
+            {
+                let (icon_mime, icon_body) = fetch(
+                    address,
+                    "GET",
+                    icon["src"]
+                        .as_str()
+                        .expect("manifest icon has a string src"),
+                    200,
+                )
+                .await;
+                assert_eq!(
+                    icon_mime,
+                    icon["type"]
+                        .as_str()
+                        .expect("manifest icon has a string type"),
+                    "{path} icon content-type"
+                );
+                assert!(
+                    icon_body.starts_with(b"\x89PNG\r\n\x1a\n"),
+                    "{path} icon is a PNG"
+                );
             }
         }
     }
@@ -236,8 +274,9 @@ async fn check_ui(address: SocketAddr) {
     let (_, snapshot) = fetch(address, "GET", "/worker/snapshot", 200).await;
     assert!(
         serde_json::from_slice::<serde_json::Value>(&snapshot)
-            .unwrap()
+            .expect("/worker/snapshot returns JSON")
             .get("tasks")
-            .is_some()
+            .is_some(),
+        "/worker/snapshot has tasks"
     );
 }

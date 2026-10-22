@@ -5,24 +5,24 @@ use task_server::{AppState, SharedClock, ledger::Store, task};
 use time::macros::datetime;
 
 fn setup() -> (tempfile::TempDir, AppState, SharedClock, serde_json::Value) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temporary directory is creatable");
     let clock = SharedClock::at(datetime!(2026-09-05 00:00 UTC));
-    let state = common::state(Store::open(dir.path()).unwrap())
+    let state = common::state(Store::open(dir.path()).expect("fresh ledger directory opens"))
         .with_clock(Arc::new(clock.clone()))
         .with_ttl(10);
     state
         .store
         .put("products", "a/b", json!({"id":"a/b"}))
-        .unwrap();
+        .expect("fresh ledger accepts a product");
     task::create(
         &state,
         json!({"id":"t","title":"test","body":"instructions","product_id":"a/b"}),
     )
-    .unwrap();
-    task::set_status(&state, "t", "ready").unwrap();
+    .expect("seed task is valid");
+    task::set_status(&state, "t", "ready").expect("draft task can become ready");
     let claim = task::claim(&state, "worker", None, "forge")
-        .unwrap()
-        .unwrap();
+        .expect("ready task is claimable")
+        .expect("ready task is offered");
     (dir, state, clock, claim)
 }
 

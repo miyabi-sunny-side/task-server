@@ -7,6 +7,6 @@ pub fn state(store: Store) -> AppState {
             "execution_targets",
             serde_json::json!({"labels": ["forge", "field", "lab_2"], "default": "forge"}),
         )
-        .unwrap();
+        .expect("fresh ledger accepts execution targets");
     AppState::new(store)
 }

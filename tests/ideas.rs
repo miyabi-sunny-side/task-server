@@ -11,12 +11,16 @@ use tower::ServiceExt;
 
 fn clocked(dir: &std::path::Path) -> (AppState, SharedClock) {
     let clock = SharedClock::at(datetime!(2026-09-26 00:00 UTC));
-    let state = common::state(Store::open(dir).unwrap()).with_clock(Arc::new(clock.clone()));
+    let state = common::state(Store::open(dir).expect("fresh ledger directory opens"))
+        .with_clock(Arc::new(clock.clone()));
     (state, clock)
 }
 
 fn ids(values: &[Value]) -> Vec<&str> {
-    values.iter().map(|v| v["id"].as_str().unwrap()).collect()
+    values
+        .iter()
+        .map(|v| v["id"].as_str().expect("listed idea has a string id"))
+        .collect()
 }
 
 #[test]
@@ -293,11 +297,16 @@ async fn request(app: axum::Router, method: &str, path: &str, body: Value) -> (S
         .uri(path)
         .header("content-type", "application/json");
     let r = app
-        .oneshot(r.body(Body::from(body.to_string())).unwrap())
+        .oneshot(
+            r.body(Body::from(body.to_string()))
+                .expect("test request is well-formed"),
+        )
         .await
         .unwrap();
     let status = r.status();
-    let bytes = to_bytes(r.into_body(), usize::MAX).await.unwrap();
+    let bytes = to_bytes(r.into_body(), usize::MAX)
+        .await
+        .expect("test response body is readable");
     (status, serde_json::from_slice(&bytes).unwrap_or_default())
 }
 
@@ -312,12 +321,18 @@ async fn rpc(app: axum::Router, session: Option<&str>, message: Value) -> (Heade
         request = request.header("mcp-session-id", session);
     }
     let response = app
-        .oneshot(request.body(Body::from(message.to_string())).unwrap())
+        .oneshot(
+            request
+                .body(Body::from(message.to_string()))
+                .expect("test request is well-formed"),
+        )
         .await
         .unwrap();
     let headers = response.headers().clone();
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test response body is readable");
+    let text = String::from_utf8(bytes.to_vec()).expect("MCP response is UTF-8");
     let value = text
         .lines()
         .find_map(|line| {
@@ -352,9 +367,9 @@ async fn mcp_session(app: &axum::Router) -> String {
     .await;
     let session = headers
         .get("mcp-session-id")
-        .unwrap()
+        .expect("initialize returns a session id")
         .to_str()
-        .unwrap()
+        .expect("session header is ASCII")
         .to_owned();
     rpc(
         app.clone(),
